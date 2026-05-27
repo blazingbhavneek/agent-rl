@@ -1,0 +1,9 @@
+/.agents/
+/.codex/
+/node_modules/
+/agent_history.json
+/local-sdk-test/.local-sdk-builder/
+/local-sdk-test/node_modules/
+/local-sdk-test/history.json
+/tmp/
+.DS_Store

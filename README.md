@@ -379,4 +379,3 @@ node ./agent.js \
   --prompt "What are the main extension points in this codebase?" \
   --capture-raw-http-trace
 ```
-# agent-rl
