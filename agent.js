@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { Agent, createTool } from "@cline/sdk";
+import { Agent, createTool } from "./cline/sdk/packages/sdk/dist/index.js";
 import { z } from "zod";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";

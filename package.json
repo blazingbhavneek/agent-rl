@@ -1,0 +1,18 @@
+{
+  "name": "agent-rl-root",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sdk:install": "cd cline/sdk && bun install",
+    "build:sdk": "cd cline/sdk && bun run build:sdk",
+    "setup:sdk": "npm run sdk:install && npm run build:sdk",
+    "test": "node ./test.js",
+    "agent": "node ./agent.js"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

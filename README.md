@@ -1,381 +1,166 @@
 # Agent RL Workspace
 
-This repo has three moving parts:
+This repo is set up as a root-level consumer project for a locally patched Cline SDK.
 
-- `cline/sdk/`: the real Cline SDK workspace. This is where the SDK source lives and where the raw request/response capture change was made.
-- `local-sdk-test/`: a separate consumer project used to prove that a locally built `@cline/sdk` package works when installed from disk like a real downstream app.
-- `agent.js`: a small CLI agent that uses `@cline/sdk`, queries a RAG service, and writes conversation history to disk.
+The shape is intentionally simple:
 
-The raw trace capture lives in the SDK provider/runtime path, not in `agent.js`. `agent.js` just opts into it when you ask for it.
+- `cline/` contains the SDK source you patch and build.
+- `agent.js` is the real root-level agent entrypoint.
+- `test.js` is the root-level regression test for exact raw request/response capture.
 
-## What Changed
+## Goal
 
-The SDK now persists the exact provider request and exact provider response text in assistant-message history metadata:
+Use a Cline SDK agent with custom tools while also persisting the exact provider request and response into assistant-message history metadata so the saved transcript can be used for training and analysis.
 
-- request body: `message.metadata.rawHttpTrace.interactions[n].request.body`
-- response body: `message.metadata.rawHttpTrace.interactions[n].response.body`
+The trace is stored on the assistant message at:
 
-This is captured at the HTTP `fetch` boundary in the SDK, so it includes the real provider wire format after Cline has already formatted system prompts, user messages, tool results, file reads, and other content for the model.
+- `message.metadata.rawHttpTrace.interactions[n].request.body`
+- `message.metadata.rawHttpTrace.interactions[n].response.body`
 
-Two important notes:
-
-- authorization-style headers are redacted on purpose
-- the trace is opt-in and only appears when you enable `captureRawHttpTrace`
-- if you want the raw trace to store one final JSON response body instead of SSE chunks, also enable `disableStreaming`
-
-## Prerequisites
-
-- Node.js `>= 22`
-- Bun `1.3.13`
-
-The SDK workspace itself is Bun-based. The local consumer test project is a normal npm project on purpose.
+Headers like `authorization` are redacted before persistence.
 
 ## Repo Layout
 
 ```text
 .
 ├── agent.js
+├── test.js
+├── package.json
 ├── README.md
-├── cline/
-│   └── sdk/
-│       ├── package.json
-│       └── packages/
-└── local-sdk-test/
-    ├── build-local-sdk-bundle.mjs
-    ├── package.json
-    ├── test.js
-    └── history.json
+└── cline/
+    └── sdk/
+        ├── package.json
+        └── packages/
 ```
 
-## Build The SDK Workspace
+## How It Works
 
-If you want to build the actual Cline SDK packages:
+The SDK patch lives in `cline/sdk/packages/llms/src/providers/ai-sdk.ts`.
+
+It captures the real HTTP request and response at the provider `fetch` boundary after the SDK has already formatted:
+
+- system prompt
+- conversation messages
+- tool schemas
+- tool results
+- file content
+
+The runtime then attaches that raw trace to the final assistant message before history is written.
+
+If `disableStreaming` is enabled, the SDK uses a non-streaming provider call so the stored response body is the final JSON response instead of SSE chunks.
+
+## Build
+
+Install the root dependency:
 
 ```bash
-cd cline/sdk
-bun install
-bun run build:sdk
+npm install
 ```
 
-Useful variants:
-
-- build packages plus the CLI app:
+Install SDK workspace dependencies:
 
 ```bash
-cd cline/sdk
-bun run build
+npm run sdk:install
 ```
 
-- run the full package test suite:
+Build the SDK:
 
 ```bash
-cd cline/sdk
-bun run test
+npm run build:sdk
 ```
 
-- run the unit-oriented suite:
+Or do both in one step:
 
 ```bash
-cd cline/sdk
-bun run test:unit
+npm run setup:sdk
 ```
 
-- run a focused package test:
-
-```bash
-cd cline/sdk
-bun -F @cline/agents test
-```
-
-The raw trace implementation was added in these SDK source files:
-
-- `cline/sdk/packages/llms/src/providers/ai-sdk.ts`
-- `cline/sdk/packages/agents/src/agent-runtime.ts`
-- `cline/sdk/packages/shared/src/agent.ts`
-
-## Why `local-sdk-test/` Exists
-
-`cline/sdk/` is a Bun workspace for SDK development. That is not the same thing as a real downstream app installing `@cline/sdk`.
-
-`local-sdk-test/` exists to test the downstream case:
-
-- bundle a local `@cline/sdk` package from the source in `cline/sdk/`
-- install that package into a separate npm project
-- run a real `Agent`
-- verify that history includes `rawHttpTrace`
-
-This catches packaging and runtime issues that do not show up when everything runs from source inside the workspace.
-
-## Set Up The Local Consumer Test Project
-
-From a clean checkout:
-
-```bash
-cd local-sdk-test
-npm run setup-local-sdk
-```
-
-That does four things:
-
-1. prepares `.local-sdk-builder/`
-2. installs the builder dependencies inside `.local-sdk-builder/`
-3. bundles a local `@cline/sdk` package from `cline/sdk/packages/`
-4. installs that local package into `local-sdk-test/node_modules/`
-
-If you already bootstrapped once and only changed SDK source files, the faster rebuild path is:
-
-```bash
-cd local-sdk-test
-npm run bundle-local-sdk
-npm run install-local-sdk
-```
-
-## Run The Raw Trace Integration Test
-
-Once `local-sdk-test/` is set up:
-
-```bash
-cd local-sdk-test
-npm test
-```
-
-What the test does:
-
-- starts a fake OpenAI-compatible HTTP server
-- installs and uses the locally built `@cline/sdk`
-- runs an `Agent`
-- writes `history.json`
-- asserts that the persisted assistant message contains:
-  - the exact request JSON body sent to the server
-  - the exact SSE response body returned by the server
-
-The test file is:
-
-- `local-sdk-test/test.js`
-
-The history file written by the test is:
-
-- `local-sdk-test/history.json`
-
-If the test passes, you should see:
+`agent.js` and `test.js` import the SDK from:
 
 ```text
-PASS raw trace persisted to /.../local-sdk-test/history.json
+./cline/sdk/packages/sdk/dist/index.js
 ```
 
-## Where To Find History
+So after SDK changes, rebuild before running the root scripts.
 
-There are two history locations in this repo, depending on what you ran.
+## Run The Trace Test
 
-### 1. Local SDK Integration Test
+```bash
+node ./test.js
+```
+
+What it verifies:
+
+- a root-level agent can use the locally built SDK
+- raw trace metadata is persisted on the assistant message
+- the stored request body exactly matches what hit the fake provider
+- the stored response body exactly matches the provider JSON response
+- streaming is disabled when requested, so the request does not send `"stream": true`
 
 The test writes:
 
-- `local-sdk-test/history.json`
+- `./history.json`
 
-The raw trace is on the assistant message:
+### Live OpenAI-Compatible Test
 
-```json
-{
-  "role": "assistant",
-  "metadata": {
-    "rawHttpTrace": {
-      "version": 1,
-      "providerId": "openai-compatible",
-      "modelId": "demo-model",
-      "interactions": [
-        {
-          "request": {
-            "body": "{... exact JSON sent to the provider ...}"
-          },
-          "response": {
-            "body": "data: {... exact SSE returned by the provider ...}"
-          }
-        }
-      ]
-    }
-  }
-}
+`test.js` can also run against a real OpenAI-compatible endpoint such as vLLM or NVIDIA's compatible API.
+
+Set these environment variables:
+
+- `TEST_BASE_URL`
+- `TEST_API_KEY`
+- `TEST_MODEL_ID`
+
+Optional:
+
+- `TEST_PROMPT`
+- `TEST_SYSTEM_PROMPT`
+
+Example:
+
+```bash
+TEST_BASE_URL="https://integrate.api.nvidia.com/v1" \
+TEST_API_KEY="$NVIDIA_API_KEY" \
+TEST_MODEL_ID="minimaxai/minimax-m2.7" \
+node ./test.js
 ```
 
-### 2. `agent.js`
+In live mode, the test still uses `providerId: "openai-compatible"` and still enables:
 
-`agent.js` changes directory into the target workspace before it writes history. That means the history file is written inside the folder you pass to `--folder`, not next to `agent.js`.
+- `captureRawHttpTrace: true`
+- `disableStreaming: true`
 
-Default:
+That matches the intended production shape for OpenAI-compatible backends like vLLM while ensuring the persisted trace stores a final JSON response body instead of SSE chunks.
 
-- `<your-workspace>/agent_history.json`
-
-Custom:
-
-- `<your-workspace>/<whatever-you-passed-to---history>`
+## Run The Agent
 
 Example:
 
 ```bash
 node ./agent.js \
-  --folder /tmp/my-workspace \
-  --prompt "Explain the extension points in this SDK" \
+  --folder /absolute/path/to/workspace \
+  --prompt "Explain the SDK extension points" \
   --history traces/run-01.json \
   --capture-raw-http-trace
 ```
 
-That writes history here:
+Useful environment variables:
 
-- `/tmp/my-workspace/traces/run-01.json`
-
-## Running `agent.js`
-
-`agent.js` is just a script file in this repo root. The repo root is not a preconfigured npm app, so you have two ways to use it.
-
-### Option A: Run It From Your Own Consumer Project
-
-Create a normal Node project anywhere you want and install:
-
-```bash
-npm install @cline/sdk zod
-```
-
-Then copy `agent.js` there or import the same logic into your app.
-
-### Option B: Run The Included `agent.js` From This Repo Root
-
-If you want to run the root `agent.js` directly from this repo, initialize the repo root as a small Node consumer project first:
-
-```bash
-npm init -y
-npm install ./local-sdk-test/.local-sdk-builder/package zod
-```
-
-Then run the agent:
-
-```bash
-node ./agent.js \
-  --folder /absolute/path/to/workspace \
-  --prompt "Answer a question about the library"
-```
-
-If you want raw wire capture in the saved history:
-
-```bash
-node ./agent.js \
-  --folder /absolute/path/to/workspace \
-  --prompt "Answer a question about the library" \
-  --capture-raw-http-trace \
-  --disable-streaming
-```
-
-You can also enable it with an environment variable:
-
-```bash
-CAPTURE_RAW_HTTP_TRACE=1 node ./agent.js \
-  --folder /absolute/path/to/workspace \
-  --prompt "Answer a question about the library"
-```
-
-And for a final non-SSE provider response body in history:
-
-```bash
-CAPTURE_RAW_HTTP_TRACE=1 DISABLE_STREAMING=1 node ./agent.js \
-  --folder /absolute/path/to/workspace \
-  --prompt "Answer a question about the library"
-```
-
-### `agent.js` Environment Variables
-
-`agent.js` supports these environment variables:
-
-- `PROVIDER_ID`
-- `MODEL_NAME`
 - `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
+- `MODEL_NAME`
+- `PROVIDER_ID`
 - `RAG_SERVICE_URL`
 - `MAX_ITERATIONS`
 - `CAPTURE_RAW_HTTP_TRACE`
 - `DISABLE_STREAMING`
 
-Defaults in `agent.js` currently point at:
+History is written inside the workspace passed to `--folder`.
 
-- an OpenAI-compatible model endpoint
-- a separate RAG service for doc search / cache lookup
+Default:
 
-If those services are not running, the script will fail or the specialist lookups will return errors.
+- `<workspace>/agent_history.json`
 
-## Integrating Raw Trace Capture Into Your Own Agent
+Custom:
 
-The only thing your agent needs to do is opt in through `modelOptions.metadata`:
-
-```js
-import { Agent } from "@cline/sdk";
-
-const agent = new Agent({
-  providerId: "openai-compatible",
-  modelId: "demo-model",
-  baseUrl: "http://127.0.0.1:8000/v1",
-  apiKey: "EMPTY",
-  systemPrompt: "You are a helpful assistant.",
-  modelOptions: {
-    metadata: {
-      captureRawHttpTrace: true,
-      disableStreaming: true,
-    },
-  },
-});
-```
-
-That is enough for the SDK to:
-
-- capture the exact HTTP request body sent to the provider
-- capture the exact HTTP response body returned by the provider
-- use a non-streaming provider call so the stored response body is a final JSON payload instead of chunked SSE
-- attach that trace to the assistant message metadata in `result.messages`
-
-The provided `agent.js` now supports this through:
-
-- `--capture-raw-http-trace`
-- `--disable-streaming`
-- `CAPTURE_RAW_HTTP_TRACE=1`
-- `DISABLE_STREAMING=1`
-
-## How To Read The Trace Programmatically
-
-When a run finishes:
-
-```js
-const result = await agent.run("Reply with OK.");
-const assistant = [...result.messages].reverse().find((m) => m.role === "assistant");
-const trace = assistant?.metadata?.rawHttpTrace;
-
-console.log(trace?.interactions?.[0]?.request?.body);
-console.log(trace?.interactions?.[0]?.response?.body);
-```
-
-## Quick Start Summary
-
-If you only want to validate the raw trace feature end to end:
-
-```bash
-cd local-sdk-test
-npm run setup-local-sdk
-npm test
-```
-
-If you want to build and test the real SDK workspace:
-
-```bash
-cd cline/sdk
-bun install
-bun run build:sdk
-bun run test
-```
-
-If you want to use the included research agent:
-
-```bash
-npm init -y
-npm install ./local-sdk-test/.local-sdk-builder/package zod
-node ./agent.js \
-  --folder /absolute/path/to/workspace \
-  --prompt "What are the main extension points in this codebase?" \
-  --capture-raw-http-trace
-```
+- `<workspace>/<value passed to --history>`
