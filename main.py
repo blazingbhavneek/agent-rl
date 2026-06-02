@@ -21,13 +21,12 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 from difflib import SequenceMatcher
 
 from stub.stub import ProjectAnalyzer          # type: ignore
-from tools.gcov import analyze_gcov_range      # type: ignore
 
 
 def _normalize_doc_name(s: str) -> str:
@@ -80,10 +79,8 @@ def find_func_doc(
     if exact.exists():
         return exact, 1.0, [(1.0, exact)]
 
-    func_norm = _normalize_doc_name(func_name)
     scored: list[tuple[float, Path]] = []
     for p in docs_dir.glob("*.md"):
-        stem_norm = _normalize_doc_name(p.stem)
         score = similarity_ratio(func_name, p.stem)
         scored.append((score, p))
 
@@ -120,7 +117,6 @@ class PipelineConfig:
     only_level: Optional[int] = None
     max_functions: Optional[int] = None
     dry_run: bool = False
-    python_bin: str = sys.executable
 
 
 # ==========================================================================
@@ -341,28 +337,6 @@ def _source_includes_for_test_file(cfg: PipelineConfig, test_file: Path) -> list
     return lines
 
 
-def _project_source_files(cfg: PipelineConfig) -> list[Path]:
-    """
-    Return actual absolute .c files under cfg.source_dir.
-    No guessing.
-    """
-    source_dir = cfg.source_dir.resolve()
-    if source_dir.is_file() and source_dir.suffix == ".c":
-        return [source_dir]
-    if not source_dir.exists():
-        return []
-    return sorted(
-        p.resolve()
-        for p in source_dir.rglob("*.c")
-        if p.is_file()
-    )
-
-
-import os
-import re
-import subprocess
-import sys
-from pathlib import Path
 
 
 def ensure_makefile(cfg: PipelineConfig, paths: dict) -> None:
@@ -372,9 +346,8 @@ def ensure_makefile(cfg: PipelineConfig, paths: dict) -> None:
     Coverage behavior:
     - Uses actual production .c files discovered under cfg.source_dir.
     - Does NOT guess src/<process>.c.
-    - Generates production .gcov files such as:
-        ^#^#src#dio100d#dio100d.c.gcov
-    - test_*.c.gcov may also be generated, but function coverage checker should ignore it and match production gcov files by Source: header.
+    - Generates production .gcov files named after source basename, e.g. dio100d.c.gcov.
+    - test_*.gcov files are deleted after gcov runs so only production gcov files remain.
     """
     test_dir: Path = paths["test_dir"]
     test_file: Path = paths["test_file"]
@@ -492,10 +465,8 @@ $(TEST_PROGRAM): $(TEST_SRCS)
 \t$(WRAP_FLAGS)
 
 coverage-test:
-\t@for src in $(PRODUCTION_SRCS); do \\
-\t\tgcov -b -c -p "$$src" >> $(TEST_REPORT_FILE) 2>&1 || true; \\
-\tdone
-\t@gcov -b -c -p *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
+\t@gcov -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
+\t@rm -f test_*.gcov
 
 clean-test:
 \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
@@ -616,13 +587,6 @@ int main(void)
         text = TEST_FILE_MARKERS[0] + "\n" + text
         changed = True
 
-    # Remove bad late main define if it exists after the production include.
-    bad_define = f"#define main {process_name}_entry_main"
-    if bad_define in text:
-        text = text.replace(bad_define + "\n", "")
-        text = text.replace(bad_define, "")
-        changed = True
-
     # Add any missing actual production includes.
     missing_includes = [
         line for line in production_include_lines
@@ -668,6 +632,16 @@ def ensure_wrap_flag(makefile: Path, func_name: str) -> bool:
     return True
 
 
+def _remove_wrap_flag(makefile: Path, func_name: str) -> bool:
+    """Remove -Wl,--wrap=<name> from WRAP_FUNCS if present."""
+    line = f"WRAP_FUNCS += -Wl,--wrap={func_name}\n"
+    text = read_text(makefile)
+    if line not in text:
+        return False
+    write_text(makefile, text.replace(line, ""))
+    return True
+
+
 # ==========================================================================
 # Stub / test-file scanning
 # ==========================================================================
@@ -675,6 +649,43 @@ def stub_exists(test_file: Path, name: str) -> bool:
     text = read_text(test_file)
     # Match a C identifier starting with __wrap_<name>
     return bool(re.search(rf"__wrap_{re.escape(name)}\b", text))
+
+
+# ==========================================================================
+# Source-protection helpers
+# ==========================================================================
+def _snapshot_dir(d: Path) -> dict[Path, bytes]:
+    snap: dict[Path, bytes] = {}
+    try:
+        for f in d.rglob("*"):
+            if f.is_file():
+                try:
+                    snap[f] = f.read_bytes()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return snap
+
+
+def _restore_from_snapshot(snap: dict[Path, bytes], protect_dir: Path) -> None:
+    for f, orig in snap.items():
+        try:
+            if f.exists() and f.read_bytes() != orig:
+                f.write_bytes(orig)
+                print(f"[pipeline] GUARD: restored {f}", file=sys.stderr)
+        except OSError:
+            pass
+    try:
+        for f in protect_dir.rglob("*"):
+            if f.is_file() and f not in snap:
+                try:
+                    f.unlink()
+                    print(f"[pipeline] GUARD: deleted agent-created file {f}", file=sys.stderr)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 # ==========================================================================
@@ -690,6 +701,7 @@ def run_agent(
     history_dir: Optional[Path] = None,
     max_iterations: Optional[int] = None,
     timeout_sec: Optional[int] = None,
+    protect_source: bool = True,
 ) -> dict:
     """Invoke agent.js with an external prompt."""
     agent_folder = folder or work_dir
@@ -717,6 +729,9 @@ def run_agent(
     if cfg.dry_run:
         print(f"[pipeline][dry-run] would run: {' '.join(cmd)}", file=sys.stderr)
         return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    _protect_dir = cfg.source_dir.parent.resolve() if protect_source else None
+    _snap = _snapshot_dir(_protect_dir) if _protect_dir is not None else {}
 
     print(f"[pipeline] agent -> {history_name}", file=sys.stderr)
     t0 = time.time()
@@ -748,6 +763,8 @@ def run_agent(
         f"elapsed={elapsed:.1f}s timed_out={timed_out}",
         file=sys.stderr,
     )
+    if _snap:
+        _restore_from_snapshot(_snap, _protect_dir)
     return res
 
 
@@ -778,28 +795,6 @@ def run_make_test(test_dir: Path) -> dict:
 # ==========================================================================
 # Coverage
 # ==========================================================================
-def find_gcov_file(test_dir: Path, source_file: str) -> Optional[Path]:
-    """
-    Look for the .gcov that matches the function's original source.
-    Try:
-        - test_<process>.c.gcov    (if sources are #included into test file)
-        - <basename>.gcov
-        - any single .gcov in the directory
-    """
-    candidates: list[Path] = []
-    base = Path(source_file).name
-    for p in test_dir.glob("*.gcov"):
-        if p.name in (f"{base}.gcov",):
-            return p
-        candidates.append(p)
-    if len(candidates) == 1:
-        return candidates[0]
-    # Fallback: prefer test_<*.c>.gcov
-    for p in candidates:
-        if p.name.endswith(".c.gcov"):
-            return p
-    return candidates[0] if candidates else None
-
 
 def check_function_coverage(
     test_dir: Path,
@@ -822,13 +817,18 @@ def check_function_coverage(
     # Refresh gcov outputs from generated .gcno files.
     for gcno in sorted(test_dir.glob("*.gcno")):
         subprocess.run(
-            ["gcov", "-b", "-c", "-p", gcno.name],
+            ["gcov", "-b", "-c", gcno.name],
             cwd=str(test_dir),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=120,
         )
+    for _f in test_dir.glob("test_*.gcov"):
+        try:
+            _f.unlink()
+        except Exception:
+            pass
 
     gcov_files = sorted(test_dir.glob("*.gcov"))
 
@@ -929,32 +929,6 @@ def check_function_coverage(
     }
 
 
-# ==========================================================================
-# Prompts (all external - nothing hardcoded in agent.js)
-# ==========================================================================
-def prompt_for_stub(func_name: str,
-    test_file: str,
-    process_name: str,
-    test_dir: str) -> str:
-    return f"""You are editing the CUnit test file `{test_file}` in `{test_dir}`.
-
-TASK: add a linker-wrapper stub for ONE external function: `{func_name}`.
-
-ABSOLUTE RULES:
-- Modify ONLY `{test_file}` in the current directory. Do not touch production sources.
-- Do NOT create stubs.c or any extra headers.
-- Place the stub below the marker: `/* === Linker Wrapper Stubs === */`.
-- Do NOT duplicate existing includes, helpers, globals, or other stubs.
-- The wrapper name MUST be `__wrap_{func_name}`.
-- Determine the correct signature by inspecting local headers and source files in `{test_dir}`'s parent project (look upward for `.h` files).
-- Add a simple fprintf(stderr, ...) log at the top of the wrapper.
-- Keep behaviour minimal and deterministic.
-- If `{func_name}` looks like an event/callback registration stub, invoke the passed callback with reasonable arguments.
-- Preserve ALL existing code, tests, and stubs in the file.
-- Run `make test` if you want to validate; ignore failures unrelated to your stub.
-- When done, call submit_and_exit.
-"""
-
 
 def prompt_for_compile_fix(
     makefile: str,
@@ -1054,7 +1028,9 @@ def prompt_for_function_test(func: dict,
                         test_file: str,
                         process_name: str,
                         attempt: int,
-                        max_attempts: int) -> str:
+                        max_attempts: int,
+                        *,
+                        make_ok: bool = True) -> str:
     fid = func["id"]
     name = func["name"]
     src = func["source_file"]
@@ -1099,45 +1075,23 @@ def prompt_for_function_test(func: dict,
                 "If coverage is below threshold, inspect the matched production gcov file and add tests."
             )
 
-    if matched_gcov_file:
-        gcov_tool_text = f"""9. You may use the `analyze_function_coverage` tool if helpful.
+    expected_gcov_path = Path(test_file).parent / f"{Path(src).name}.gcov"
+    gcov_tool_text = f"""9. After running `make test`, MUST call `analyze_function_coverage` to verify coverage:
 
-IMPORTANT:
-Do NOT analyze `test_{process_name}.c.gcov` or any `test_*.c.gcov` file.
-Those files are CUnit test harness coverage, not production source coverage.
-Use the matched PRODUCTION gcov file whose `Source:` header resolves to the target source file.
-
-For this target, use:
-    gcov_file: {matched_gcov_file}
+    gcov_file: {expected_gcov_path}
     start_line: {s}
     end_line: {e}
 
-Production gcov filenames may be path-encoded by `gcov -p`, for example:
-    ^#^#src#dio100d#dio100d.c.gcov
-That is normal. Do not assume the gcov filename matches the test filename."""
-    else:
-        gcov_tool_text = f"""9. You may use the `analyze_function_coverage` tool if helpful.
-
-IMPORTANT:
-Do NOT analyze `test_{process_name}.c.gcov` or any `test_*.c.gcov` file.
-Those files are CUnit test harness coverage, not production source coverage.
-No matched production gcov file is available yet.
-First make the generated test directly call the target production function so gcov creates/updates the production `.gcov` file.
-
-Target source:
-```c
-{src}
-```
-
-Line range:
-  start_line: {s}
-  end_line:   {e}"""
+CRITICAL: Use ONLY this exact gcov file path above.
+Do NOT use `test_{process_name}.c.gcov` or any `test_*.c.gcov` — those are test harness files and will always show wrong coverage.
+This production gcov file is created/updated every time `make test` runs.
+Call `analyze_function_coverage` BEFORE calling submit_and_exit to confirm lines {s}..{e} coverage increased."""
 
     if name == "main":
         production_call_rule = f"""CRITICAL HARNESS FACT
-The production source may be included into the CUnit test file like this:
+The production source is included into the CUnit test file like this:
 ```c
-#define main DISABLED_MAIN
+#define main {process_name}_entry_main
 #include "...production source..."
 #undef main
 ```
@@ -1145,25 +1099,25 @@ Therefore the target production function:
 ```c
 int main(int argc, char **argv)
 ```
-may be compiled and callable inside the test file as:
+is compiled and callable inside the test file as:
 ```c
-DISABLED_MAIN(argc, argv)
+{process_name}_entry_main(argc, argv)
 ```
 The test file has its own CUnit `main()`. Do NOT call `main()` directly.
 
 For this target, add and register at least one CUnit test that directly calls the production main through the renamed symbol:
 ```c
 char *argv[] = {{ "{process_name}", NULL }};
-int ret = DISABLED_MAIN(1, argv);
+int ret = {process_name}_entry_main(1, argv);
 ```
 Wrapper-only smoke tests are NOT enough.
 The first goal is to make gcov change from:
 ```text
-function DISABLED_MAIN called 0
+function {process_name}_entry_main called 0
 ```
 to:
 ```text
-function DISABLED_MAIN called 1
+function {process_name}_entry_main called 1
 ```
 or higher."""
     else:
@@ -1197,6 +1151,7 @@ line range:   {s} .. {e} (inclusive)
 CURRENT STATUS
 attempt:        {attempt} / {max_attempts}
 coverage so far: {cov_pct if cov_pct is not None else 'unknown'}%
+{'WARNING: `make test` is FAILING — fix compilation before adding tests.' if not make_ok else ''}
 
 {production_call_rule}
 
@@ -1211,12 +1166,12 @@ RULES
 0. MANDATORY:
 Add and register at least one CUnit test that directly calls the current target production function itself. Do not only call `__wrap_*` stubs.
 
-If the target function is `main` and the harness renames it with:
+If the target function is `main`, the harness renames it with:
 ```c
-#define main DISABLED_MAIN
+#define main {process_name}_entry_main
 ```
-then call:
-    DISABLED_MAIN(argc, argv)
+Call:
+    {process_name}_entry_main(argc, argv)
 not:
     main(argc, argv).
 
@@ -1698,19 +1653,42 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
             for name in batch_names
             if name in bodies
         }
+        if not batch_bodies:
+            print(
+                f"[pipeline] skipping batch {idx}/{len(batches)}: no generated bodies for {batch_names}",
+                file=sys.stderr,
+            )
+            continue
+        # Only tell the integration agent about stubs it actually has bodies for.
+        names_with_bodies = list(batch_bodies.keys())
         print(
             f"[pipeline] integrating stub batch {idx}/{len(batches)}: "
-            f"names={batch_names}, usable_bodies={len(batch_bodies)}",
+            f"names_with_bodies={names_with_bodies}",
             file=sys.stderr,
         )
         integrate_stubs_and_compile_with_agent(
             cfg=cfg,
             paths=paths,
             generated_bodies=batch_bodies,
-            missing_stub_names=batch_names,
+            missing_stub_names=names_with_bodies,
             batch_index=idx,
             batch_total=len(batches),
         )
+        still_missing = [n for n in batch_names if not stub_exists(test_file, n)]
+        if still_missing:
+            print(
+                f"[pipeline] WARNING: {len(still_missing)} stubs not integrated after batch {idx}: {still_missing}",
+                file=sys.stderr,
+            )
+
+    # Remove wrap flags for stubs that never made it into the test file.
+    # Leaving them causes linker errors that burn all compile-fix attempts.
+    final_missing = [n for n in candidates if not stub_exists(test_file, n)]
+    for n in final_missing:
+        if _remove_wrap_flag(makefile, n):
+            print(f"[pipeline] removed wrap flag for unintegrated stub: {n}", file=sys.stderr)
+    if final_missing:
+        print(f"[pipeline] {len(final_missing)} stubs permanently missing: {final_missing}", file=sys.stderr)
 
 
 # ==========================================================================
@@ -1759,20 +1737,21 @@ def ensure_skeleton_compiles(cfg: PipelineConfig, paths: dict) -> bool:
             test_dir,
             prompt,
             f"_compile_fix_{attempt:03d}.json",
+            folder=cfg.source_dir.parent.parent.resolve(),
         )
 
-    return False
+    return run_make_test(test_dir)["ok"]
 
 
 # ==========================================================================
 # Per-function coverage loop
 # ==========================================================================
-def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
+def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
     """
     Process target functions leaf -> root.
 
     Continuation behavior:
-    - Before asking the agent to add tests for a function, run `make test`.
+    - Check existing gcov data (no rebuild) to skip already-covered functions.
     - Analyze gcov line-range coverage for that function.
     - If coverage >= cfg.coverage_threshold, skip the function.
     - Default threshold is 80.0%.
@@ -1781,6 +1760,7 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
     test_file: Path = paths["test_file"]
     process_name: str = paths["process_name"]
 
+    repo_root = cfg.source_dir.parent.parent.resolve()
     funcs = functions_leaf_first(analysis)
     print(f"[pipeline] {len(funcs)} functions to process (leaf -> root)",
         file=sys.stderr)
@@ -1788,6 +1768,8 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
         file=sys.stderr)
 
     done = 0
+    skipped = 0
+    coverage_results: dict[str, Optional[float]] = {}
     for func in funcs:
         if cfg.only_function and func["id"] != cfg.only_function:
             continue
@@ -1796,21 +1778,14 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
         if cfg.max_functions is not None and done >= cfg.max_functions:
             break
 
-        # Continuation check:
-        # Run current tests first, then inspect coverage for this exact function range.
+        # Coverage pre-check: read existing gcov WITHOUT rebuilding.
+        # Avoids clean-test wiping all coverage data on every function.
+        # Compile failures are caught inside the attempt loop.
         print(
             f"[pipeline] coverage pre-check for {func['id']} "
             f"lines {func['start_line']}..{func['end_line']}",
             file=sys.stderr,
         )
-        make_res = run_make_test(test_dir)
-        if not make_res["ok"]:
-            print(
-                f"[pipeline] make test failed during coverage pre-check for {func['id']}; "
-                f"will still ask agent to work on this function",
-                file=sys.stderr,
-            )
-
         source_file_abs = _resolve_source_file(cfg, func["source_file"])
         print(
             f"[pipeline] resolved coverage source: {func['source_file']} -> {source_file_abs}",
@@ -1836,6 +1811,8 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
                 f">= threshold={cfg.coverage_threshold:.1f}%",
                 file=sys.stderr,
             )
+            coverage_results[func["id"]] = pct
+            skipped += 1
             done += 1
             continue
 
@@ -1845,96 +1822,10 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
             file=sys.stderr,
         )
 
+        last_make_ok = True
         for attempt in range(1, cfg.max_test_attempts + 1):
             func_for_prompt = dict(func)
             func_for_prompt["source_file"] = str(source_file_abs)
-            func_for_prompt["source_dir"] = str(cfg.source_dir.resolve())
-            func_for_prompt["actual_source_files"] = [str(p) for p in _project_source_files(cfg)]
-            func_for_prompt["initial_coverage_rule"] = (
-                "For the first/initial CUnit test for this target function, "
-                "add and register a test that directly calls the current target production function. "
-                "Do not only call __wrap_* stubs. "
-                "If the target function is main and the harness renames main using "
-                "#define main DISABLED_MAIN, call DISABLED_MAIN(1, argv), not main. "
-                "If the target is not main, call the target function itself with safe/minimal arguments. "
-                "Use wrappers to prevent blocking, exiting, real I/O, database, networking, timers, "
-                "shared memory, or logging side effects. "
-                "The goal is that gcov reports the target function called at least once."
-                """
-When generating the first/initial CUnit test for a target source file, do not only create wrapper-smoke tests.
-You must add at least one test that directly executes the current target production function being processed.
-
-The current target function will be provided in the function metadata, for example:
-- func["name"]
-- func["source_file"]
-- func["start_line"]
-- func["end_line"]
-- func["signature"] if available
-
-Your goal for the first test is simple:
-make gcov show that the target production function was called at least 1 time.
-
-Rules:
-1. If the target function is production main():
-   The test harness may include the source with:
-   #define main DISABLED_MAIN
-   #include "..."
-   #undef main
-   In that case, call:
-   char *argv[] = {"program_name", NULL};
-   DISABLED_MAIN(1, argv);
-   Do not call main() directly.
-
-2. If the target function is not main():
-   Call the actual target function by name using safe/minimal arguments.
-   Examples:
-   - For int foo(void): call foo();
-   - For int foo(int x): call foo(0);
-   - For int foo(char *s): call foo(NULL) first only if the function handles NULL safely; otherwise pass a local buffer.
-   - For int foo(StructType *p): create a local StructType object, memset it to 0, and pass &object.
-   - For void foo(void): call foo();
-
-3. Do not settle for tests that only call __wrap_* stubs.
-   Wrapper-only smoke tests are allowed, but they are not enough.
-At least one registered CUnit test must call the target production function itself.
-
-4. Register the production-call test in all_tests() using CU_add_test().
-
-5. Keep the test safe:
-- Stub or wrap functions that block forever.
-- Stub or wrap functions that terminate the process.
-- Stub or wrap external I/O, database, shared memory, networking, timers, and logging calls.
-- Wrappers should return safe success values unless testing an error branch.
-- If a function may loop forever, provide a wrapper/state variable that makes it return.
-
-6. For production main():
-Ensure wrappers make the normal path safe:
-- pmf_mainloop returns immediately.
-- pmf_exit does not exit.
-- pmf_addevent returns 0.
-- pmf_addtimer returns a valid nonnegative timer id, for example 1.
-- initialization/open functions return success values.
-
-7. The first test does not need perfect assertions.
-It may use simple assertions like:
-- CU_ASSERT_TRUE(1);
-- CU_ASSERT_EQUAL(ret, expected);
-- CU_ASSERT_TRUE(mock_called_count > 0);
-The priority is production coverage:
-the target function should appear in gcov as called 1 or more times.
-
-8. If the function has static linkage but the source file is included directly into the test file:
-call the static function directly from the test because it is in the same translation unit.
-
-9. If the function name is replaced by a macro in the harness, call the rewritten name.
-Specifically, if production main is renamed by:
-#define main DISABLED_MAIN
-then call DISABLED_MAIN(), not main().
-
-10. Do not remove existing tests or wrappers. Add the production-call test alongside existing smoke/linkage tests.
-"""
-            )
-
             prompt = prompt_for_function_test(
                 func=func_for_prompt,
                 coverage=cov,
@@ -1942,22 +1833,40 @@ then call DISABLED_MAIN(), not main().
                 process_name=process_name,
                 attempt=attempt,
                 max_attempts=cfg.max_test_attempts,
+                make_ok=last_make_ok,
             )
             run_agent(
                 cfg,
                 test_dir,
                 prompt,
                 f"{_safe_filename(func['id'])}_attempt_{attempt:02d}.json",
+                folder=repo_root,
             )
 
             make_res = run_make_test(test_dir)
             if not make_res["ok"]:
                 print(
-                    f"[pipeline] make test failed after attempt {attempt} for {func['id']}; "
-                    f"coverage may be unavailable",
+                    f"[pipeline] make test failed after attempt {attempt} for {func['id']}; running compile-fix",
                     file=sys.stderr,
                 )
+                _src_dir = cfg.source_dir.resolve()
+                run_agent(
+                    cfg,
+                    test_dir,
+                    prompt_for_compile_fix(
+                        str(paths["makefile"]),
+                        str(test_file),
+                        (make_res.get("stderr") or "") + "\n---\n" + (make_res.get("stdout") or ""),
+                        source_dir=str(_src_dir),
+                        source_makefile=str(_src_dir / "Makefile"),
+                        actual_source_files=[str(p) for p in _project_source_files(cfg)],
+                    ),
+                    f"{_safe_filename(func['id'])}_attempt_{attempt:02d}_compile_fix.json",
+                    folder=repo_root,
+                )
+                make_res = run_make_test(test_dir)
 
+            last_make_ok = make_res["ok"]
             source_file_abs = _resolve_source_file(cfg, func["source_file"])
             print(
                 f"[pipeline] resolved coverage source after attempt {attempt}: "
@@ -1991,9 +1900,20 @@ then call DISABLED_MAIN(), not main().
                 file=sys.stderr,
             )
 
+        coverage_results[func["id"]] = pct
         done += 1
 
-    print(f"[pipeline] processed {done}/{len(funcs)} functions", file=sys.stderr)
+    print(
+        f"[pipeline] processed {done}/{len(funcs)} functions "
+        f"({skipped} skipped at threshold)",
+        file=sys.stderr,
+    )
+    return {
+        "functions_total": len(funcs),
+        "functions_done": done,
+        "functions_skipped_at_threshold": skipped,
+        "coverage": {k: round(v, 1) if v is not None else None for k, v in coverage_results.items()},
+    }
 
 
 def _safe_filename(s: str) -> str:
@@ -2014,7 +1934,7 @@ def run(cfg: PipelineConfig) -> int:
 
     analysis = run_or_load_analysis(cfg, paths["analysis_path"])
 
-    # ensure_makefile(cfg, paths)
+    ensure_makefile(cfg, paths)
     ensure_test_file(cfg, paths)
     handle_stubs(cfg, paths, analysis)
 
@@ -2023,11 +1943,12 @@ def run(cfg: PipelineConfig) -> int:
             file=sys.stderr)
         return 2
 
-    process_functions(cfg, paths, analysis)
+    summary = process_functions(cfg, paths, analysis)
 
     write_json(paths["test_dir"] / "DONE.json", {
         "finished_at": now_iso(),
         "source": str(cfg.source_dir),
+        **summary,
     })
     print("[pipeline] finished.", file=sys.stderr)
     return 0
