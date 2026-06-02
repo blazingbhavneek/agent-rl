@@ -117,6 +117,10 @@ class PipelineConfig:
     only_level: Optional[int] = None
     max_functions: Optional[int] = None
     dry_run: bool = False
+    python_bin: str = sys.executable
+    max_stub_gen_retries: int = 3
+    max_stub_integrate_retries: int = 3
+    max_minimal_test_attempts: int = 5
 
 
 # ==========================================================================
@@ -488,6 +492,7 @@ clean-test:
     if new_text != text:
         write_text(makefile, new_text)
 
+    sync_wrap_flags(paths["test_file"], makefile)
     print(f"[pipeline] Makefile ready: {makefile}", file=sys.stderr)
 
 
@@ -509,13 +514,9 @@ def ensure_test_file(cfg: PipelineConfig, paths: dict) -> None:
     production_include_block = ""
     if production_include_lines:
         production_include_block = (
-            "\n/* Rename production main before including production sources. */\n"
-            f"#define main {process_name}_entry_main\n"
             "\n/* Auto-included production sources for coverage. */\n"
             + "\n".join(production_include_lines)
-            + "\n\n"
-            "/* Restore test main name. */\n"
-            "#undef main\n"
+            + "\n"
         )
 
     if not test_file.exists():
@@ -541,10 +542,7 @@ def ensure_test_file(cfg: PipelineConfig, paths: dict) -> None:
 /* Linker wrapper stubs go here. */
 
 {TEST_FILE_MARKERS[5]}
-static void test_generated_stub_linkage_smoke(void)
-{{
-    CU_ASSERT_TRUE(1);
-}}
+/* Test cases go here. */
 
 {TEST_FILE_MARKERS[6]}
 int main(void)
@@ -553,13 +551,8 @@ int main(void)
     if (CU_initialize_registry() != CUE_SUCCESS) {{
         return CU_get_error();
     }}
-    suite = CU_add_suite("{process_name}_generated_suite", NULL, NULL);
+    suite = CU_add_suite("{process_name}_suite", NULL, NULL);
     if (suite == NULL) {{
-        CU_cleanup_registry();
-        return CU_get_error();
-    }}
-    if (CU_add_test(suite, "test_generated_stub_linkage_smoke",
-        test_generated_stub_linkage_smoke) == NULL) {{
         CU_cleanup_registry();
         return CU_get_error();
     }}
@@ -594,13 +587,9 @@ int main(void)
     ]
     if missing_includes:
         insertion = (
-            "\n/* Rename production main before including production sources. */\n"
-            f"#define main {process_name}_entry_main\n"
             "\n/* Auto-included production sources for coverage. */\n"
             + "\n".join(missing_includes)
-            + "\n\n"
-            "/* Restore test main name. */\n"
-            "#undef main\n"
+            + "\n"
         )
         text = text.replace(TEST_FILE_MARKERS[0], TEST_FILE_MARKERS[0] + insertion, 1)
         changed = True
@@ -632,14 +621,11 @@ def ensure_wrap_flag(makefile: Path, func_name: str) -> bool:
     return True
 
 
-def _remove_wrap_flag(makefile: Path, func_name: str) -> bool:
-    """Remove -Wl,--wrap=<name> from WRAP_FUNCS if present."""
-    line = f"WRAP_FUNCS += -Wl,--wrap={func_name}\n"
-    text = read_text(makefile)
-    if line not in text:
-        return False
-    write_text(makefile, text.replace(line, ""))
-    return True
+def sync_wrap_flags(test_file: Path, makefile: Path) -> None:
+    """Ensure every __wrap_* symbol in the test file has a WRAP_FUNCS entry."""
+    text = read_text(test_file)
+    for name in re.findall(r'__wrap_(\w+)\b', text):
+        ensure_wrap_flag(makefile, name)
 
 
 # ==========================================================================
@@ -723,6 +709,7 @@ def run_agent(
     env["MAX_ITERATIONS"] = str(
         max_iterations if max_iterations is not None else cfg.max_agent_iterations
     )
+    env["PYTHON_BIN"] = cfg.python_bin
 
     actual_timeout = timeout_sec if timeout_sec is not None else cfg.agent_timeout_sec
 
@@ -771,7 +758,7 @@ def run_agent(
 # ==========================================================================
 # Build
 # ==========================================================================
-def run_make_test(test_dir: Path) -> dict:
+def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
     cmd = ["make", "test"]
     try:
         proc = subprocess.run(
@@ -779,17 +766,18 @@ def run_make_test(test_dir: Path) -> dict:
             cwd=str(test_dir),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=timeout,
         )
         return {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
             "stdout": proc.stdout,
             "stderr": proc.stderr,
+            "timed_out": False,
         }
     except subprocess.TimeoutExpired:
         return {"ok": False, "returncode": -1, "stdout": "",
-            "stderr": "make test timed out"}
+            "stderr": f"make test timed out after {timeout}s", "timed_out": True}
 
 
 # ==========================================================================
@@ -1575,120 +1563,230 @@ def insert_stub_into_test_file(test_file: Path, func_name: str, body: str) -> bo
 
 
 def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
-    """
-    Generate/reuse missing stubs and integrate them in batches.
-
-    Continuation behavior:
-    - If a wrapper already exists in the final test file, do not regenerate it.
-    - If a generated stub file already exists under _stub_gen/<func>/stub.c,
-        generate_stub_code() will reuse it instead of calling the agent.
-    - Wrapper flags are ensured for all candidates, even if the wrapper already
-        exists in the test file.
-    """
     test_file: Path = paths["test_file"]
     makefile: Path = paths["makefile"]
     test_dir: Path = paths["test_dir"]
+    batch_size = max(1, int(cfg.stub_batch_size))
 
     candidates = collect_stub_candidates(analysis)
     print(f"[pipeline] {len(candidates)} stub candidates total", file=sys.stderr)
 
-    # Always ensure wrapper flags for all candidates.
-    # This fixes continuation cases where the wrapper exists but the Makefile flag
-    # is missing.
-    for name in candidates:
-        ensure_wrap_flag(makefile, name)
-
-    # Only generate/integrate stubs that are not already in the final test file.
-    missing = [n for n in candidates if not stub_exists(test_file, n)]
-    print(f"[pipeline] {len(missing)} missing stubs in final test file",
-        file=sys.stderr)
-
-    if not missing:
-        print("[pipeline] all stubs already exist in test file; skipping stub generation/integration", file=sys.stderr)
+    if not [n for n in candidates if not stub_exists(test_file, n)]:
+        print("[pipeline] all stubs already in test file", file=sys.stderr)
         return
 
     bodies: dict[str, str] = {}
 
-    # 1. Generate or reuse candidate stub files in parallel.
-    with ThreadPoolExecutor(max_workers=min(6, len(missing))) as pool:
-        futs = {
-            pool.submit(generate_stub_code, cfg, test_dir, n): n
-            for n in missing
-        }
-        for fut in as_completed(futs):
-            name = futs[fut]
-            try:
-                body = fut.result()
-            except Exception as e:
-                print(
-                    f"[pipeline] stub gen failed for {name}: {e}",
-                    file=sys.stderr,
-                )
-                body = None
-            if body:
-                bodies[name] = body
-                print(
-                    f"[pipeline] generated/reused stub body for {name} "
-                    f"({len(body)} chars)",
-                    file=sys.stderr,
-                )
-            else:
-                print(f"[pipeline] NO usable body for {name}", file=sys.stderr)
+    # ------------------------------------------------------------------
+    # Phase 1: generate stub bodies with retry.
+    # ------------------------------------------------------------------
+    for gen_round in range(1, cfg.max_stub_gen_retries + 1):
+        to_gen = [
+            n for n in candidates
+            if not stub_exists(test_file, n) and n not in bodies
+        ]
+        if not to_gen:
+            break
+        print(
+            f"[pipeline] stub gen round {gen_round}/{cfg.max_stub_gen_retries}: "
+            f"{len(to_gen)} need bodies",
+            file=sys.stderr,
+        )
+        with ThreadPoolExecutor(max_workers=min(6, len(to_gen))) as pool:
+            futs = {pool.submit(generate_stub_code, cfg, test_dir, n): n for n in to_gen}
+            for fut in as_completed(futs):
+                name = futs[fut]
+                try:
+                    body = fut.result()
+                except Exception as e:
+                    print(f"[pipeline] stub gen error {name}: {e}", file=sys.stderr)
+                    body = None
+                if body:
+                    bodies[name] = body
+                    print(f"[pipeline] body ready: {name} ({len(body)} chars)", file=sys.stderr)
+                else:
+                    print(f"[pipeline] NO body: {name} round {gen_round}", file=sys.stderr)
 
-    # 2. Integrate stubs in smaller batches.
-    batch_size = max(1, int(cfg.stub_batch_size))
-    batches = [
-        missing[i:i + batch_size]
-        for i in range(0, len(missing), batch_size)
-    ]
+    no_body = [n for n in candidates if not stub_exists(test_file, n) and n not in bodies]
+    if no_body:
+        print(f"[pipeline] WARNING: no body after all gen rounds: {no_body}", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Phase 2: integrate with retry.
+    # ------------------------------------------------------------------
+    for int_round in range(1, cfg.max_stub_integrate_retries + 1):
+        to_integrate = [
+            n for n in candidates
+            if not stub_exists(test_file, n) and n in bodies
+        ]
+        if not to_integrate:
+            break
+        print(
+            f"[pipeline] stub integration round {int_round}/{cfg.max_stub_integrate_retries}: "
+            f"{len(to_integrate)} to integrate",
+            file=sys.stderr,
+        )
+        batches = [to_integrate[i:i + batch_size] for i in range(0, len(to_integrate), batch_size)]
+        for idx, batch_names in enumerate(batches, start=1):
+            batch_bodies = {n: bodies[n] for n in batch_names}
+            print(
+                f"[pipeline] integration batch {idx}/{len(batches)}: {batch_names}",
+                file=sys.stderr,
+            )
+            integrate_stubs_and_compile_with_agent(
+                cfg=cfg,
+                paths=paths,
+                generated_bodies=batch_bodies,
+                missing_stub_names=list(batch_bodies.keys()),
+                batch_index=idx,
+                batch_total=len(batches),
+            )
+        after = [n for n in to_integrate if not stub_exists(test_file, n)]
+        if after:
+            print(
+                f"[pipeline] round {int_round}: {len(after)} still missing: {after}",
+                file=sys.stderr,
+            )
+
+    final_missing = [n for n in candidates if not stub_exists(test_file, n)]
+    if final_missing:
+        print(f"[pipeline] {len(final_missing)} permanently missing stubs: {final_missing}", file=sys.stderr)
+
+
+# ==========================================================================
+# Minimal test validation
+# ==========================================================================
+def prompt_for_minimal_test(process_name: str, test_file: str, entry_sym: str) -> str:
+    return f"""Ensure the CUnit test file has a minimal test that calls the production entry point and RETURNS.
+
+TEST FILE: {test_file}
+ENTRY SYMBOL: {entry_sym}
+
+TASK:
+1. Read the test file.
+2. If no test calling `{entry_sym}` exists, add one:
+   ```c
+   static void test_minimal_entry(void) {{
+       char *argv[] = {{"{process_name}", NULL}};
+       int ret = {entry_sym}(1, argv);
+       (void)ret;
+       CU_ASSERT_TRUE(1);
+   }}
+   ```
+3. Register it in the test suite with CU_add_test.
+4. Ensure ALL stubs for blocking functions return immediately:
+   - Infinite loops (pmf_mainloop, event loops): return immediately, do NOT loop.
+   - Process-exit calls (pmf_exit, exit, _exit): return without exiting.
+   - Blocking I/O (read, accept, recv): return -1 or 0.
+   - Timer/event registration: return 0 or a valid handle.
+5. Run `make test`.
+6. If it compiles and exits within the timeout, call submit_and_exit.
+7. If compile/link error: fix it.
+8. If a needed `__wrap_*` stub is missing: add it under `/* === Linker Wrapper Stubs === */`.
+
+When done, call submit_and_exit.
+"""
+
+
+def prompt_for_hang_fix(process_name: str, test_file: str, makefile: str,
+                        entry_sym: str, timeout_sec: int) -> str:
+    return f"""The test binary timed out after {timeout_sec}s — a blocking function has no working stub.
+
+TEST FILE: {test_file}
+MAKEFILE: {makefile}
+ENTRY SYMBOL: {entry_sym}
+
+DIAGNOSIS:
+`{entry_sym}(1, argv)` was called but the process never returned within {timeout_sec}s.
+A function called (directly or indirectly) by `{entry_sym}` is blocking:
+- Infinite event/main loop (pmf_mainloop, select loop, while(1))
+- Blocking system call (read/accept/recv with no data ready)
+- A function that calls exit()/_exit() which terminates the process before CUnit can finish
+
+FIX:
+1. Read the test file — find which `__wrap_*` stubs exist.
+2. Identify the blocking function: look at what `{process_name}` calls early in startup.
+3. Add or fix the stub so it returns immediately.
+4. Stub pattern for blocking functions:
+   ```c
+   return_type __wrap_blocking_func(args) {{
+       fprintf(stderr, "__wrap_blocking_func called\\n");
+       return safe_return_value;  /* 0, NULL, or valid handle — do NOT loop or exit */
+   }}
+   ```
+5. Run `make test` after fixing.
+
+When done, call submit_and_exit.
+"""
+
+
+def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
+    """Write a minimal production-call test and iterate until binary compiles, runs, and terminates."""
+    test_dir: Path = paths["test_dir"]
+    test_file: Path = paths["test_file"]
+    makefile: Path = paths["makefile"]
+    process_name: str = paths["process_name"]
+    repo_root = cfg.source_dir.parent.parent.resolve()
+    entry_sym = f"{process_name}_entry_main"
 
     print(
-        f"[pipeline] integrating stubs in {len(batches)} batch(es), batch_size={batch_size}",
+        f"[pipeline] minimal test phase: ensuring {entry_sym}() runs and terminates",
         file=sys.stderr,
     )
 
-    for idx, batch_names in enumerate(batches, start=1):
-        batch_bodies = {
-            name: bodies[name]
-            for name in batch_names
-            if name in bodies
-        }
-        if not batch_bodies:
+    for attempt in range(1, cfg.max_minimal_test_attempts + 1):
+        print(f"[pipeline] minimal test attempt {attempt}/{cfg.max_minimal_test_attempts}", file=sys.stderr)
+
+        run_agent(
+            cfg,
+            test_dir,
+            prompt_for_minimal_test(process_name, str(test_file), entry_sym),
+            f"_minimal_test_{attempt:02d}.json",
+            folder=repo_root,
+        )
+
+        sync_wrap_flags(test_file, makefile)
+        res = run_make_test(test_dir, timeout=90)
+
+        if res["ok"]:
+            print(f"[pipeline] minimal test PASSED on attempt {attempt}", file=sys.stderr)
+            return True
+
+        if res.get("timed_out"):
             print(
-                f"[pipeline] skipping batch {idx}/{len(batches)}: no generated bodies for {batch_names}",
+                f"[pipeline] minimal test HUNG (binary did not exit within 90s); fixing blocking stubs",
                 file=sys.stderr,
             )
-            continue
-        # Only tell the integration agent about stubs it actually has bodies for.
-        names_with_bodies = list(batch_bodies.keys())
-        print(
-            f"[pipeline] integrating stub batch {idx}/{len(batches)}: "
-            f"names_with_bodies={names_with_bodies}",
-            file=sys.stderr,
-        )
-        integrate_stubs_and_compile_with_agent(
-            cfg=cfg,
-            paths=paths,
-            generated_bodies=batch_bodies,
-            missing_stub_names=names_with_bodies,
-            batch_index=idx,
-            batch_total=len(batches),
-        )
-        still_missing = [n for n in batch_names if not stub_exists(test_file, n)]
-        if still_missing:
+            run_agent(
+                cfg,
+                test_dir,
+                prompt_for_hang_fix(process_name, str(test_file), str(makefile), entry_sym, 90),
+                f"_hang_fix_{attempt:02d}.json",
+                folder=repo_root,
+            )
+        else:
             print(
-                f"[pipeline] WARNING: {len(still_missing)} stubs not integrated after batch {idx}: {still_missing}",
+                f"[pipeline] minimal test compile/link error on attempt {attempt}; running compile-fix",
                 file=sys.stderr,
+            )
+            _src = cfg.source_dir.resolve()
+            run_agent(
+                cfg,
+                test_dir,
+                prompt_for_compile_fix(
+                    str(makefile),
+                    str(test_file),
+                    (res.get("stderr") or "") + "\n---\n" + (res.get("stdout") or ""),
+                    source_dir=str(_src),
+                    source_makefile=str(_src / "Makefile"),
+                    actual_source_files=[str(p) for p in _project_source_files(cfg)],
+                ),
+                f"_minimal_compile_fix_{attempt:02d}.json",
+                folder=repo_root,
             )
 
-    # Remove wrap flags for stubs that never made it into the test file.
-    # Leaving them causes linker errors that burn all compile-fix attempts.
-    final_missing = [n for n in candidates if not stub_exists(test_file, n)]
-    for n in final_missing:
-        if _remove_wrap_flag(makefile, n):
-            print(f"[pipeline] removed wrap flag for unintegrated stub: {n}", file=sys.stderr)
-    if final_missing:
-        print(f"[pipeline] {len(final_missing)} stubs permanently missing: {final_missing}", file=sys.stderr)
+    print(f"[pipeline] WARNING: minimal test never passed after {cfg.max_minimal_test_attempts} attempts", file=sys.stderr)
+    return False
 
 
 # ==========================================================================
@@ -1711,6 +1809,7 @@ def ensure_skeleton_compiles(cfg: PipelineConfig, paths: dict) -> bool:
     actual_source_files = [str(p) for p in _project_source_files(cfg)]
 
     for attempt in range(cfg.max_compile_fix_attempts + 1):
+        sync_wrap_flags(paths["test_file"], paths["makefile"])
         res = run_make_test(test_dir)
         if res["ok"]:
             print(
@@ -1843,6 +1942,7 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
                 folder=repo_root,
             )
 
+            sync_wrap_flags(test_file, paths["makefile"])
             make_res = run_make_test(test_dir)
             if not make_res["ok"]:
                 print(
@@ -1864,6 +1964,7 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
                     f"{_safe_filename(func['id'])}_attempt_{attempt:02d}_compile_fix.json",
                     folder=repo_root,
                 )
+                sync_wrap_flags(test_file, paths["makefile"])
                 make_res = run_make_test(test_dir)
 
             last_make_ok = make_res["ok"]
@@ -1934,14 +2035,17 @@ def run(cfg: PipelineConfig) -> int:
 
     analysis = run_or_load_analysis(cfg, paths["analysis_path"])
 
-    ensure_makefile(cfg, paths)
     ensure_test_file(cfg, paths)
     handle_stubs(cfg, paths, analysis)
+    ensure_makefile(cfg, paths)
 
     if not ensure_skeleton_compiles(cfg, paths):
         print("[pipeline] skeleton failed to compile after all fix attempts",
             file=sys.stderr)
         return 2
+
+    if not ensure_minimal_test_runs(cfg, paths):
+        print("[pipeline] WARNING: minimal test never passed; coverage tests may fail", file=sys.stderr)
 
     summary = process_functions(cfg, paths, analysis)
 
@@ -1984,6 +2088,11 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
     ap.add_argument("--only-level", type=int, default=None)
     ap.add_argument("--max-functions", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--python-bin", type=str, default=sys.executable,
+                    help="Python binary used by agent.js for gcov analysis tool")
+    ap.add_argument("--max-stub-gen-retries", type=int, default=3)
+    ap.add_argument("--max-stub-integrate-retries", type=int, default=3)
+    ap.add_argument("--max-minimal-test-attempts", type=int, default=5)
     ap.add_argument(
         "--func-docs-dir",
         type=Path,
@@ -2006,6 +2115,10 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
         only_level=ns.only_level,
         max_functions=ns.max_functions,
         dry_run=ns.dry_run,
+        python_bin=ns.python_bin,
+        max_stub_gen_retries=ns.max_stub_gen_retries,
+        max_stub_integrate_retries=ns.max_stub_integrate_retries,
+        max_minimal_test_attempts=ns.max_minimal_test_attempts,
         func_docs_dir=ns.func_docs_dir.resolve(),
     )
 
