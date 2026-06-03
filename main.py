@@ -30,6 +30,8 @@ from stub.stub import ProjectAnalyzer          # type: ignore
 
 
 # region Config & Infrastructure
+
+@dataclass
 class PipelineConfig:
     source_dir: Path
     agent_js: Path
@@ -53,6 +55,7 @@ class PipelineConfig:
     max_stub_gen_retries: int = 3
     max_stub_integrate_retries: int = 3
     max_minimal_test_attempts: int = 5
+    semantic_judge_min_score: int = 75
 
 def derive_test_dir(src_dir: Path) -> Path:
     src_dir = src_dir.resolve()
@@ -314,6 +317,7 @@ def run_agent(
         "--folder", str(agent_folder),
         "--prompt-file", str(prompt_file),
         "--history", str(history_path),
+        "--capture-raw-http-trace",
     ]
 
     env = os.environ.copy()
@@ -536,13 +540,48 @@ def prompt_for_compile_fix(
     else:
         actual_source_files_text = " (not provided)"
 
-    return f"""The CUnit test does not compile.
+    return f"""
+
+The CUnit test failed to compile, link, or run.
+
+Fix the failure shown in the output below. It may be a compiler error, linker error, CUnit assertion failure, runtime crash, segfault, abort, or other execution failure.
+
+After fix, make sure to compile them again and run them to make sure its ok now.
 
 FILES YOU MAY EDIT
 - Test Makefile:
   `{makefile}`
 - Test C file:
   `{test_file}`
+
+TEST HARNESS FIXING RULES
+You are expected to fix the test harness, not production code.
+
+You MAY change:
+- the test C file,
+- wrapper stubs,
+- mock return values,
+- fake/static test data,
+- test setup/reset functions,
+- local prototypes used only by the test,
+- linker wrap flags in the test Makefile,
+- include/compiler/linker settings in the test Makefile if needed.
+
+You MUST NOT change:
+- production source files,
+- production headers,
+- original source Makefile,
+- generated external dependencies,
+- system headers.
+
+Important:
+- Wrapper/stub signatures may be wrong. Inspect the real function prototypes and fix wrappers to match exactly.
+- Mock return values may be wrong. If production dereferences a returned pointer, return valid static fake storage.
+- Global fake data may be uninitialized. Initialize required fake globals in reset/setup or mock open/init functions.
+- Linker wrap flags may be missing or stale. Preserve existing wrap flags, but add/remove test Makefile wrap flags if required by the test harness.
+- Do not call `__real_*` from wrappers.
+- Do not hide crashes by deleting assertions or replacing them with always-pass assertions.
+- Do not edit production code to make the test pass.
 
 REFERENCE LOCATIONS
 - Source folder passed by user:
@@ -614,32 +653,48 @@ When done, call submit_and_exit.
 """
 
 def prompt_for_minimal_test(process_name: str, test_file: str, entry_sym: str) -> str:
-    return f"""Ensure the CUnit test file has a minimal test that calls the production entry point and RETURNS.
+    return f"""
+You are editing an existing CUnit test file.
 
-TEST FILE: {test_file}
-ENTRY SYMBOL: {entry_sym}
+File to modify:
+{test_file}
 
-TASK:
-1. Read the test file.
-2. If no test calling `{entry_sym}` exists, add one:
-   ```c
-   static void test_minimal_entry(void) {{
-       char *argv[] = {{"{process_name}", NULL}};
-       int ret = {entry_sym}(1, argv);
-       (void)ret;
-       CU_ASSERT_TRUE(1);
-   }}
-   ```
-3. Register it in the test suite with CU_add_test.
-4. Ensure ALL stubs for blocking functions return immediately:
-   - Infinite loops (pmf_mainloop, event loops): return immediately, do NOT loop.
-   - Process-exit calls (pmf_exit, exit, _exit): return without exiting.
-   - Blocking I/O (read, accept, recv): return -1 or 0.
-   - Timer/event registration: return 0 or a valid handle.
-5. Run `make test`.
-6. If it compiles and exits within the timeout, call submit_and_exit.
-7. If compile/link error: fix it.
-8. If a needed `__wrap_*` stub is missing: add it under `/* === Linker Wrapper Stubs === */`.
+Process:
+{process_name}
+
+Entry function:
+{entry_sym}
+
+Goal:
+Make a minimal startup test that compiles, links, runs, and exits quickly.
+
+Do not over-engineer this stage.
+Do not deeply rewrite the test framework.
+Do not create many scenario tests here.
+Do not run real blocking loops, hardware calls, IPC, timers, daemon loops, or real sleeps.
+
+Required:
+1. Add or fix wrappers/stubs for external dependencies needed by {entry_sym}.
+2. Stub any mainloop/blocking function so it returns immediately.
+3. Add configurable return values only where needed to make startup run.
+4. Add simple call counters for important startup dependencies if easy:
+   - process start/init
+   - logging init
+   - event registration
+   - timer registration
+   - mainloop
+   - exit
+5. Add/reset those counters in reset_mocks() if reset_mocks exists.
+6. Add one minimal CUnit test that calls {entry_sym}.
+7. Assert only basic startup behavior that is obvious from existing code.
+8. Ensure CUnit main returns non-zero on test failure using CU_get_number_of_failures().
+
+Important:
+- This is only the bootstrap compile/run stage.
+- Do not attempt full semantic coverage here.
+- Keep changes small.
+- Preserve existing tests.
+- If a symbol/signature is unknown, inspect only the relevant header/source needed to fix it.
 
 When done, call submit_and_exit.
 """
@@ -788,7 +843,46 @@ Use safe/minimal arguments:
 - For pointer args, create local zeroed objects or safe buffers when possible.
 - Do not pass `NULL` unless the function is expected to handle `NULL`.
 
-The first goal is to make gcov report the target function as called at least once."""
+The first goal is to make gcov report the target function as called at least once.
+
+You are not allowed to write coverage-only tests.
+
+A valid test must satisfy all of these rules:
+
+1. Use Arrange / Act / Assert structure.
+2. Assert at least one externally observable behavior:
+   - return value,
+   - global state change,
+   - output structure contents,
+   - mock call count,
+   - mock argument values,
+   - pointer assignment,
+   - cleanup/reset behavior,
+   - error logging / exit behavior.
+3. Do not use meaningless assertions:
+   - CU_ASSERT_TRUE(1)
+   - CU_ASSERT_TRUE(counter >= 0)
+   - CU_ASSERT_PTR_NOT_NULL(any pointer that was manually assigned in the test without calling production code)
+4. Every mock must capture enough information to verify behavior:
+   - call count,
+   - last arguments,
+   - return value control.
+5. Each test must reset all mock state before running.
+6. Do not remove existing meaningful assertions to fix compilation.
+7. Prefer exact assertions over loose assertions:
+   - prefer CU_ASSERT_EQUAL(x, 1)
+   - avoid CU_ASSERT_TRUE(x >= 1) unless multiple calls are genuinely acceptable.
+8. If the target calls another function, verify the interaction:
+   - called or not called,
+   - number of calls,
+   - argument values.
+9. If the function mutates a struct, assert exact changed fields and exact unchanged fields where important.
+10. If testing an error path, assert the error effect:
+    - error log called,
+    - exit called,
+    - cleanup performed,
+    - return value indicates failure.
+"""
 
     report_name = f"{test_file.split('/')[-1]}_report.txt"
 
@@ -1692,7 +1786,7 @@ def ensure_skeleton_compiles(cfg: PipelineConfig, paths: dict) -> bool:
             )
             return True
 
-        combined_output = (res.get("stderr") or "") + "\n---\n" + (res.get("stdout") or "")
+        combined_output = collect_failure_diagnostics(test_dir, test_file, res)
         print(
             f"[pipeline] compile attempt {attempt + 1} failed, asking agent to fix",
             file=sys.stderr,
@@ -1717,9 +1811,654 @@ def ensure_skeleton_compiles(cfg: PipelineConfig, paths: dict) -> bool:
 
 # endregion Stage 4 — Skeleton Compilation
 
+# region Stage 5 & 6 Helpers
+
+def _read_json_loose(path: Path) -> dict:
+    """
+    Read JSON written by the agent.
+
+    The agent is instructed to write strict JSON, but this parser is tolerant
+    of accidental surrounding text.
+    """
+    if not path.exists():
+        return {}
+
+    raw = path.read_text(errors="ignore").strip()
+    if not raw:
+        return {}
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start:end + 1])
+        except Exception:
+            return {}
+
+    return {}
+
+
+def _semantic_context_path(test_dir: Path) -> Path:
+    return test_dir / "_leaf_to_root_semantic_context.json"
+
+
+def _load_semantic_context(test_dir: Path) -> dict:
+    path = _semantic_context_path(test_dir)
+    if not path.exists():
+        return {"functions": {}}
+
+    data = _read_json_loose(path)
+    if not isinstance(data, dict):
+        return {"functions": {}}
+
+    if "functions" not in data or not isinstance(data["functions"], dict):
+        data["functions"] = {}
+
+    return data
+
+
+def _append_semantic_context(test_dir: Path, func: dict, verdict: dict) -> None:
+    path = _semantic_context_path(test_dir)
+    data = _load_semantic_context(test_dir)
+    fid = func.get("id") or func.get("name") or "unknown"
+    data["functions"][fid] = {
+        "func": func,
+        "verdict": verdict,
+    }
+    write_json(path, data)
+
+
+def prompt_for_semantic_test_judge(
+    *,
+    process_name: str,
+    test_file: str,
+    func: dict,
+    coverage: dict,
+    make_result: dict,
+    semantic_context: dict,
+    verdict_file: str,
+    min_score: int,
+) -> str:
+    fid = func.get("id") or func.get("name") or "unknown_function"
+
+    return f"""
+You are a semantic unit-test judge for generated CUnit tests.
+
+You are NOT fixing code in this step.
+You must inspect the real repository source and judge whether the existing tests
+for the target function are meaningful.
+
+Process:
+{process_name}
+
+Target function:
+{fid}
+
+Target function metadata:
+{json.dumps(func, indent=2, default=str)}
+
+Current coverage info:
+{json.dumps(coverage, indent=2, default=str)}
+
+Latest make/test result:
+{json.dumps(make_result, indent=2, default=str)}
+
+Existing leaf-to-root semantic context:
+{json.dumps(semantic_context, indent=2, default=str)}
+
+Test file:
+{test_file}
+
+Verdict output file:
+{verdict_file}
+
+Minimum acceptable semantic score:
+{min_score}
+
+You must inspect:
+1. the target function implementation,
+2. headers defining structs/macros/globals used by the function,
+3. callees and wrappers/mocks,
+4. current CUnit tests,
+5. parent/caller functions if needed to understand why this function matters,
+6. previous accepted leaf-function context.
+
+Judge semantically, not by simple text patterns.
+
+A passing test set must demonstrate that the tests would fail if important
+production behavior was broken.
+
+Evaluate whether tests verify:
+- return values,
+- state transitions,
+- global variable changes,
+- struct field changes,
+- timer/counter behavior,
+- dependency call count,
+- dependency arguments,
+- payload structs passed to dependencies,
+- error/cleanup behavior,
+- null/boundary/error branches where relevant.
+
+Also judge whether the test file now contains useful comments/explanations for
+this function so parent-function tests can use the behavior context later.
+
+Fail if the tests are mostly smoke/coverage-only, even if coverage is high.
+
+Write ONLY valid JSON to:
+{verdict_file}
+
+JSON object fields:
+- passed: boolean
+- score: integer from 0 to 100
+- summary: string
+- function_explanation: string
+- tested_behaviors: array of strings
+- important_state: array of strings
+- important_dependencies: array of strings
+- parent_context_value: string
+- missing_cases: array of strings
+- weak_or_meaningless_checks: array of strings
+- required_fixes: array of strings
+- remaining_risks: array of strings
+
+Set passed=true only if score >= {min_score} and the tests are semantically meaningful.
+"""
+
+
+def run_semantic_test_judge(
+    cfg: PipelineConfig,
+    *,
+    test_dir: Path,
+    repo_root: Path,
+    process_name: str,
+    test_file: Path,
+    func: dict,
+    coverage: dict,
+    make_result: dict,
+) -> dict:
+    """LLM-based semantic quality gate."""
+    min_score = int(getattr(cfg, "semantic_judge_min_score", 75))
+    fid = func.get("id") or func.get("name") or "unknown_function"
+
+    verdict_file = test_dir / f"_semantic_judge_{_safe_filename(fid)}.json"
+
+    try:
+        verdict_file.unlink()
+    except FileNotFoundError:
+        pass
+
+    semantic_context = _load_semantic_context(test_dir)
+
+    run_agent(
+        cfg,
+        test_dir,
+        prompt_for_semantic_test_judge(
+            process_name=process_name,
+            test_file=str(test_file),
+            func=func,
+            coverage=coverage or {},
+            make_result=make_result or {},
+            semantic_context=semantic_context,
+            verdict_file=str(verdict_file),
+            min_score=min_score,
+        ),
+        f"{_safe_filename(fid)}_semantic_judge.json",
+        folder=repo_root,
+    )
+
+    verdict = _read_json_loose(verdict_file)
+
+    if not verdict:
+        return {
+            "passed": False,
+            "score": 0,
+            "summary": "Semantic judge did not produce a readable JSON verdict.",
+            "function_explanation": "",
+            "tested_behaviors": [],
+            "important_state": [],
+            "important_dependencies": [],
+            "parent_context_value": "",
+            "missing_cases": ["No semantic judge verdict was produced."],
+            "weak_or_meaningless_checks": [],
+            "required_fixes": ["Run semantic repair and ensure judge JSON is written."],
+            "remaining_risks": [],
+        }
+
+    score = int(verdict.get("score") or 0)
+    verdict["score"] = score
+    verdict["passed"] = bool(verdict.get("passed")) and score >= min_score
+
+    return verdict
+
+
+def prompt_for_semantic_test_repair(
+    *,
+    process_name: str,
+    test_file: str,
+    func: dict,
+    coverage: dict,
+    judge_verdict: dict,
+    semantic_context: dict,
+) -> str:
+    fid = func.get("id") or func.get("name") or "unknown_function"
+
+    return f"""
+You are editing an existing CUnit test file.
+
+The tests compile/run or partially compile/run, but the semantic judge says
+they are not meaningful enough.
+
+Process:
+{process_name}
+
+Target function:
+{fid}
+
+Target function metadata:
+{json.dumps(func, indent=2, default=str)}
+
+Current coverage:
+{json.dumps(coverage, indent=2, default=str)}
+
+Semantic judge verdict:
+{json.dumps(judge_verdict, indent=2, default=str)}
+
+Existing leaf-to-root semantic context:
+{json.dumps(semantic_context, indent=2, default=str)}
+
+Test file to modify:
+{test_file}
+
+You must inspect the real source before editing:
+- target function implementation,
+- structs/macros/globals it uses,
+- external dependencies it calls,
+- callers/parents if useful,
+- existing mocks/wrappers in the test file.
+
+Do NOT add generic template tests.
+Do NOT add coverage-only tests.
+Do NOT guess field names or signatures.
+
+Fix the tests so they semantically prove behavior.
+
+Required repair behavior:
+1. Cover the judge's missing_cases and required_fixes.
+2. Add or strengthen assertions so tests fail when production behavior is wrong.
+3. Assert exact return values/state/mocks/arguments where possible.
+4. Capture dependency arguments in wrappers when behavior depends on them.
+5. If a struct pointer is passed to a dependency, copy it and assert important fields.
+6. Add comments near the tests explaining:
+   - what {fid} does,
+   - why each scenario matters,
+   - what parent/root functions can rely on from this leaf/intermediate function.
+7. Extend reset_mocks/reset helpers for any new mock state.
+8. Preserve existing meaningful tests and assertions.
+9. Keep the test binary non-blocking and terminating.
+
+Do not weaken tests just to compile.
+If compilation fails because of wrong assumptions, inspect headers/source and correct them.
+
+When done, call submit_and_exit.
+"""
+
+
+def prompt_for_function_test_with_semantic_context(
+    *,
+    func: dict,
+    coverage: dict,
+    test_file: str,
+    process_name: str,
+    attempt: int,
+    max_attempts: int,
+    make_ok: bool,
+    semantic_context: dict,
+    last_judge_verdict: Optional[dict],
+) -> str:
+    fid = func.get("id") or func.get("name") or "unknown_function"
+
+    return f"""
+You are editing an existing CUnit test file for production C code.
+
+Process:
+{process_name}
+
+Target function:
+{fid}
+
+Target metadata:
+{json.dumps(func, indent=2, default=str)}
+
+Current coverage:
+{json.dumps(coverage, indent=2, default=str)}
+
+Attempt:
+{attempt}/{max_attempts}
+
+Previous make_ok:
+{make_ok}
+
+Existing leaf-to-root semantic context from already accepted lower-level functions:
+{json.dumps(semantic_context, indent=2, default=str)}
+
+Previous semantic judge verdict for this function, if any:
+{json.dumps(last_judge_verdict or {}, indent=2, default=str)}
+
+Test file:
+{test_file}
+
+You must explore the source yourself before editing.
+Inspect:
+1. target implementation,
+2. used headers,
+3. structs/enums/macros/constants,
+4. globals read/written,
+5. callees,
+6. callers/parent functions,
+7. current test file,
+8. current mocks/wrappers,
+9. Makefile wrapping style.
+
+Because this pipeline processes leaf-to-root, use the semantic_context above
+to understand what lower-level functions already guarantee. Parent tests should
+not be random coverage calls; they should verify orchestration and integration
+of the child behaviors.
+
+Add meaningful tests for realistic use cases of {fid}.
+
+The tests must include comments/explanations that describe:
+- what {fid} is responsible for,
+- which lower-level behavior it depends on,
+- what each scenario proves,
+- why parent/root functions can rely on this behavior later.
+
+Do not create generic template tests.
+Do not create smoke tests.
+Do not merely execute lines for gcov.
+
+A meaningful test should verify observable behavior:
+- return value,
+- global state change,
+- struct field change,
+- timer/counter transition,
+- dependency call count,
+- dependency argument values,
+- payload passed to dependency,
+- error log,
+- cleanup,
+- exit behavior,
+- early return/no-op behavior.
+
+Create separate tests for distinct source behaviors when present:
+- normal path,
+- boundary path,
+- null/invalid path,
+- external dependency failure,
+- state transition,
+- cleanup/error branch,
+- early return/no-op.
+
+Mocks/wrappers:
+- capture call count,
+- capture important arguments,
+- allow configurable returns,
+- capture payload structs with memcpy when needed,
+- never block or call real hardware/IPC/mainloop.
+
+reset_mocks/reset helper:
+- reset all new mock state,
+- reset production globals touched by tests,
+- reset arrays/pointers/null-injection flags,
+- do not rely on test order.
+
+CUnit main:
+- must return non-zero when CUnit has failures.
+
+Do not delete meaningful tests.
+Do not weaken assertions to pass build.
+If something does not compile, inspect source/header definitions and fix it.
+
+When done, call submit_and_exit.
+"""
+
+
+def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> str:
+    """
+    Collect runtime diagnostics whenever make/test fails.
+
+    If the binary does not exist because it was a compile/link failure, this
+    function returns that fact. If the binary exists, it captures:
+    - CUnit report/log files,
+    - direct binary stdout/stderr,
+    - gdb backtrace if gdb is available.
+    """
+    chunks: list[str] = []
+    test_bin = test_dir / test_binary_name
+
+    chunks.append("RUNTIME DIAGNOSTICS")
+    chunks.append(f"test_dir: {test_dir}")
+    chunks.append(f"test_binary: {test_bin}")
+
+    for name in [f"{test_binary_name}_log.txt", f"{test_binary_name}_report.txt"]:
+        p = test_dir / name
+        if p.exists():
+            try:
+                chunks.append(
+                    f"\n--- {name} ---\n"
+                    f"{p.read_text(errors='ignore')[-12000:]}"
+                )
+            except Exception as e:
+                chunks.append(f"\n--- {name} unreadable: {e} ---")
+
+    if not test_bin.exists():
+        chunks.append(
+            "\n--- binary check ---\n"
+            "Test binary does not exist. This is probably a compile/link failure, "
+            "not a runtime crash."
+        )
+        return "\n".join(chunks)
+
+    try:
+        direct = subprocess.run(
+            [str(test_bin)],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            f"returncode={direct.returncode}\n"
+            f"stdout:\n{direct.stdout[-8000:]}\n"
+            f"stderr:\n{direct.stderr[-8000:]}"
+        )
+    except subprocess.TimeoutExpired:
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            "Timed out after 20 seconds. The test binary may be hanging."
+        )
+    except Exception as e:
+        chunks.append(f"\n--- direct binary run failed ---\n{e}")
+
+    try:
+        gdb = subprocess.run(
+            [
+                "gdb", "-q", "-batch",
+                "-ex", "set pagination off",
+                "-ex", "run",
+                "-ex", "bt",
+                "-ex", "bt full",
+                "--args", str(test_bin),
+            ],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=40,
+        )
+        chunks.append(
+            "\n--- gdb backtrace ---\n"
+            f"returncode={gdb.returncode}\n"
+            f"stdout:\n{gdb.stdout[-20000:]}\n"
+            f"stderr:\n{gdb.stderr[-8000:]}"
+        )
+    except FileNotFoundError:
+        chunks.append("\n--- gdb backtrace ---\ngdb not installed.")
+    except subprocess.TimeoutExpired:
+        chunks.append("\n--- gdb backtrace ---\ngdb timed out after 40 seconds.")
+    except Exception as e:
+        chunks.append(f"\n--- gdb backtrace failed ---\n{e}")
+
+    return "\n".join(chunks)
+
+
+def build_output_with_runtime_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
+    """
+    Combine normal make output with runtime diagnostics.
+
+    Use this instead of:
+      (res.get("stderr") or "") + "\\n---\\n" + (res.get("stdout") or "")
+
+    Gives the agent enough information to fix runtime crashes like Error 139.
+    """
+    base_output = collect_failure_diagnostics(test_dir, test_file, res)
+    test_binary_name = Path(test_file).stem
+    diagnostics = collect_runtime_crash_diagnostics(test_dir, test_binary_name)
+
+    return (
+        base_output
+        + "\n\n==================== RUNTIME / EXECUTION DIAGNOSTICS ====================\n"
+        + diagnostics
+        + "\n======================\n"
+        + "\nNOTE TO AGENT:\n"
+        + "- If compilation/link failed, fix the compile/link error first.\n"
+        + "- If the binary exists and direct run or gdb shows a crash, fix that runtime crash.\n"
+        + "- For segfaults, inspect the backtrace and likely wrapper/mock/global pointer cause.\n"
+        + "- Do not treat a runtime segfault as a normal compiler error.\n"
+    )
+
+
+def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
+    """
+    Collect diagnostic information for any make/test failure.
+
+    Safe for compile/link failures too:
+    - If the binary does not exist, it records that.
+    - If the binary exists, it runs it directly and tries gdb.
+    """
+    chunks: list[str] = []
+
+    test_binary_name = Path(test_file).stem
+    test_bin = test_dir / test_binary_name
+
+    chunks.append("AUTOMATIC FAILURE DIAGNOSTICS")
+    chunks.append(f"test_dir: {test_dir}")
+    chunks.append(f"test_file: {test_file}")
+    chunks.append(f"test_binary: {test_bin}")
+
+    base_output = (res.get("stderr") or "") + "\n---\n" + (res.get("stdout") or "")
+    chunks.append("\n--- original make/test output ---")
+    chunks.append(base_output[-30000:])
+
+    for name in [
+        f"{test_binary_name}_log.txt",
+        f"{test_binary_name}_report.txt",
+    ]:
+        p = test_dir / name
+        if p.exists():
+            try:
+                chunks.append(f"\n--- {name} ---")
+                chunks.append(p.read_text(errors="ignore")[-12000:])
+            except Exception as e:
+                chunks.append(f"\n--- {name} unreadable: {e} ---")
+
+    if not test_bin.exists():
+        chunks.append(
+            "\n--- binary check ---\n"
+            "Test binary does not exist. This is likely a compile or link failure."
+        )
+        return "\n".join(chunks)
+
+    try:
+        direct = subprocess.run(
+            [str(test_bin)],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            f"returncode={direct.returncode}\n"
+            f"stdout:\n{direct.stdout[-8000:]}\n"
+            f"stderr:\n{direct.stderr[-8000:]}"
+        )
+    except subprocess.TimeoutExpired:
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            "Timed out after 20 seconds. This is likely a runtime hang/blocking call."
+        )
+    except Exception as e:
+        chunks.append(f"\n--- direct binary run failed ---\n{e}")
+
+    try:
+        gdb = subprocess.run(
+            [
+                "gdb", "-q", "-batch",
+                "-ex", "set pagination off",
+                "-ex", "run",
+                "-ex", "bt",
+                "-ex", "bt full",
+                "--args", str(test_bin),
+            ],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=40,
+        )
+        chunks.append(
+            "\n--- gdb backtrace ---\n"
+            f"returncode={gdb.returncode}\n"
+            f"stdout:\n{gdb.stdout[-20000:]}\n"
+            f"stderr:\n{gdb.stderr[-8000:]}"
+        )
+    except FileNotFoundError:
+        chunks.append("\n--- gdb backtrace ---\ngdb not installed.")
+    except subprocess.TimeoutExpired:
+        chunks.append("\n--- gdb backtrace ---\ngdb timed out after 40 seconds.")
+    except Exception as e:
+        chunks.append(f"\n--- gdb backtrace failed ---\n{e}")
+
+    return "\n".join(chunks)
+
+# endregion Stage 5 & 6 Helpers
+
 # region Stage 5 — Minimal Test Validation
 def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
-    """Write a minimal production-call test and iterate until binary compiles, runs, and terminates."""
+    """
+    Write a minimal production-call/smoke test and iterate until the binary
+    compiles, runs, terminates, and passes.
+
+    This stage intentionally does NOT run the semantic judge.
+
+    Stage 5 is infrastructure validation only:
+    - Makefile works
+    - wrappers/stubs link
+    - CUnit binary runs
+    - binary terminates
+    - no immediate runtime crash/hang
+
+    Semantic judging happens later in Stage 6, leaf -> root.
+    """
     test_dir: Path = paths["test_dir"]
     test_file: Path = paths["test_file"]
     makefile: Path = paths["makefile"]
@@ -1733,7 +2472,10 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
     )
 
     for attempt in range(1, cfg.max_minimal_test_attempts + 1):
-        print(f"[pipeline] minimal test attempt {attempt}/{cfg.max_minimal_test_attempts}", file=sys.stderr)
+        print(
+            f"[pipeline] minimal test attempt {attempt}/{cfg.max_minimal_test_attempts}",
+            file=sys.stderr,
+        )
 
         run_agent(
             cfg,
@@ -1747,34 +2489,51 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
         res = run_make_test(test_dir, timeout=90)
 
         if res["ok"]:
-            print(f"[pipeline] minimal test PASSED on attempt {attempt}", file=sys.stderr)
+            print(
+                f"[pipeline] minimal test PASSED on attempt {attempt}; "
+                f"binary compiles, runs, terminates, and infrastructure is usable",
+                file=sys.stderr,
+            )
             return True
 
         if res.get("timed_out"):
             print(
-                f"[pipeline] minimal test HUNG (binary did not exit within 90s); fixing blocking stubs",
+                f"[pipeline] minimal test HUNG binary did not exit within 90s; "
+                f"fixing blocking stubs",
                 file=sys.stderr,
             )
             run_agent(
                 cfg,
                 test_dir,
-                prompt_for_hang_fix(process_name, str(test_file), str(makefile), entry_sym, 90),
+                prompt_for_hang_fix(
+                    process_name,
+                    str(test_file),
+                    str(makefile),
+                    entry_sym,
+                    90,
+                ),
                 f"_hang_fix_{attempt:02d}.json",
                 folder=repo_root,
             )
         else:
             print(
-                f"[pipeline] minimal test compile/link error on attempt {attempt}; running compile-fix",
+                f"[pipeline] minimal test compile/link/runtime error on attempt {attempt}; "
+                f"collecting diagnostics and running compile-fix",
                 file=sys.stderr,
             )
             _src = cfg.source_dir.resolve()
+            diagnostic_build_output = build_output_with_runtime_diagnostics(
+                test_dir,
+                test_file,
+                res,
+            )
             run_agent(
                 cfg,
                 test_dir,
                 prompt_for_compile_fix(
                     str(makefile),
                     str(test_file),
-                    (res.get("stderr") or "") + "\n---\n" + (res.get("stdout") or ""),
+                    diagnostic_build_output,
                     source_dir=str(_src),
                     source_makefile=str(_src / "Makefile"),
                     actual_source_files=[str(p) for p in _project_source_files(cfg)],
@@ -1794,10 +2553,13 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
     Process target functions leaf -> root.
 
     Continuation behavior:
-    - Check existing gcov data (no rebuild) to skip already-covered functions.
-    - Analyze gcov line-range coverage for that function.
-    - If coverage >= cfg.coverage_threshold, skip the function.
-    - Default threshold is 80.0%.
+    - Check existing gcov data without rebuilding.
+    - If coverage >= threshold, still require LLM semantic judge pass.
+    - Accepted leaf/intermediate function explanations are stored and passed upward.
+
+    Runtime diagnostic addition:
+    - On every make/test failure, append runtime logs/direct-run/gdb diagnostics
+      to the compile-fix prompt input.
     """
     test_dir: Path = paths["test_dir"]
     test_file: Path = paths["test_file"]
@@ -1805,25 +2567,33 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
 
     repo_root = cfg.source_dir.parent.parent.resolve()
     funcs = functions_leaf_first(analysis)
-    print(f"[pipeline] {len(funcs)} functions to process (leaf -> root)",
-        file=sys.stderr)
-    print(f"[pipeline] continuation skip threshold: {cfg.coverage_threshold:.1f}%",
-        file=sys.stderr)
+    print(
+        f"[pipeline] {len(funcs)} functions to process (leaf -> root)",
+        file=sys.stderr,
+    )
+    print(
+        f"[pipeline] continuation skip threshold: {cfg.coverage_threshold:.1f}%",
+        file=sys.stderr,
+    )
+    print(
+        f"[pipeline] semantic judge min score: {getattr(cfg, 'semantic_judge_min_score', 75)}",
+        file=sys.stderr,
+    )
 
     done = 0
     skipped = 0
     coverage_results: dict[str, Optional[float]] = {}
+    semantic_results: dict[str, Optional[int]] = {}
     for func in funcs:
         if cfg.only_function and func["id"] != cfg.only_function:
             continue
+
         if cfg.only_level is not None and func.get("depth") != cfg.only_level:
             continue
+
         if cfg.max_functions is not None and done >= cfg.max_functions:
             break
 
-        # Coverage pre-check: read existing gcov WITHOUT rebuilding.
-        # Avoids clean-test wiping all coverage data on every function.
-        # Compile failures are caught inside the attempt loop.
         print(
             f"[pipeline] coverage pre-check for {func['id']} "
             f"lines {func['start_line']}..{func['end_line']}",
@@ -1848,16 +2618,43 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
             if pct is None:
                 pct = cov.get("coverage_percent")
 
+        last_judge: Optional[dict] = None
+
         if pct is not None and pct >= cfg.coverage_threshold:
+            func_for_judge = dict(func)
+            func_for_judge["source_file"] = str(source_file_abs)
+
+            judge = run_semantic_test_judge(
+                cfg,
+                test_dir=test_dir,
+                repo_root=repo_root,
+                process_name=process_name,
+                test_file=test_file,
+                func=func_for_judge,
+                coverage=cov or {},
+                make_result={"ok": True, "note": "coverage pre-check semantic judge"},
+            )
+            semantic_results[func["id"]] = judge.get("score")
+
+            if judge.get("passed"):
+                print(
+                    f"[pipeline] SKIP {func['id']} coverage={pct:.1f}% "
+                    f">= threshold={cfg.coverage_threshold:.1f}% "
+                    f"and semantic score={judge.get('score')}",
+                    file=sys.stderr,
+                )
+                _append_semantic_context(test_dir, func_for_judge, judge)
+                coverage_results[func["id"]] = pct
+                skipped += 1
+                done += 1
+                continue
+
+            last_judge = judge
             print(
-                f"[pipeline] SKIP {func['id']} coverage={pct:.1f}% "
-                f">= threshold={cfg.coverage_threshold:.1f}%",
+                f"[pipeline] coverage OK but semantic judge FAILED for {func['id']}; "
+                f"score={judge.get('score')} summary={judge.get('summary')}",
                 file=sys.stderr,
             )
-            coverage_results[func["id"]] = pct
-            skipped += 1
-            done += 1
-            continue
 
         print(
             f"[pipeline] --> PROCESS {func['id']} current coverage={pct}%, "
@@ -1869,15 +2666,31 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
         for attempt in range(1, cfg.max_test_attempts + 1):
             func_for_prompt = dict(func)
             func_for_prompt["source_file"] = str(source_file_abs)
-            prompt = prompt_for_function_test(
-                func=func_for_prompt,
-                coverage=cov,
-                test_file=str(test_file),
-                process_name=process_name,
-                attempt=attempt,
-                max_attempts=cfg.max_test_attempts,
-                make_ok=last_make_ok,
-            )
+
+            semantic_context = _load_semantic_context(test_dir)
+
+            if last_judge:
+                prompt = prompt_for_semantic_test_repair(
+                    process_name=process_name,
+                    test_file=str(test_file),
+                    func=func_for_prompt,
+                    coverage=cov or {},
+                    judge_verdict=last_judge,
+                    semantic_context=semantic_context,
+                )
+            else:
+                prompt = prompt_for_function_test_with_semantic_context(
+                    func=func_for_prompt,
+                    coverage=cov or {},
+                    test_file=str(test_file),
+                    process_name=process_name,
+                    attempt=attempt,
+                    max_attempts=cfg.max_test_attempts,
+                    make_ok=last_make_ok,
+                    semantic_context=semantic_context,
+                    last_judge_verdict=last_judge,
+                )
+
             run_agent(
                 cfg,
                 test_dir,
@@ -1890,17 +2703,23 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
             make_res = run_make_test(test_dir)
             if not make_res["ok"]:
                 print(
-                    f"[pipeline] make test failed after attempt {attempt} for {func['id']}; running compile-fix",
+                    f"[pipeline] make test failed after attempt {attempt} for {func['id']}; "
+                    f"collecting diagnostics and running compile-fix",
                     file=sys.stderr,
                 )
                 _src_dir = cfg.source_dir.resolve()
+                diagnostic_build_output = build_output_with_runtime_diagnostics(
+                    test_dir,
+                    test_file,
+                    make_res,
+                )
                 run_agent(
                     cfg,
                     test_dir,
                     prompt_for_compile_fix(
                         str(paths["makefile"]),
                         str(test_file),
-                        (make_res.get("stderr") or "") + "\n---\n" + (make_res.get("stdout") or ""),
+                        diagnostic_build_output,
                         source_dir=str(_src_dir),
                         source_makefile=str(_src_dir / "Makefile"),
                         actual_source_files=[str(p) for p in _project_source_files(cfg)],
@@ -1932,32 +2751,63 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
                 if pct is None:
                     pct = cov.get("coverage_percent")
 
-            if pct is not None and pct >= cfg.coverage_threshold:
+            if pct is not None and pct >= cfg.coverage_threshold and make_res["ok"]:
+                func_for_judge = dict(func)
+                func_for_judge["source_file"] = str(source_file_abs)
+
+                judge = run_semantic_test_judge(
+                    cfg,
+                    test_dir=test_dir,
+                    repo_root=repo_root,
+                    process_name=process_name,
+                    test_file=test_file,
+                    func=func_for_judge,
+                    coverage=cov or {},
+                    make_result=make_res,
+                )
+                semantic_results[func["id"]] = judge.get("score")
+
+                if judge.get("passed"):
+                    print(
+                        f"[pipeline] -> DONE {func['id']} coverage={pct:.1f}% "
+                        f">= threshold={cfg.coverage_threshold:.1f}% "
+                        f"semantic score={judge.get('score')}",
+                        file=sys.stderr,
+                    )
+                    _append_semantic_context(test_dir, func_for_judge, judge)
+                    last_judge = None
+                    break
+
+                last_judge = judge
                 print(
-                    f"[pipeline] -> DONE {func['id']} coverage={pct:.1f}% "
-                    f">= threshold={cfg.coverage_threshold:.1f}%",
+                    f"[pipeline] -> semantic judge FAILED for {func['id']} after attempt {attempt}; "
+                    f"coverage={pct}% score={judge.get('score')} summary={judge.get('summary')}",
                     file=sys.stderr,
                 )
-                break
-
-            print(
-                f"[pipeline] -> attempt {attempt} coverage={pct}%",
-                file=sys.stderr,
-            )
+            else:
+                print(
+                    f"[pipeline] -> attempt {attempt} coverage={pct}%",
+                    file=sys.stderr,
+                )
 
         coverage_results[func["id"]] = pct
         done += 1
 
     print(
         f"[pipeline] processed {done}/{len(funcs)} functions "
-        f"({skipped} skipped at threshold)",
+        f"({skipped} skipped at threshold after semantic judge)",
         file=sys.stderr,
     )
     return {
         "functions_total": len(funcs),
         "functions_done": done,
         "functions_skipped_at_threshold": skipped,
-        "coverage": {k: round(v, 1) if v is not None else None for k, v in coverage_results.items()},
+        "coverage": {
+            k: round(v, 1) if v is not None else None
+            for k, v in coverage_results.items()
+        },
+        "semantic_score": semantic_results,
+        "semantic_context_file": str(_semantic_context_path(test_dir)),
     }
 
 # endregion Stage 6 — Per-Function Coverage Loop
@@ -2034,6 +2884,12 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
         default=Path("/home/seigyo/rl/moove_docs/func"),
         help="Directory containing function docs as <func_name>.md",
     )
+    ap.add_argument(
+        "--semantic-judge-min-score",
+        type=int,
+        default=75,
+        help="Minimum semantic score for a function to be considered done.",
+    )
 
     ns = ap.parse_args(argv)
     return PipelineConfig(
@@ -2055,6 +2911,7 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
         max_stub_integrate_retries=ns.max_stub_integrate_retries,
         max_minimal_test_attempts=ns.max_minimal_test_attempts,
         func_docs_dir=ns.func_docs_dir.resolve(),
+        semantic_judge_min_score=ns.semantic_judge_min_score,
     )
 
 def main(argv: Optional[list[str]] = None) -> int:

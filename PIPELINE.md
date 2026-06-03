@@ -173,33 +173,88 @@ run()
 │       ├─ make test (timeout=90s)
 │       ├─ PASS → proceed
 │       ├─ HANG (timed_out) → hang-fix agent: find blocking stub, make it return
-│       └─ COMPILE ERROR → compile-fix agent
+│       └─ COMPILE/RUNTIME ERROR → build_output_with_runtime_diagnostics()
+│           (gdb backtrace + direct binary run + report/log files) → compile-fix agent
 │       (soft-fail — warns but doesn't abort, non-main functions may still work)
 │
 └─ process_functions()         [Stage 6]
     ├─ order: leaf → root (deepest callees first)
+    ├─ semantic context: _leaf_to_root_semantic_context.json
+    │   accumulates judge verdicts leaf → root so parent tests get child behavior context
     └─ per function:
         ├─ pre-check: read existing gcov WITHOUT rebuilding
-        │   └─ coverage ≥ threshold → skip (records pct in coverage_results)
+        │   ├─ coverage < threshold → go to attempt loop
+        │   └─ coverage ≥ threshold → run_semantic_test_judge()
+        │       ├─ PASS (score ≥ semantic_judge_min_score) → skip, append context
+        │       └─ FAIL → set last_judge, fall through to attempt loop
         ├─ attempt loop (max_test_attempts):
-        │   ├─ agent writes CUnit test for this function
-        │   │   given: exact gcov path, line range, uncovered lines,
-        │   │          correct rename symbol, make_ok status
+        │   ├─ if last_judge set → prompt_for_semantic_test_repair()
+        │   │   (repair weaknesses identified by judge)
+        │   └─ else → prompt_for_function_test_with_semantic_context()
+        │       (semantic context from accepted lower-level functions passed in)
+        │   ├─ run agent
         │   ├─ sync_wrap_flags()
         │   ├─ make test (timeout=300s)
-        │   │   └─ FAIL → compile-fix agent → sync_wrap_flags → make test again
+        │   │   └─ FAIL → build_output_with_runtime_diagnostics() → compile-fix agent
+        │   │           → sync_wrap_flags → make test again
         │   ├─ check_function_coverage()
         │   │   ├─ gcov -b -c *.gcno  (no -p flag, simple names)
         │   │   ├─ rm test_*.gcov
         │   │   └─ match <source>.gcov by Source: header → parse line range
-        │   └─ coverage ≥ threshold → break
-        └─ record final pct in coverage_results
+        │   └─ coverage ≥ threshold AND make ok → run_semantic_test_judge()
+        │       ├─ PASS → append context, break attempt loop
+        │       └─ FAIL → set last_judge, continue (triggers repair next iteration)
+        └─ record final pct and semantic score in results
 
 DONE.json:
   finished_at, source,
   functions_total, functions_done, functions_skipped_at_threshold,
-  coverage: { func_id → pct | null }
+  coverage: { func_id → pct | null },
+  semantic_score: { func_id → int | null },
+  semantic_context_file: path to _leaf_to_root_semantic_context.json
 ```
+
+---
+
+## Semantic Judge Layer
+
+Every function must pass both a coverage gate and an LLM semantic quality gate.
+
+**`run_semantic_test_judge`** invokes the agent as a read-only judge:
+- Reads target function implementation, headers, structs, globals, callees, callers
+- Reads existing CUnit tests and mocks
+- Uses accumulated leaf-to-root semantic context
+- Writes a JSON verdict to `_semantic_judge_<func_id>.json`
+
+Verdict fields: `passed`, `score` (0-100), `summary`, `function_explanation`,
+`tested_behaviors`, `important_state`, `important_dependencies`,
+`parent_context_value`, `missing_cases`, `weak_or_meaningless_checks`,
+`required_fixes`, `remaining_risks`.
+
+`passed=true` only if `score >= semantic_judge_min_score` (default 75).
+
+**Repair loop**: when judge fails, the next attempt uses `prompt_for_semantic_test_repair`
+which explicitly targets the judge's `missing_cases` and `required_fixes`. This continues
+until the judge passes or `max_test_attempts` is exhausted.
+
+**Leaf-to-root accumulation**: accepted function verdicts are stored in
+`_leaf_to_root_semantic_context.json`. Parent function prompts receive this context
+so tests verify orchestration of child behaviors, not just isolated smoke calls.
+
+---
+
+## Runtime Diagnostics
+
+All compile-fix agent calls now receive enriched diagnostics via
+`build_output_with_runtime_diagnostics()` / `collect_failure_diagnostics()`:
+- Original `make test` stderr/stdout
+- `<test>_log.txt` and `<test>_report.txt` content
+- Direct binary run (20s timeout) — stdout, stderr, returncode
+- `gdb -batch` backtrace (40s timeout) — full `bt full` output
+- Annotated note distinguishing compile failure vs runtime crash vs hang
+
+This gives the agent enough information to fix segfaults (Error 139) and other
+runtime crashes, not just compile errors.
 
 ---
 
@@ -211,6 +266,9 @@ DONE.json:
 - **Hang detection**: binary timeout (90s) separate from compile error — different agent prompt for each.
 - **No premade assumptions**: initial test file has bare includes. Whether production `main` exists, what rename to use, what stubs are needed — all handled by agents in response to compile errors.
 - **Coverage path**: agent always given exact absolute path to production gcov file (`test_dir/<source_basename>.gcov`), even on first run.
+- **Dual gate**: coverage threshold alone is not enough to skip a function — the LLM semantic judge must also pass (`score >= semantic_judge_min_score`). Smoke/coverage-only tests are rejected.
+- **Leaf-to-root context**: each accepted function's behavioral explanation is persisted and fed to parent-function prompts, so higher-level tests verify orchestration, not just execution.
+- **Runtime diagnostics**: every compile-fix call receives gdb backtrace + direct binary output in addition to make output, allowing segfault/crash root-cause analysis.
 
 ---
 
@@ -232,5 +290,7 @@ DONE.json:
 | `--stub-batch-size` | 8 | Stubs per integration batch |
 | `--func-docs-dir` | `/home/seigyo/rl/moove_docs/func` | Markdown docs for stub generation hints |
 | `--only-function` | — | Process only this function id |
+| `--only-level` | — | Process only functions at this call-depth level |
 | `--max-functions` | — | Stop after N functions |
 | `--dry-run` | false | Print agent commands without running |
+| `--semantic-judge-min-score` | 75 | Minimum LLM semantic score for a function to be considered done |
