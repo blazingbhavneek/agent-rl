@@ -114,8 +114,8 @@ The original design described a sequential, agent-driven process:
 | 16 | Moved snapshot after dry_run check | Was snapshotting entire src/ on dry-run calls for no reason |
 | 17 | `handle_stubs`: wrap flags moved out of stub phase entirely | Flags written by `ensure_makefile` via `sync_wrap_flags` AFTER stubs are integrated |
 | 18 | Added `sync_wrap_flags(test_file, makefile)` | Derive WRAP_FUNCS from `__wrap_*` symbols actually in test file — called before every `make test` |
-| 19 | Added stub generation retry loop (`max_stub_gen_retries=3`) | Single pass left missing stubs silently |
-| 20 | Added stub integration retry loop (`max_stub_integrate_retries=3`) | Single pass left missing stubs silently |
+| 19 | Added stub generation retry loop | Single pass left missing stubs silently; v2 now retries until every candidate validates |
+| 20 | Added stub integration retry loop | Single pass left missing stubs silently; v2 now retries until integration succeeds |
 | 21 | Integration agent only given stubs that have bodies | Was told to integrate stubs with no generated body — agent confused |
 | 22 | Skip integration batch if `batch_bodies` is empty | Agent called with empty JSON, made spurious changes |
 | 23 | Added `ensure_minimal_test_runs()` pipeline stage | Binary must compile + run + exit before coverage tests are written; blocking stubs detected here |
@@ -132,7 +132,11 @@ The original design described a sequential, agent-driven process:
 
 ---
 
-## Current Pipeline Flow
+## Current Pipeline Flow (v1 — SUPERSEDED by v2 below)
+
+> **This section documents the original sequential flow and is no longer the runtime path.**
+> `run()` now executes the v2 parallel flow described at the end of this document.
+> `process_functions()` is retained in the codebase but is dead code.
 
 ```
 run()
@@ -235,7 +239,7 @@ Verdict fields: `passed`, `score` (0-100), `summary`, `function_explanation`,
 
 **Repair loop**: when judge fails, the next attempt uses `prompt_for_semantic_test_repair`
 which explicitly targets the judge's `missing_cases` and `required_fixes`. This continues
-until the judge passes or `max_test_attempts` is exhausted.
+until the judge passes in the v2 runtime path.
 
 **Leaf-to-root accumulation**: accepted function verdicts are stored in
 `_leaf_to_root_semantic_context.json`. Parent function prompts receive this context
@@ -281,11 +285,11 @@ runtime crashes, not just compile errors.
 | `--python-bin` | `sys.executable` | Python binary for agent.js gcov tool (`PYTHON_BIN` env) |
 | `--agent-timeout-sec` | 1800 | Per-agent subprocess timeout |
 | `--max-agent-iterations` | 25 | MAX_ITERATIONS env for agent.js |
-| `--max-compile-fix-attempts` | 5 | Retries in ensure_skeleton_compiles |
-| `--max-stub-gen-retries` | 3 | Rounds of parallel stub generation |
-| `--max-stub-integrate-retries` | 3 | Rounds of stub integration |
-| `--max-minimal-test-attempts` | 5 | Attempts in ensure_minimal_test_runs |
-| `--max-test-attempts` | 4 | Per-function coverage attempts |
+| `--max-compile-fix-attempts` | 5 | Legacy/v1 only; v2 repair loops run until success |
+| `--max-stub-gen-retries` | 3 | Legacy/v1 only; v2 stub generation runs until every candidate validates |
+| `--max-stub-integrate-retries` | 3 | Legacy/v1 only; v2 stub integration runs until success |
+| `--max-minimal-test-attempts` | 5 | Legacy/v1 only; v2 minimal validation runs until success |
+| `--max-test-attempts` | 4 | Legacy/v1 only; v2 per-function generation runs until coverage and semantic judge pass |
 | `--coverage-threshold` | 80.0 | Skip function if coverage ≥ this % |
 | `--stub-batch-size` | 8 | Stubs per integration batch |
 | `--func-docs-dir` | `/home/seigyo/rl/moove_docs/func` | Markdown docs for stub generation hints |
@@ -294,3 +298,229 @@ runtime crashes, not just compile errors.
 | `--max-functions` | — | Stop after N functions |
 | `--dry-run` | false | Print agent commands without running |
 | `--semantic-judge-min-score` | 75 | Minimum LLM semantic score for a function to be considered done |
+
+---
+
+## Redesigned Pipeline (v2)
+
+### New Directory Layout
+
+```
+tests/<process>/
+├── Makefile                          # annotated master (do_mkmf + source flags + comments)
+├── _pipeline_context.json            # extracted flags + source files, fed to every agent
+├── test_<process>.c                  # master test file (assembled incrementally)
+├── analysis.json
+├── _stub_gen/                        # Stage 1: per-stub isolation (named _stub_gen in code)
+│   └── <func_name>/
+│       ├── stub.c                    # __wrap_<func> body
+│       ├── stub_validate_main.c      # harness: weak dummy + calls func() via --wrap
+│       ├── Makefile                  # cp master + WRAP_FUNCS += -Wl,--wrap=<func>
+│       └── result.json              # {"validated": true} on pass
+├── _unit_tests/                      # Stage 4: per-function isolation
+│   └── <func_id>/
+│       ├── test_<func_id>.c          # agent writes here; includes prod source; local overrides
+│       ├── Makefile                  # cp master Makefile (has all WRAP_FUNCS post Stage 2)
+│       ├── agent_history/
+│       ├── judge_verdict.json        # {"passed": true/false, "score": N, ...}
+│       └── coverage.json
+└── agent_history/
+```
+
+---
+
+### v2 Pipeline Flow
+
+```
+CONTINUATION CHECKS AT STARTUP
+  _pipeline_context.json exists?                        → skip Stage 0
+  analysis.json exists?                                 → skip analysis
+  _stub_gen/<func>/result.json "validated":true?        → skip that stub in Stage 1
+  stub symbol in master test file?                      → skip that stub in Stage 2
+  _unit_tests/<func_id>/judge_verdict.json "passed":true → skip that func in Stage 4
+                                                           (load saved verdict into semantic_context)
+  func test cases already present in master?            → skip that func in Stage 5
+│
+▼
+analysis (cached via analysis.json)
+ensure_test_file (bare skeleton, idempotent)
+│
+▼
+Stage 0: build_annotated_makefile
+  SKIP IF: _pipeline_context.json exists
+  ├─ do_mkmf <source_dir> → master Makefile
+  ├─ parse source Makefile: CFLAGS, CFLAGS_LINUX, CPPFLAGS, INCLUDE, LDFLAGS, LDLIBS, LIBS
+  ├─ append test target block with inline comments:
+  │     # from source Makefile
+  │     # do_mkmf generated
+  │     # pipeline: coverage flags
+  │     # pipeline: wrap flags (populated incrementally in Stage 2)
+  └─ write _pipeline_context.json:
+        { process_name, source_dir, source_makefile, actual_source_files,
+          flags: {CFLAGS, INCLUDE, ...}, test_dir, test_file, makefile }
+│
+▼
+Stage 1: PARALLEL — stub gen + compile/link/runtime validate
+  all stubs run concurrently (ThreadPoolExecutor)
+  │
+  per stub:
+  SKIP IF: _stub_gen/<func>/result.json "validated":true
+  ├─ generate_stub_code → _stub_gen/<func>/stub.c  (agent)
+  ├─ write stub_validate_main.c (programmatic, no agent):
+  │     __attribute__((weak)) int <func>() { return 0; }  // weak dummy real
+  │     int main(void) { (void)<func>(); return 0; }       // calls via --wrap
+  ├─ gcc -c stub.c $(FLAGS)                    // compile check
+  ├─ gcc stub.c harness.c -Wl,--wrap=<func> -o stub_validate  // wrap linkage check
+  ├─ ./stub_validate                           // runtime: __wrap_<func> actually called
+  ├─ fail at any step → fresh micro-fix agent (stub.c + exact error)
+  │                    → loop until validation succeeds
+  write _stub_gen/<func>/result.json {"validated":true} on pass
+│
+  HARD BLOCK — wait for all stubs validated before proceeding
+│
+▼
+Stage 2: SEQUENTIAL — stub integration into master
+  per stub (one at a time, alphabetical order)
+  SKIP IF: stub_exists(master_test_file, func_name)
+  ├─ insert stub.c body into master test_<proc>.c under /* === Linker Wrapper Stubs === */
+  ├─ append WRAP_FUNCS += -Wl,--wrap=<func> to master Makefile
+  ├─ make test on master (compile + run)
+  └─ fail → fresh micro-fix agent (this stub + this error only) → loop until pass
+  master always passes make test after each stub
+│
+▼
+Stage 3: ensure_minimal_test_runs
+  loop until pass:
+  ├─ minimal test agent
+  ├─ make test (90s timeout)
+  ├─ HANG → fresh hang-fix agent → loop
+  └─ FAIL → fresh compile-fix agent (with runtime diagnostics) → loop
+│
+▼
+Stage 4: PARALLEL (level-by-level) — unit test gen + judge
+  group functions by depth; process deepest level first
+  within each level: all functions run concurrently (ThreadPoolExecutor)
+  wait for level N to fully complete before starting level N-1
+  (semantic_context from level N is available to level N-1 agents)
+  │
+  per func:
+  SKIP IF: _unit_tests/<func_id>/judge_verdict.json "passed":true
+           → load verdict into semantic_context, continue
+  │
+  ├─ scaffold _unit_tests/<func_id>/ if not exists:
+  │   ├─ test_<func_id>.c skeleton (prod source include, markers, own main)
+  │   └─ cp master Makefile (has all WRAP_FUNCS from Stage 2)
+  │
+  └─ loop until judge passes:
+      ├─ judge_verdict.json exists and passed:false → repair path (last_judge set)
+      ├─ if last_judge → prompt_for_semantic_test_repair
+      └─ else → prompt_for_function_test_with_semantic_context
+                 (semantic_context from accepted lower-level funcs passed in)
+      ├─ run agent (writes to _unit_tests/<func_id>/test_<func_id>.c only)
+      ├─ make test (local, in _unit_tests/<func_id>/)
+      ├─ fail → build_output_with_runtime_diagnostics
+      │         → fresh compile-fix agent → make test again → loop
+      ├─ check_function_coverage (local gcov in _unit_tests/<func_id>/)
+      ├─ coverage < threshold → loop (fresh test-gen agent)
+      └─ coverage >= threshold AND make ok:
+          ├─ run_semantic_test_judge
+          ├─ write judge_verdict.json
+          ├─ PASS (score >= min) → _append_semantic_context, break
+          └─ FAIL → set last_judge → loop (repair path next iteration)
+│
+▼
+Stage 5: SEQUENTIAL — unit test integration into master
+  per func in leaf-to-root order (judge-passed only)
+  SKIP IF: func test cases already present in master test file
+  ├─ extract /* === Test Cases === */ content from _unit_tests/<func_id>/test_<func_id>.c
+  ├─ extract CU_add_test() registration calls
+  ├─ append test cases to master test_<proc>.c under /* === Test Cases === */
+  ├─ append registrations under /* === Test Registration === */
+  ├─ gcc -fsyntax-only on master
+  └─ fail → fresh micro-fix agent (this addition + error only) → loop until pass
+│
+▼
+DONE.json:
+  finished_at, source,
+  functions_total, functions_done, functions_skipped,
+  coverage: { func_id → pct | null },
+  semantic_score: { func_id → int | null },
+  semantic_context_file
+```
+
+---
+
+### v2 Implementation Notes
+
+The active v2 runtime is intentionally retry-until-success. Legacy max-attempt
+flags remain accepted for CLI compatibility, but they do not cap the v2 repair
+loops. This avoids producing partial downstream state from a temporarily bad
+agent edit, incomplete stub, or broken harness.
+
+#### 1. `ensure_makefile` → `build_annotated_makefile` (modify in place)
+- Add `parse_source_makefile_flags(source_makefile) -> dict` (new, ~20 lines: regex
+  extract CFLAGS/INCLUDE/LDFLAGS etc.)
+- After writing Makefile, write `_pipeline_context.json`
+- Everything else (do_mkmf call, trash marker detection, test target block) unchanged
+- Rename function, update call in `run()`
+
+#### 2. `generate_stub_code` — add validation tail (~30 lines)
+- After agent writes stub.c and body is validated syntactically (existing checks),
+  add `_validate_stub_locally(stub_dir, func_name, flags)` call:
+  - Write `stub_validate_main.c` programmatically (no agent)
+  - `gcc -c stub.c $(FLAGS)` → if fails: loop fresh micro-fix agent
+  - Link + run validate binary → if fails: loop fresh micro-fix agent
+  - Write `result.json {"validated":true}`
+- Continuation: if `result.json` exists and validated, skip entirely (already in code
+  as "reuse cached stub" — just add the result.json check)
+
+#### 3. `handle_stubs` Phase 2 — replace batch integration with sequential
+- Delete: `integrate_stubs_and_compile_with_agent` call + retry loop
+- Add: `integrate_all_stubs_sequential(cfg, paths, bodies, flags)`
+  - Per stub: `insert_stub_into_test_file` (already exists) + `ensure_wrap_flag`
+    (already exists) + `run_make_test` + fresh micro-fix loop on fail
+  - ~40 lines
+
+#### 4. Delete `ensure_skeleton_compiles`
+- Replaced by per-stub `make test` check in Stage 2
+- Remove call from `run()`
+
+#### 5. `process_functions` → split into Stage 4 + Stage 5
+- Stage 4 `parallel_generate_unit_tests(cfg, paths, analysis, flags)`:
+  - Same judge/coverage/repair loop as current `process_functions` inner loop
+  - Change: work in `_unit_tests/<func_id>/` dir instead of master test dir
+  - Change: scaffold per-func dir + cp Makefile before agent call
+  - Change: level-by-level ThreadPoolExecutor instead of sequential
+  - Continuation: check `judge_verdict.json` at top of per-func block
+  - ~80 lines new, reuses all existing prompt/judge/coverage functions unchanged
+- Stage 5 `integrate_all_unit_tests_sequential(cfg, paths, funcs, results)`:
+  - `extract_test_additions(unit_test_file) -> (cases_str, registrations_str)`
+    (regex extract between markers, ~20 lines)
+  - Per func: append to master + `gcc -fsyntax-only` + micro-fix loop
+  - ~40 lines
+
+#### 6. `run()` reordering (~10 line change)
+```python
+def run(cfg):
+    paths = derive_paths(cfg)
+    analysis = run_or_load_analysis(cfg, paths["analysis_path"])
+    ensure_test_file(cfg, paths)
+    flags = build_annotated_makefile(cfg, paths)        # was ensure_makefile
+    handle_stubs(cfg, paths, analysis)                  # validates all stubs, then integrates
+    # ensure_skeleton_compiles removed
+    ensure_minimal_test_runs(cfg, paths)
+    results = parallel_generate_unit_tests(cfg, paths, analysis, flags)
+    integrate_all_unit_tests_sequential(cfg, paths, analysis, results, flags)
+    write_json(...)
+```
+
+#### Core helper functions
+| Function | Lines | Purpose |
+|---|---|---|
+| `parse_source_makefile_flags` | ~20 | regex extract flags from source Makefile |
+| `_validate_stub_locally` | ~40 | compile/link/runtime check per stub; loops until success |
+| `integrate_all_stubs_sequential` | ~40 | one-by-one stub integration with make test; loops until success |
+| `parallel_generate_unit_tests` | ~80 | level-by-level parallel Stage 4; each function loops until coverage and semantic judge pass |
+| `integrate_all_unit_tests_sequential` | ~40 | one-by-one unit test integration; syntax/final master repair loops until success |
+| `extract_test_additions` | ~20 | pull test cases + registrations from unit test file |
+| `_scaffold_unit_test_dir` | ~30 | create dir, skeleton, cp Makefile |

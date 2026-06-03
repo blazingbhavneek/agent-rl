@@ -54,6 +54,7 @@ def make_cfg(**kwargs) -> M.PipelineConfig:
         max_stub_integrate_retries=1,
         max_minimal_test_attempts=2,
         semantic_judge_min_score=75,
+        max_unit_test_workers=2,
     )
     defaults.update(kwargs)
     return M.PipelineConfig(**defaults)
@@ -77,6 +78,14 @@ class TestPipelineConfig:
     def test_custom_semantic_score(self):
         cfg = make_cfg(semantic_judge_min_score=60)
         assert cfg.semantic_judge_min_score == 60
+
+    def test_max_unit_test_workers_default(self):
+        cfg = make_cfg()
+        assert cfg.max_unit_test_workers == 2
+
+    def test_max_unit_test_workers_custom(self):
+        cfg = make_cfg(max_unit_test_workers=8)
+        assert cfg.max_unit_test_workers == 8
 
 
 class TestDeriveTestDir:
@@ -616,6 +625,655 @@ class TestRunSemanticTestJudge:
 
 
 # ===========================================================================
+# parse_source_makefile_flags
+# ===========================================================================
+
+class TestParseSourceMakefileFlags:
+    def test_extracts_cflags(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text("CFLAGS = -Wall -O2\n", encoding="utf-8")
+        flags = M.parse_source_makefile_flags(mk)
+        assert "-Wall" in flags["CFLAGS"]
+        assert "-O2" in flags["CFLAGS"]
+
+    def test_extracts_include(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text("INCLUDE = -I/usr/include -I./local\n", encoding="utf-8")
+        flags = M.parse_source_makefile_flags(mk)
+        assert "-I/usr/include" in flags["INCLUDE"]
+
+    def test_plus_equals(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text("CFLAGS += -DDEBUG\n", encoding="utf-8")
+        flags = M.parse_source_makefile_flags(mk)
+        assert "-DDEBUG" in flags["CFLAGS"]
+
+    def test_multiple_assignments_concatenated(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text("CFLAGS = -Wall\nCFLAGS += -O2\n", encoding="utf-8")
+        flags = M.parse_source_makefile_flags(mk)
+        assert "-Wall" in flags["CFLAGS"]
+        assert "-O2" in flags["CFLAGS"]
+
+    def test_empty_makefile_returns_empty_dict(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text("", encoding="utf-8")
+        assert M.parse_source_makefile_flags(mk) == {}
+
+    def test_missing_file_returns_empty_dict(self, tmp: Path):
+        flags = M.parse_source_makefile_flags(tmp / "nonexistent")
+        assert flags == {}
+
+    def test_all_known_vars_extracted(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text(
+            "CFLAGS = -Wall\nCFLAGS_LINUX = -linux\nCPPFLAGS = -DFOO\n"
+            "INCLUDE = -I.\nLDFLAGS = -L/lib\nLDLIBS = -lm\nLIBS = -lpthread\n",
+            encoding="utf-8",
+        )
+        flags = M.parse_source_makefile_flags(mk)
+        for var in ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]:
+            assert var in flags, f"{var} not extracted"
+
+    def test_does_not_extract_unrelated_vars(self, tmp: Path):
+        mk = tmp / "Makefile"
+        mk.write_text("CC = gcc\nAR = ar\n", encoding="utf-8")
+        flags = M.parse_source_makefile_flags(mk)
+        assert "CC" not in flags
+        assert "AR" not in flags
+
+
+# ===========================================================================
+# extract_test_additions
+# ===========================================================================
+
+class TestExtractTestAdditions:
+    def _write(self, tmp: Path, content: str) -> Path:
+        f = tmp / "test_fn.c"
+        f.write_text(content, encoding="utf-8")
+        return f
+
+    def test_extracts_test_cases_and_reg(self, tmp: Path):
+        f = self._write(tmp, """
+/* === Test Cases === */
+static void test_normal(void) {
+    CU_ASSERT_EQUAL(1, 1);
+}
+/* === Test Registration === */
+int main(void) {
+    CU_add_test(suite, "test_normal", test_normal);
+    CU_basic_set_mode(CU_BRM_VERBOSE);
+}
+""")
+        cases, reg = M.extract_test_additions(f)
+        assert "test_normal" in cases
+        assert any("test_normal" in r for r in reg)
+
+    def test_no_markers_returns_empty(self, tmp: Path):
+        f = self._write(tmp, "int x = 0;\n")
+        cases, reg = M.extract_test_additions(f)
+        assert cases == ""
+        assert reg == []
+
+    def test_no_registration_still_returns_cases(self, tmp: Path):
+        f = self._write(tmp, "/* === Test Cases === */\nstatic void test_x(){}\n")
+        cases, reg = M.extract_test_additions(f)
+        assert "test_x" in cases
+
+    def test_multiple_cu_add_test_calls(self, tmp: Path):
+        f = self._write(tmp, """
+/* === Test Cases === */
+static void test_a(){}
+static void test_b(){}
+/* === Test Registration === */
+int main(void){
+    CU_add_test(suite, "a", test_a);
+    CU_add_test(suite, "b", test_b);
+}
+""")
+        _, reg = M.extract_test_additions(f)
+        assert len(reg) == 2
+        assert any("test_a" in r for r in reg)
+        assert any("test_b" in r for r in reg)
+
+    def test_empty_cases_section(self, tmp: Path):
+        f = self._write(tmp, """
+/* === Test Cases === */
+/* === Test Registration === */
+int main(void){ CU_add_test(suite, "x", x); }
+""")
+        cases, reg = M.extract_test_additions(f)
+        assert cases.strip() == ""
+        assert len(reg) == 1
+
+
+# ===========================================================================
+# _scaffold_unit_test_dir
+# ===========================================================================
+
+def _make_project(tmp: Path) -> tuple:
+    """Create minimal project structure, return (cfg, paths, func)."""
+    src = tmp / "project" / "src" / "proc"
+    src.mkdir(parents=True)
+    (src / "proc.c").write_text("void foo(){}\n", encoding="utf-8")
+
+    test_dir = tmp / "project" / "tests" / "proc"
+    test_dir.mkdir(parents=True)
+    master_mk = test_dir / "Makefile"
+    master_mk.write_text("CC=gcc\nWRAP_FUNCS += -Wl,--wrap=foo\n", encoding="utf-8")
+    test_file = test_dir / "test_proc.c"
+    test_file.write_text("", encoding="utf-8")
+
+    import json as _json
+    ctx = {"flags": {"CFLAGS": "-Wall"}, "actual_source_files": [str(src / "proc.c")]}
+    (test_dir / "_pipeline_context.json").write_text(_json.dumps(ctx), encoding="utf-8")
+
+    cfg = make_cfg(source_dir=src)
+    paths = {
+        "test_dir": test_dir, "process_name": "proc",
+        "test_file": test_file, "makefile": master_mk,
+    }
+    func = {
+        "id": "my_func", "name": "my_func",
+        "source_file": str(src / "proc.c"),
+        "start_line": 1, "end_line": 10, "depth": 2,
+    }
+    return cfg, paths, func
+
+
+class TestScaffoldUnitTestDir:
+    def test_creates_all_artefacts(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        assert unit_dir.exists()
+        assert (unit_dir / "test_my_func.c").exists()
+        assert (unit_dir / "Makefile").exists()
+        assert (unit_dir / "agent_history").is_dir()
+
+    def test_test_file_has_cunit_includes(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        content = (unit_dir / "test_my_func.c").read_text(encoding="utf-8")
+        assert "CUnit/CUnit.h" in content
+        assert "CUnit/Basic.h" in content
+
+    def test_test_file_has_all_markers(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        content = (unit_dir / "test_my_func.c").read_text(encoding="utf-8")
+        for marker in M.TEST_FILE_MARKERS:
+            assert marker in content, f"Missing marker: {marker}"
+
+    def test_test_file_has_own_main(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        content = (unit_dir / "test_my_func.c").read_text(encoding="utf-8")
+        assert "int main(void)" in content
+        assert "CU_initialize_registry" in content
+
+    def test_idempotent_does_not_overwrite(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        sentinel = "// SENTINEL_MARKER"
+        tf = unit_dir / "test_my_func.c"
+        tf.write_text(tf.read_text(encoding="utf-8") + sentinel, encoding="utf-8")
+        M._scaffold_unit_test_dir(cfg, paths, func)  # second call
+        assert sentinel in tf.read_text(encoding="utf-8")
+
+    def test_makefile_has_wrap_funcs(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        mk_content = (unit_dir / "Makefile").read_text(encoding="utf-8")
+        assert "WRAP_FUNCS" in mk_content
+        assert "-Wl,--wrap=foo" in mk_content
+
+    def test_makefile_has_test_program(self, tmp: Path):
+        cfg, paths, func = _make_project(tmp)
+        unit_dir = M._scaffold_unit_test_dir(cfg, paths, func)
+        mk_content = (unit_dir / "Makefile").read_text(encoding="utf-8")
+        assert "TEST_PROGRAM" in mk_content
+        assert "test_my_func" in mk_content
+
+
+# ===========================================================================
+# _validate_stub_locally
+# ===========================================================================
+
+class TestValidateStubLocally:
+    def _setup(self, tmp: Path):
+        src = tmp / "src" / "proc"
+        src.mkdir(parents=True)
+        cfg = make_cfg(source_dir=src)
+        stub_dir = tmp / "_stub_gen" / "foo"
+        stub_dir.mkdir(parents=True)
+        (stub_dir / "stub.c").write_text(
+            'void __wrap_foo(void){ fprintf(stderr,"called\\n"); }\n',
+            encoding="utf-8",
+        )
+        return cfg, stub_dir
+
+    def test_skips_if_already_validated(self, tmp: Path):
+        cfg, stub_dir = self._setup(tmp)
+        M.write_json(stub_dir / "result.json", {"validated": True, "func_name": "foo"})
+        with patch("subprocess.run") as mock_run:
+            M._validate_stub_locally(cfg, tmp, "foo", stub_dir)
+        mock_run.assert_not_called()
+
+    def test_writes_result_json_on_success(self, tmp: Path):
+        cfg, stub_dir = self._setup(tmp)
+        ok = MagicMock(returncode=0, stdout="stub_validate OK", stderr="")
+        with patch("subprocess.run", return_value=ok):
+            M._validate_stub_locally(cfg, tmp, "foo", stub_dir)
+        result_file = stub_dir / "result.json"
+        assert result_file.exists()
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert data["validated"] is True
+        assert data["func_name"] == "foo"
+
+    def test_writes_stub_validate_main_c(self, tmp: Path):
+        cfg, stub_dir = self._setup(tmp)
+        ok = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=ok):
+            M._validate_stub_locally(cfg, tmp, "foo", stub_dir)
+        harness = stub_dir / "stub_validate_main.c"
+        assert harness.exists()
+        content = harness.read_text(encoding="utf-8")
+        assert "int main" in content
+        assert "return 0" in content
+
+    def test_calls_fix_agent_on_compile_failure(self, tmp: Path):
+        cfg, stub_dir = self._setup(tmp)
+        cfg.max_fix_attempts = 1
+        call_count = [0]
+
+        def fake_run(*args, **kwargs):
+            call_count[0] += 1
+            # First compile call fails; all subsequent succeed
+            if call_count[0] == 1:
+                return MagicMock(returncode=1, stdout="", stderr="error: bad syntax")
+            return MagicMock(returncode=0, stdout="stub_validate OK", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch.object(M, "_fix_stub_with_agent") as mock_fix:
+            M._validate_stub_locally(cfg, tmp, "foo", stub_dir)
+
+        mock_fix.assert_called_once()
+        assert call_count[0] >= 4  # compile fail, then compile+link+run succeed
+
+    def test_calls_fix_agent_on_link_failure(self, tmp: Path):
+        cfg, stub_dir = self._setup(tmp)
+        call_count = [0]
+
+        def fake_run(*args, **kwargs):
+            call_count[0] += 1
+            # compile succeeds, link fails once, then everything succeeds
+            if call_count[0] == 2:
+                return MagicMock(returncode=1, stdout="", stderr="undefined ref")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch.object(M, "_fix_stub_with_agent") as mock_fix:
+            M._validate_stub_locally(cfg, tmp, "foo", stub_dir)
+
+        mock_fix.assert_called_once()
+
+    def test_calls_fix_agent_on_runtime_failure(self, tmp: Path):
+        cfg, stub_dir = self._setup(tmp)
+        call_count = [0]
+
+        def fake_run(*args, **kwargs):
+            call_count[0] += 1
+            # compile + link succeed, run fails once, then everything succeeds
+            if call_count[0] == 3:
+                return MagicMock(returncode=139, stdout="", stderr="Segfault")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch.object(M, "_fix_stub_with_agent") as mock_fix:
+            M._validate_stub_locally(cfg, tmp, "foo", stub_dir)
+
+        mock_fix.assert_called_once()
+
+
+# ===========================================================================
+# integrate_all_stubs_sequential
+# ===========================================================================
+
+class TestIntegrateAllStubsSequential:
+    def _setup(self, tmp: Path):
+        src = tmp / "src" / "proc"
+        src.mkdir(parents=True)
+        (src / "proc.c").write_text("void foo(){}\n", encoding="utf-8")
+        cfg = make_cfg(source_dir=src)
+        test_file = tmp / "test_proc.c"
+        test_file.write_text("/* === Linker Wrapper Stubs === */\n", encoding="utf-8")
+        makefile = tmp / "Makefile"
+        makefile.write_text("CC=gcc\n", encoding="utf-8")
+        paths = {"test_file": test_file, "makefile": makefile,
+                 "test_dir": tmp, "process_name": "proc"}
+        return cfg, paths, test_file, makefile
+
+    def test_inserts_stub_and_wrap_flag(self, tmp: Path):
+        cfg, paths, test_file, makefile = self._setup(tmp)
+        body = 'void __wrap_myfunc(void){ fprintf(stderr, "called\\n"); }'
+        with patch.object(M, "run_make_test", return_value={"ok": True, "timed_out": False}):
+            M.integrate_all_stubs_sequential(cfg, paths, {"myfunc": body}, {})
+        assert "__wrap_myfunc" in test_file.read_text(encoding="utf-8")
+        assert "-Wl,--wrap=myfunc" in makefile.read_text(encoding="utf-8")
+
+    def test_skips_already_integrated_stub(self, tmp: Path):
+        cfg, paths, test_file, makefile = self._setup(tmp)
+        test_file.write_text(
+            "/* === Linker Wrapper Stubs === */\nvoid __wrap_foo(void){}\n",
+            encoding="utf-8",
+        )
+        with patch.object(M, "run_make_test") as mock_make:
+            M.integrate_all_stubs_sequential(cfg, paths, {"foo": "void __wrap_foo(){}"}, {})
+        mock_make.assert_not_called()
+
+    def test_loops_compile_fix_until_make_passes(self, tmp: Path):
+        cfg, paths, test_file, makefile = self._setup(tmp)
+        cfg.max_fix_attempts = 1
+        make_calls = [0]
+
+        def fake_make(*a, **kw):
+            make_calls[0] += 1
+            if make_calls[0] == 1:
+                return {"ok": False, "returncode": 1, "stdout": "",
+                        "stderr": "error", "timed_out": False}
+            return {"ok": True, "returncode": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+        with patch.object(M, "run_make_test", side_effect=fake_make), \
+             patch.object(M, "run_agent"), \
+             patch.object(M, "build_output_with_runtime_diagnostics", return_value="diag"):
+            M.integrate_all_stubs_sequential(
+                cfg, paths, {"bar": "void __wrap_bar(){}"}, {})
+
+        assert make_calls[0] == 2
+
+    def test_multiple_stubs_each_checked(self, tmp: Path):
+        cfg, paths, test_file, makefile = self._setup(tmp)
+        make_calls = [0]
+
+        def fake_make(*a, **kw):
+            make_calls[0] += 1
+            return {"ok": True, "returncode": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+        bodies = {
+            "alpha": "void __wrap_alpha(){}",
+            "beta": "void __wrap_beta(){}",
+        }
+        with patch.object(M, "run_make_test", side_effect=fake_make):
+            M.integrate_all_stubs_sequential(cfg, paths, bodies, {})
+
+        assert make_calls[0] == 2  # one make test per stub
+        content = test_file.read_text(encoding="utf-8")
+        assert "__wrap_alpha" in content
+        assert "__wrap_beta" in content
+
+
+# ===========================================================================
+# handle_stubs
+# ===========================================================================
+
+class TestHandleStubs:
+    def test_generates_until_validated_body_exists(self, tmp: Path):
+        src = tmp / "src" / "proc"
+        src.mkdir(parents=True)
+        cfg = make_cfg(source_dir=src, max_stub_gen_retries=1)
+        test_file = tmp / "test_proc.c"
+        test_file.write_text("/* === Linker Wrapper Stubs === */\n", encoding="utf-8")
+        makefile = tmp / "Makefile"
+        makefile.write_text("CC=gcc\n", encoding="utf-8")
+        paths = {
+            "test_file": test_file,
+            "makefile": makefile,
+            "test_dir": tmp,
+            "process_name": "proc",
+        }
+        analysis = {"stub_candidates": {"proc.c": ["foo"]}}
+        body = 'void __wrap_foo(void){ fprintf(stderr, "called\\n"); }'
+
+        with patch.object(M, "generate_stub_code", side_effect=[None, body]) as mock_gen, \
+             patch.object(M, "integrate_all_stubs_sequential") as mock_integrate:
+            M.handle_stubs(cfg, paths, analysis)
+
+        assert mock_gen.call_count == 2
+        mock_integrate.assert_called_once()
+        assert mock_integrate.call_args[0][2] == {"foo": body}
+
+
+# ===========================================================================
+# build_annotated_makefile
+# ===========================================================================
+
+class TestBuildAnnotatedMakefile:
+    def _setup(self, tmp: Path):
+        src = tmp / "project" / "src" / "proc"
+        src.mkdir(parents=True)
+        source_mk = src / "Makefile"
+        source_mk.write_text("CFLAGS = -Wall\nINCLUDE = -I.\n", encoding="utf-8")
+        (src / "proc.c").write_text("void foo(){}\n", encoding="utf-8")
+
+        test_dir = tmp / "project" / "tests" / "proc"
+        test_dir.mkdir(parents=True)
+        test_file = test_dir / "test_proc.c"
+        test_file.write_text("", encoding="utf-8")
+        makefile = test_dir / "Makefile"
+
+        cfg = make_cfg(source_dir=src)
+        paths = {
+            "test_dir": test_dir, "process_name": "proc",
+            "test_file": test_file, "makefile": makefile,
+        }
+        return cfg, paths, test_dir, makefile
+
+    def _fake_do_mkmf(self, makefile: Path):
+        """Return a subprocess.run side_effect that creates the Makefile."""
+        def _inner(*args, **kwargs):
+            if isinstance(args[0], list) and "do_mkmf" in args[0]:
+                makefile.write_text("CC=gcc\n# do_mkmf generated\n", encoding="utf-8")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return _inner
+
+    def test_returns_cached_flags_if_context_exists(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        cached = {"flags": {"CFLAGS": "-O2"}, "process_name": "proc"}
+        M.write_json(test_dir / "_pipeline_context.json", cached)
+        with patch("subprocess.run") as mock_run:
+            flags = M.build_annotated_makefile(cfg, paths)
+        mock_run.assert_not_called()
+        assert flags == {"CFLAGS": "-O2"}
+
+    def test_runs_do_mkmf_if_no_makefile(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        with patch("subprocess.run", side_effect=self._fake_do_mkmf(makefile)):
+            flags = M.build_annotated_makefile(cfg, paths)
+        assert makefile.exists()
+
+    def test_writes_pipeline_context_json(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        with patch("subprocess.run", side_effect=self._fake_do_mkmf(makefile)):
+            M.build_annotated_makefile(cfg, paths)
+        ctx_file = test_dir / "_pipeline_context.json"
+        assert ctx_file.exists()
+        ctx = json.loads(ctx_file.read_text(encoding="utf-8"))
+        assert "flags" in ctx
+        assert "process_name" in ctx
+        assert ctx["process_name"] == "proc"
+        assert "actual_source_files" in ctx
+
+    def test_returns_flags_dict(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        with patch("subprocess.run", side_effect=self._fake_do_mkmf(makefile)):
+            flags = M.build_annotated_makefile(cfg, paths)
+        assert isinstance(flags, dict)
+        # Source Makefile has CFLAGS = -Wall
+        assert "-Wall" in flags.get("CFLAGS", "")
+
+    def test_context_has_source_files(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        with patch("subprocess.run", side_effect=self._fake_do_mkmf(makefile)):
+            M.build_annotated_makefile(cfg, paths)
+        ctx = json.loads((test_dir / "_pipeline_context.json").read_text())
+        assert len(ctx["actual_source_files"]) >= 1
+        assert any("proc.c" in f for f in ctx["actual_source_files"])
+
+    def test_appends_test_target_block(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        with patch("subprocess.run", side_effect=self._fake_do_mkmf(makefile)):
+            M.build_annotated_makefile(cfg, paths)
+        mk_text = makefile.read_text(encoding="utf-8")
+        assert "TEST_PROGRAM" in mk_text
+        assert "coverage-test" in mk_text
+
+    def test_existing_bad_makefile_replaced(self, tmp: Path):
+        cfg, paths, test_dir, makefile = self._setup(tmp)
+        makefile.write_text(
+            "# === Auto-generated CUnit pipeline rules ===\nCC=gcc\n"
+            "# === End Auto-generated CUnit pipeline rules ===\n",
+            encoding="utf-8",
+        )
+        with patch("subprocess.run", side_effect=self._fake_do_mkmf(makefile)):
+            M.build_annotated_makefile(cfg, paths)
+        assert makefile.with_name("Makefile.bad_pipeline_backup").exists()
+
+
+# ===========================================================================
+# integrate_all_unit_tests_sequential
+# ===========================================================================
+
+class TestIntegrateAllUnitTestsSequential:
+    def _setup(self, tmp: Path):
+        src = tmp / "src" / "proc"
+        src.mkdir(parents=True)
+        cfg = make_cfg(source_dir=src)
+
+        test_dir = tmp
+        test_file = test_dir / "test_proc.c"
+        test_file.write_text(
+            "/* === Test Cases === */\n/* === Test Registration === */\n"
+            "int main(void){\n    CU_basic_set_mode(CU_BRM_VERBOSE);\n    return 0;\n}\n",
+            encoding="utf-8",
+        )
+        makefile = test_dir / "Makefile"
+        makefile.write_text("CC=gcc\n", encoding="utf-8")
+        paths = {
+            "test_dir": test_dir, "process_name": "proc",
+            "test_file": test_file, "makefile": makefile,
+        }
+        return cfg, paths, test_file
+
+    def _make_unit_test(self, tmp: Path, func_id: str, safe_id: str) -> Path:
+        unit_dir = tmp / "_unit_tests" / safe_id
+        unit_dir.mkdir(parents=True)
+        content = f"""
+/* === Test Cases === */
+static void test_{safe_id}_normal(void) {{
+    CU_ASSERT_EQUAL(1, 1);
+}}
+/* === Test Registration === */
+int main(void) {{
+    CU_add_test(suite, "normal", test_{safe_id}_normal);
+    return 0;
+}}
+"""
+        (unit_dir / f"test_{safe_id}.c").write_text(content, encoding="utf-8")
+        return unit_dir
+
+    def test_appends_test_cases_to_master(self, tmp: Path):
+        cfg, paths, test_file = self._setup(tmp)
+        func_id = "my_func"
+        safe_id = M._safe_filename(func_id)
+        unit_dir = self._make_unit_test(tmp, func_id, safe_id)
+
+        analysis = {
+            "function_levels": {"0": [func_id]},
+            "functions": [{"id": func_id, "name": func_id,
+                           "source_file": "/s.c", "depth": 0}],
+        }
+        results = {func_id: {"passed": True, "unit_dir": str(unit_dir)}}
+
+        ok_check = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=ok_check):
+            M.integrate_all_unit_tests_sequential(cfg, paths, analysis, results, {})
+
+        content = test_file.read_text(encoding="utf-8")
+        assert f"test_{safe_id}_normal" in content
+        assert f"/* --- unit: {func_id} --- */" in content
+
+    def test_skips_failed_functions(self, tmp: Path):
+        cfg, paths, test_file = self._setup(tmp)
+        func_id = "bad_func"
+        safe_id = M._safe_filename(func_id)
+        unit_dir = self._make_unit_test(tmp, func_id, safe_id)
+
+        analysis = {
+            "function_levels": {"0": [func_id]},
+            "functions": [{"id": func_id, "name": func_id,
+                           "source_file": "/s.c", "depth": 0}],
+        }
+        results = {func_id: {"passed": False}}
+
+        original = test_file.read_text(encoding="utf-8")
+        ok_run = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=ok_run):
+            M.integrate_all_unit_tests_sequential(cfg, paths, analysis, results, {})
+
+        assert test_file.read_text(encoding="utf-8") == original
+
+    def test_skips_already_integrated(self, tmp: Path):
+        cfg, paths, test_file = self._setup(tmp)
+        func_id = "exist_func"
+        safe_id = M._safe_filename(func_id)
+        unit_dir = self._make_unit_test(tmp, func_id, safe_id)
+
+        # Pre-mark as already integrated
+        test_file.write_text(
+            test_file.read_text(encoding="utf-8")
+            + f"\n/* --- unit: {func_id} --- */\n",
+            encoding="utf-8",
+        )
+        analysis = {
+            "function_levels": {"0": [func_id]},
+            "functions": [{"id": func_id, "name": func_id,
+                           "source_file": "/s.c", "depth": 0}],
+        }
+        results = {func_id: {"passed": True, "unit_dir": str(unit_dir)}}
+
+        ok_run = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=ok_run):
+            M.integrate_all_unit_tests_sequential(cfg, paths, analysis, results, {})
+
+    def test_loops_compile_fix_on_syntax_error(self, tmp: Path):
+        cfg, paths, test_file = self._setup(tmp)
+        func_id = "fix_func"
+        safe_id = M._safe_filename(func_id)
+        unit_dir = self._make_unit_test(tmp, func_id, safe_id)
+
+        analysis = {
+            "function_levels": {"0": [func_id]},
+            "functions": [{"id": func_id, "name": func_id,
+                           "source_file": "/s.c", "depth": 0}],
+        }
+        results = {func_id: {"passed": True, "unit_dir": str(unit_dir)}}
+
+        chk_calls = [0]
+        def fake_run(*args, **kwargs):
+            chk_calls[0] += 1
+            if chk_calls[0] == 1:
+                return MagicMock(returncode=1, stdout="", stderr="error: undeclared")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch.object(M, "run_agent"):
+            M.integrate_all_unit_tests_sequential(cfg, paths, analysis, results, {})
+
+        # call 1: syntax check fails, call 2: syntax check passes, call 3: final make test
+        assert chk_calls[0] == 3
+
+
+# ===========================================================================
 # parse_args
 # ===========================================================================
 
@@ -642,6 +1300,14 @@ class TestParseArgs:
     def test_stub_batch_size_min_1(self, tmp: Path):
         cfg = M.parse_args(self._minimal_argv(tmp) + ["--stub-batch-size", "0"])
         assert cfg.stub_batch_size >= 1
+
+    def test_default_unit_test_workers(self, tmp: Path):
+        cfg = M.parse_args(self._minimal_argv(tmp))
+        assert cfg.max_unit_test_workers == 4
+
+    def test_custom_unit_test_workers(self, tmp: Path):
+        cfg = M.parse_args(self._minimal_argv(tmp) + ["--max-unit-test-workers", "8"])
+        assert cfg.max_unit_test_workers == 8
 
 
 # ===========================================================================

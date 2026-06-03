@@ -56,6 +56,8 @@ class PipelineConfig:
     max_stub_integrate_retries: int = 3
     max_minimal_test_attempts: int = 5
     semantic_judge_min_score: int = 75
+    max_unit_test_workers: int = 4
+    max_fix_attempts: int = 20
 
 def derive_test_dir(src_dir: Path) -> Path:
     src_dir = src_dir.resolve()
@@ -115,6 +117,20 @@ def now_iso() -> str:
 
 def _safe_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+
+def parse_source_makefile_flags(source_makefile: Path) -> dict:
+    """Extract CFLAGS/INCLUDE/LDFLAGS etc. from source Makefile via regex."""
+    text = read_text(source_makefile)
+    flags: dict[str, str] = {}
+    for var in ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]:
+        parts: list[str] = []
+        for m in re.finditer(rf"^{var}\s*[\+:]?=[ \t]*(.+)$", text, re.MULTILINE):
+            val = m.group(1).strip().rstrip("\\").strip()
+            if val:
+                parts.append(val)
+        if parts:
+            flags[var] = " ".join(parts)
+    return flags
 
 # endregion Config & Infrastructure
 
@@ -964,12 +980,14 @@ def ensure_test_file(cfg: PipelineConfig, paths: dict) -> None:
     test_file.parent.mkdir(parents=True, exist_ok=True)
 
     production_include_lines = _source_includes_for_test_file(cfg, test_file)
+    define_main = f"#define main {process_name}_entry_main"
     production_include_block = ""
     if production_include_lines:
         production_include_block = (
-            "\n/* Auto-included production sources for coverage. */\n"
+            f"\n/* Production sources — main renamed so CUnit owns int main(void). */\n"
+            f"{define_main}\n"
             + "\n".join(production_include_lines)
-            + "\n"
+            + "\n#undef main\n"
         )
 
     if not test_file.exists():
@@ -1039,13 +1057,37 @@ int main(void)
         if line not in text
     ]
     if missing_includes:
-        insertion = (
-            "\n/* Auto-included production sources for coverage. */\n"
-            + "\n".join(missing_includes)
-            + "\n"
-        )
-        text = text.replace(TEST_FILE_MARKERS[0], TEST_FILE_MARKERS[0] + insertion, 1)
+        has_define = define_main in text
+        if has_define:
+            # Insert AFTER the #define main line so new files stay inside the define/undef block.
+            new_inc_block = "\n".join(missing_includes) + "\n"
+            text = text.replace(
+                define_main + "\n",
+                define_main + "\n" + new_inc_block,
+                1,
+            )
+        else:
+            insertion = (
+                f"\n/* Production sources — main renamed so CUnit owns int main(void). */\n"
+                f"{define_main}\n"
+                + "\n".join(missing_includes)
+                + "\n#undef main\n"
+            )
+            text = text.replace(TEST_FILE_MARKERS[0], TEST_FILE_MARKERS[0] + insertion, 1)
         changed = True
+    elif define_main not in text and any(ln in text for ln in production_include_lines):
+        # Includes present but #define main wrapper missing.
+        # Insert #define before first include, #undef after last include.
+        present = [ln for ln in production_include_lines if ln in text]
+        if present:
+            text = text.replace(present[0], f"{define_main}\n{present[0]}", 1)
+            # Insert #undef after last include (first occurrence in current text)
+            last_inc = present[-1]
+            idx = text.find(last_inc)
+            if idx >= 0:
+                end = idx + len(last_inc)
+                text = text[:end] + "\n#undef main" + text[end:]
+            changed = True
 
     # Ensure all markers exist.
     for marker in TEST_FILE_MARKERS:
@@ -1162,15 +1204,37 @@ def generate_stub_code(
             return False
         return True
 
-    # Continuation: reuse existing generated stub if valid.
+    # Continuation: reuse existing generated stub ONLY if also validated.
+    result_file = stub_dir / "result.json"
     if stub_out.exists():
         cached_body = _clean_stub_body(read_text(stub_out))
         if _is_valid_stub_body(cached_body):
+            already_validated = False
+            if result_file.exists():
+                try:
+                    already_validated = load_json(result_file).get("validated", False)
+                except Exception:
+                    pass
+            if already_validated:
+                print(
+                    f"[pipeline] reuse cached validated stub: {func_name}",
+                    file=sys.stderr,
+                )
+                return cached_body
+            # Exists but not yet validated — run validation now, skip agent.
             print(
-                f"[pipeline] reuse cached generated stub for {func_name}: {stub_out}",
+                f"[pipeline] stub exists unvalidated for {func_name}, validating",
                 file=sys.stderr,
             )
-            return cached_body
+            if not _validate_stub_locally(cfg, test_dir, func_name, stub_dir):
+                print(
+                    f"[pipeline] existing stub {func_name} failed validation, regenerating",
+                    file=sys.stderr,
+                )
+                stub_out.unlink(missing_ok=True)
+                result_file.unlink(missing_ok=True)
+            else:
+                return cached_body
         print(
             f"[pipeline] cached stub invalid for {func_name}, regenerating: {stub_out}",
             file=sys.stderr,
@@ -1299,9 +1363,198 @@ When done, call submit_and_exit.
             file=sys.stderr,
         )
         return None
+
+    _validate_stub_locally(cfg, test_dir, func_name, stub_dir)
     return body
 
-def integrate_stubs_and_compile_with_agent(
+
+def _validate_stub_locally(
+    cfg: PipelineConfig,
+    test_dir: Path,
+    func_name: str,
+    stub_dir: Path,
+) -> bool:
+    """
+    Compile-validate and runtime-validate a stub.
+    Loops with fresh micro-fix agent until both pass.
+    Writes result.json {validated:true} on success.
+    """
+    stub_c = stub_dir / "stub.c"
+    validate_main = stub_dir / "stub_validate_main.c"
+    validate_bin = stub_dir / "stub_validate"
+    result_file = stub_dir / "result.json"
+
+    if result_file.exists():
+        try:
+            if load_json(result_file).get("validated"):
+                return True
+        except Exception:
+            pass
+
+    # Harness exercises the --wrap linkage path.
+    # Signature check is intentionally shallow (no-arg weak dummy):
+    # real argument-type compatibility is caught in Stage 2 when the stub
+    # is linked against production code that includes the real headers.
+    harness = f"""#include <stdio.h>
+/* Weak dummy — linker needs a real {func_name} to wrap; --wrap redirects calls to __wrap */
+__attribute__((weak)) int {func_name}() {{ return 0; }}
+int main(void) {{
+    (void){func_name}();  /* exercised via --wrap_{func_name} */
+    fprintf(stderr, "stub_validate OK\\n");
+    return 0;
+}}
+"""
+    write_text(validate_main, harness)
+
+    repo_root = cfg.source_dir.parent.parent.resolve()
+    context_file = test_dir / "_pipeline_context.json"
+    flags: dict = {}
+    if context_file.exists():
+        try:
+            flags = load_json(context_file).get("flags", {})
+        except Exception:
+            pass
+
+    cflags = " ".join(filter(None, [
+        flags.get("CFLAGS", ""),
+        flags.get("CFLAGS_LINUX", ""),
+        flags.get("CPPFLAGS", ""),
+        flags.get("INCLUDE", ""),
+    ]))
+
+    attempt = 1
+    while True:
+        compile_res = subprocess.run(
+            f"gcc -c {cflags} {stub_c} -o {stub_dir}/stub.o",
+            shell=True, cwd=str(stub_dir),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if compile_res.returncode != 0:
+            err = (compile_res.stderr + compile_res.stdout)[:3000]
+            print(f"[pipeline] stub compile error {func_name} attempt {attempt}: {err[:200]}", file=sys.stderr)
+            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
+            attempt += 1
+            continue
+
+        link_res = subprocess.run(
+            f"gcc {cflags} {stub_c} {validate_main} -Wl,--wrap={func_name} -o {validate_bin}",
+            shell=True, cwd=str(stub_dir),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if link_res.returncode != 0:
+            err = (link_res.stderr + link_res.stdout)[:3000]
+            print(f"[pipeline] stub link error {func_name} attempt {attempt}: {err[:200]}", file=sys.stderr)
+            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
+            attempt += 1
+            continue
+
+        run_res = subprocess.run(
+            [str(validate_bin)],
+            cwd=str(stub_dir),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        if run_res.returncode != 0:
+            err = f"runtime exit={run_res.returncode}\n{run_res.stderr}\n{run_res.stdout}"
+            print(f"[pipeline] stub runtime error {func_name} attempt {attempt}: {err[:200]}", file=sys.stderr)
+            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
+            attempt += 1
+            continue
+
+        write_json(result_file, {"validated": True, "func_name": func_name})
+        print(f"[pipeline] stub validated: {func_name}", file=sys.stderr)
+        return True
+
+
+def _fix_stub_with_agent(
+    cfg: PipelineConfig,
+    stub_dir: Path,
+    func_name: str,
+    error: str,
+    repo_root: Path,
+    history_dir: Path,
+) -> None:
+    stub_c = stub_dir / "stub.c"
+    prompt = f"""Fix the __wrap_{func_name} stub.
+
+FILE: {stub_c}
+
+ERROR:
+{error[:3000]}
+
+RULES:
+- Edit ONLY {stub_c}
+- Function must be named exactly __wrap_{func_name}
+- Do NOT call __real_{func_name}
+- Raw C only, no markdown
+- Keep: fprintf(stderr, "__wrap_{func_name} called\\n");
+
+When done, call submit_and_exit.
+"""
+    run_agent(
+        cfg,
+        work_dir=stub_dir,
+        prompt=prompt,
+        history_name=f"_stub_fix_{_safe_filename(func_name)}_{int(time.time())}.json",
+        folder=repo_root,
+        history_dir=history_dir / "agent_history",
+        protect_source=True,
+    )
+
+
+def integrate_all_stubs_sequential(
+    cfg: PipelineConfig,
+    paths: dict,
+    validated_bodies: dict[str, str],
+    flags: dict,
+) -> None:
+    """
+    Integrate validated stubs one at a time into master test file.
+    After each insertion: make test on master. Loop compile-fix until pass.
+    Master always passes make test after each stub.
+    """
+    test_file: Path = paths["test_file"]
+    makefile: Path = paths["makefile"]
+    test_dir: Path = paths["test_dir"]
+    source_dir = cfg.source_dir.resolve()
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    for func_name, body in validated_bodies.items():
+        if stub_exists(test_file, func_name):
+            print(f"[pipeline] stub already integrated: {func_name}", file=sys.stderr)
+            continue
+
+        print(f"[pipeline] integrating stub: {func_name}", file=sys.stderr)
+        insert_stub_into_test_file(test_file, func_name, body)
+        ensure_wrap_flag(makefile, func_name)
+
+        attempt = 1
+        while True:
+            sync_wrap_flags(test_file, makefile)
+            res = run_make_test(test_dir)
+            if res["ok"]:
+                print(f"[pipeline] master OK after stub: {func_name}", file=sys.stderr)
+                break
+            print(f"[pipeline] make test failed after stub {func_name} attempt {attempt}, fixing", file=sys.stderr)
+            diag = build_output_with_runtime_diagnostics(test_dir, test_file, res)
+            run_agent(
+                cfg,
+                test_dir,
+                prompt_for_compile_fix(
+                    str(makefile), str(test_file), diag,
+                    source_dir=str(source_dir),
+                    source_makefile=str(source_dir / "Makefile"),
+                    actual_source_files=[str(p) for p in _project_source_files(cfg)],
+                ),
+                f"_stub_integrate_fix_{_safe_filename(func_name)}_{int(time.time())}.json",
+                folder=repo_root,
+            )
+            attempt += 1
+
+
+def _integrate_stubs_and_compile_with_agent_LEGACY(
     cfg: PipelineConfig,
     paths: dict,
     generated_bodies: dict[str, str],
@@ -1506,24 +1759,41 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
     candidates = collect_stub_candidates(analysis)
     print(f"[pipeline] {len(candidates)} stub candidates total", file=sys.stderr)
 
-    if not [n for n in candidates if not stub_exists(test_file, n)]:
-        print("[pipeline] all stubs already in test file", file=sys.stderr)
-        return
+    def _validated_stub_body(name: str) -> Optional[str]:
+        stub_dir = test_dir / "_stub_gen" / _safe_filename(name)
+        stub_out = stub_dir / "stub.c"
+        result_file = stub_dir / "result.json"
+        if not stub_out.exists() or not result_file.exists():
+            return None
+        try:
+            if not load_json(result_file).get("validated"):
+                return None
+        except Exception:
+            return None
+        body = read_text(stub_out).strip()
+        if not body or f"__wrap_{name}" not in body or f"__real_{name}" in body:
+            return None
+        return body
 
     bodies: dict[str, str] = {}
+    for n in candidates:
+        cached = _validated_stub_body(n)
+        if cached:
+            bodies[n] = cached
 
     # ------------------------------------------------------------------
-    # Phase 1: generate stub bodies with retry.
+    # Phase 1: generate stub bodies until every candidate has a validated body.
     # ------------------------------------------------------------------
-    for gen_round in range(1, cfg.max_stub_gen_retries + 1):
+    gen_round = 1
+    while True:
         to_gen = [
             n for n in candidates
-            if not stub_exists(test_file, n) and n not in bodies
+            if n not in bodies
         ]
         if not to_gen:
             break
         print(
-            f"[pipeline] stub gen round {gen_round}/{cfg.max_stub_gen_retries}: "
+            f"[pipeline] stub gen round {gen_round}: "
             f"{len(to_gen)} need bodies",
             file=sys.stderr,
         )
@@ -1541,66 +1811,40 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
                     print(f"[pipeline] body ready: {name} ({len(body)} chars)", file=sys.stderr)
                 else:
                     print(f"[pipeline] NO body: {name} round {gen_round}", file=sys.stderr)
+        gen_round += 1
 
-    no_body = [n for n in candidates if not stub_exists(test_file, n) and n not in bodies]
-    if no_body:
-        print(f"[pipeline] WARNING: no body after all gen rounds: {no_body}", file=sys.stderr)
-
-    # ------------------------------------------------------------------
-    # Phase 2: integrate with retry.
-    # ------------------------------------------------------------------
-    for int_round in range(1, cfg.max_stub_integrate_retries + 1):
-        to_integrate = [
-            n for n in candidates
-            if not stub_exists(test_file, n) and n in bodies
-        ]
-        if not to_integrate:
-            break
-        print(
-            f"[pipeline] stub integration round {int_round}/{cfg.max_stub_integrate_retries}: "
-            f"{len(to_integrate)} to integrate",
-            file=sys.stderr,
-        )
-        batches = [to_integrate[i:i + batch_size] for i in range(0, len(to_integrate), batch_size)]
-        for idx, batch_names in enumerate(batches, start=1):
-            batch_bodies = {n: bodies[n] for n in batch_names}
-            print(
-                f"[pipeline] integration batch {idx}/{len(batches)}: {batch_names}",
-                file=sys.stderr,
-            )
-            integrate_stubs_and_compile_with_agent(
-                cfg=cfg,
-                paths=paths,
-                generated_bodies=batch_bodies,
-                missing_stub_names=list(batch_bodies.keys()),
-                batch_index=idx,
-                batch_total=len(batches),
-            )
-        after = [n for n in to_integrate if not stub_exists(test_file, n)]
-        if after:
-            print(
-                f"[pipeline] round {int_round}: {len(after)} still missing: {after}",
-                file=sys.stderr,
-            )
-
-    final_missing = [n for n in candidates if not stub_exists(test_file, n)]
-    if final_missing:
-        print(f"[pipeline] {len(final_missing)} permanently missing stubs: {final_missing}", file=sys.stderr)
+    # Phase 2: sequential one-by-one integration with make test after each.
+    context_file = test_dir / "_pipeline_context.json"
+    flags: dict = {}
+    if context_file.exists():
+        try:
+            flags = load_json(context_file).get("flags", {})
+        except Exception:
+            pass
+    validated = {n: bodies[n] for n in candidates if n in bodies}
+    integrate_all_stubs_sequential(cfg, paths, validated, flags)
 
 # endregion Stage 2 — Stub Generation & Integration
 
 # region Stage 3 — Makefile Setup
-def ensure_makefile(cfg: PipelineConfig, paths: dict) -> None:
+def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
     """
-    Ensure Makefile exists by running do_mkmf first, then append only the pipeline test target.
+    Stage 0: create annotated master Makefile + write _pipeline_context.json.
 
-    Coverage behavior:
-    - Uses actual production .c files discovered under cfg.source_dir.
-    - Does NOT guess src/<process>.c.
-    - Generates production .gcov files named after source basename, e.g. dio100d.c.gcov.
-    - test_*.gcov files are deleted after gcov runs so only production gcov files remain.
+    Returns extracted flags dict so every downstream stage can use them
+    without re-reading the Makefile.
+
+    Skips Makefile rebuild if _pipeline_context.json already exists.
     """
     test_dir: Path = paths["test_dir"]
+    context_file = test_dir / "_pipeline_context.json"
+    if context_file.exists():
+        try:
+            ctx = load_json(context_file)
+            print("[pipeline] Stage 0: using cached _pipeline_context.json", file=sys.stderr)
+            return ctx.get("flags", {})
+        except Exception:
+            pass
     test_file: Path = paths["test_file"]
     makefile: Path = paths["makefile"]
     process_name: str = paths["process_name"]
@@ -1711,7 +1955,8 @@ test: clean-test $(TEST_PROGRAM)
 \t$(MAKE) coverage-test
 
 $(TEST_PROGRAM): $(TEST_SRCS)
-\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) -o $(TEST_PROGRAM) $(TEST_LIBS) \\
+\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) -o $(TEST_PROGRAM) \\
+\t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
 \t-Wl,--gc-sections \\
 \t$(WRAP_FLAGS)
 
@@ -1739,8 +1984,23 @@ clean-test:
     if new_text != text:
         write_text(makefile, new_text)
 
+    # -------------------------------------------------------------------------
+    # 4. Parse source Makefile flags and write _pipeline_context.json.
+    # -------------------------------------------------------------------------
+    flags = parse_source_makefile_flags(source_makefile) if source_makefile.exists() else {}
+    write_json(context_file, {
+        "process_name": process_name,
+        "source_dir": str(source_dir),
+        "source_makefile": str(source_makefile),
+        "actual_source_files": [str(p) for p in _project_source_files(cfg)],
+        "flags": flags,
+        "test_dir": str(paths["test_dir"]),
+        "test_file": str(paths["test_file"]),
+        "makefile": str(makefile),
+    })
     sync_wrap_flags(paths["test_file"], makefile)
-    print(f"[pipeline] Makefile ready: {makefile}", file=sys.stderr)
+    print(f"[pipeline] Stage 0: Makefile + context ready: {makefile}", file=sys.stderr)
+    return flags
 
 def ensure_wrap_flag(makefile: Path, func_name: str) -> bool:
     """Append -Wl,--wrap=<name> to WRAP_FUNCS if not already present."""
@@ -1758,58 +2018,6 @@ def sync_wrap_flags(test_file: Path, makefile: Path) -> None:
         ensure_wrap_flag(makefile, name)
 
 # endregion Stage 3 — Makefile Setup
-
-# region Stage 4 — Skeleton Compilation
-def ensure_skeleton_compiles(cfg: PipelineConfig, paths: dict) -> bool:
-    """
-    Compile-fix loop.
-    Gives the agent:
-    - exact source folder from args
-    - original source Makefile
-    - actual resolved source .c files
-    """
-    test_dir: Path = paths["test_dir"]
-    test_file: Path = paths["test_file"]
-    makefile: Path = paths["makefile"]
-
-    source_dir = cfg.source_dir.resolve()
-    source_makefile = source_dir / "Makefile"
-    actual_source_files = [str(p) for p in _project_source_files(cfg)]
-
-    for attempt in range(cfg.max_compile_fix_attempts + 1):
-        sync_wrap_flags(paths["test_file"], paths["makefile"])
-        res = run_make_test(test_dir)
-        if res["ok"]:
-            print(
-                f"[pipeline] skeleton compiles (attempt {attempt})",
-                file=sys.stderr,
-            )
-            return True
-
-        combined_output = collect_failure_diagnostics(test_dir, test_file, res)
-        print(
-            f"[pipeline] compile attempt {attempt + 1} failed, asking agent to fix",
-            file=sys.stderr,
-        )
-        prompt = prompt_for_compile_fix(
-            str(makefile),
-            str(test_file),
-            combined_output,
-            source_dir=str(source_dir),
-            source_makefile=str(source_makefile),
-            actual_source_files=actual_source_files,
-        )
-        run_agent(
-            cfg,
-            test_dir,
-            prompt,
-            f"_compile_fix_{attempt:03d}.json",
-            folder=cfg.source_dir.parent.parent.resolve(),
-        )
-
-    return run_make_test(test_dir)["ok"]
-
-# endregion Stage 4 — Skeleton Compilation
 
 # region Stage 5 & 6 Helpers
 
@@ -2471,9 +2679,10 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
         file=sys.stderr,
     )
 
-    for attempt in range(1, cfg.max_minimal_test_attempts + 1):
+    attempt = 1
+    while True:
         print(
-            f"[pipeline] minimal test attempt {attempt}/{cfg.max_minimal_test_attempts}",
+            f"[pipeline] minimal test attempt {attempt}",
             file=sys.stderr,
         )
 
@@ -2541,9 +2750,7 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
                 f"_minimal_compile_fix_{attempt:02d}.json",
                 folder=repo_root,
             )
-
-    print(f"[pipeline] WARNING: minimal test never passed after {cfg.max_minimal_test_attempts} attempts", file=sys.stderr)
-    return False
+        attempt += 1
 
 # endregion Stage 5 — Minimal Test Validation
 
@@ -2663,7 +2870,8 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
         )
 
         last_make_ok = True
-        for attempt in range(1, cfg.max_test_attempts + 1):
+        attempt = 1
+        while True:
             func_for_prompt = dict(func)
             func_for_prompt["source_file"] = str(source_file_abs)
 
@@ -2685,7 +2893,7 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
                     test_file=str(test_file),
                     process_name=process_name,
                     attempt=attempt,
-                    max_attempts=cfg.max_test_attempts,
+                    max_attempts=attempt,
                     make_ok=last_make_ok,
                     semantic_context=semantic_context,
                     last_judge_verdict=last_judge,
@@ -2789,6 +2997,7 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
                     f"[pipeline] -> attempt {attempt} coverage={pct}%",
                     file=sys.stderr,
                 )
+            attempt += 1
 
         coverage_results[func["id"]] = pct
         done += 1
@@ -2812,6 +3021,573 @@ def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
 
 # endregion Stage 6 — Per-Function Coverage Loop
 
+# region Stage 4 — Parallel Unit Test Generation
+import shutil as _shutil
+
+def _stub_srcs_relative(test_dir: Path, unit_dir: Path) -> list[tuple[str, str]]:
+    """
+    Return [(relative_stub_path, func_name)] for all validated stubs.
+    Relative path is from unit_dir (the cwd when building the unit test).
+    Stubs are generated into _stub_gen/<func_name>/ by generate_stub_code.
+    """
+    stubs_dir = test_dir / "_stub_gen"
+    result: list[tuple[str, str]] = []
+    if not stubs_dir.exists():
+        return result
+    for result_file in sorted(stubs_dir.glob("*/result.json")):
+        try:
+            data = load_json(result_file)
+            if not data.get("validated"):
+                continue
+            func_name = data.get("func_name", result_file.parent.name)
+            stub_c = result_file.parent / "stub.c"
+            if stub_c.exists():
+                rel = Path(os.path.relpath(stub_c.resolve(), start=unit_dir)).as_posix()
+                result.append((rel, func_name))
+        except Exception:
+            pass
+    return result
+
+
+def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path, unit_dir: Path) -> None:
+    """
+    Update STUB_SRCS in unit Makefile to exclude stubs whose __wrap_ function
+    is locally DEFINED (not just called) in the unit test file.
+    Prevents duplicate-symbol link errors when the test overrides a stub.
+    """
+    text = read_text(unit_test_file)
+    # Match definitions: return_type __wrap_name(...) {
+    local_overrides = set(re.findall(r'__wrap_(\w+)\s*\([^)]*\)\s*\{', text))
+    all_stubs = _stub_srcs_relative(test_dir, unit_dir)
+    filtered = [path for path, fname in all_stubs if fname not in local_overrides]
+    stub_srcs_line = "STUB_SRCS = " + " ".join(filtered)
+    mk_text = read_text(unit_makefile)
+    new_mk = re.sub(r'^STUB_SRCS\s*=.*$', stub_srcs_line, mk_text, flags=re.MULTILINE)
+    if new_mk != mk_text:
+        write_text(unit_makefile, new_mk)
+
+def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Path:
+    """Create _unit_tests/<func_id>/ with skeleton test file + generated Makefile."""
+    test_dir: Path = paths["test_dir"]
+    process_name: str = paths["process_name"]
+    func_id = func["id"]
+    safe_id = _safe_filename(func_id)
+
+    unit_dir = test_dir / "_unit_tests" / safe_id
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / "agent_history").mkdir(exist_ok=True)
+
+    unit_test_file = unit_dir / f"test_{safe_id}.c"
+    unit_makefile = unit_dir / "Makefile"
+
+    if not unit_test_file.exists():
+        prod_lines = _source_includes_for_test_file(cfg, unit_test_file)
+        prod_block = (
+            f"\n/* Production sources — main renamed so CUnit owns int main(void). */\n"
+            f"#define main {process_name}_entry_main\n"
+            + "\n".join(prod_lines)
+            + "\n#undef main\n"
+        ) if prod_lines else ""
+        skeleton = f"""/* CUnit unit test for {func_id} */
+{TEST_FILE_MARKERS[0]}
+#include <CUnit/CUnit.h>
+#include <CUnit/Basic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+{prod_block}
+{TEST_FILE_MARKERS[1]}
+/* Compatibility definitions go here if needed. */
+
+{TEST_FILE_MARKERS[2]}
+/* Test globals go here. */
+
+{TEST_FILE_MARKERS[3]}
+/* Test helpers go here. */
+
+/* === Local Stub Overrides === */
+/* Override __wrap_* stubs here for this function only. */
+
+{TEST_FILE_MARKERS[4]}
+/* Stubs linked from master via Makefile WRAP_FUNCS. */
+
+{TEST_FILE_MARKERS[5]}
+/* Test cases for {func_id} go here. */
+
+{TEST_FILE_MARKERS[6]}
+int main(void)
+{{
+    CU_pSuite suite = NULL;
+    if (CU_initialize_registry() != CUE_SUCCESS)
+        return CU_get_error();
+    suite = CU_add_suite("{func_id}_suite", NULL, NULL);
+    if (suite == NULL) {{
+        CU_cleanup_registry();
+        return CU_get_error();
+    }}
+    CU_basic_set_mode(CU_BRM_VERBOSE);
+    CU_basic_run_tests();
+    {{
+        unsigned int failures = CU_get_number_of_failures();
+        CU_cleanup_registry();
+        return failures == 0 ? 0 : 1;
+    }}
+}}
+"""
+        write_text(unit_test_file, skeleton)
+
+    if not unit_makefile.exists():
+        _generate_unit_test_makefile(cfg, paths, func_id, safe_id, unit_dir, unit_test_file)
+
+    return unit_dir
+
+
+def _generate_unit_test_makefile(
+    cfg: PipelineConfig,
+    paths: dict,
+    func_id: str,
+    safe_id: str,
+    unit_dir: Path,
+    unit_test_file: Path,
+) -> None:
+    """Generate Makefile for a unit test dir from _pipeline_context.json."""
+    context_file = paths["test_dir"] / "_pipeline_context.json"
+    flags: dict = {}
+    if context_file.exists():
+        try:
+            flags = load_json(context_file).get("flags", {})
+        except Exception:
+            pass
+
+    # Inherit WRAP_FUNCS lines from master Makefile
+    master_mk_text = read_text(paths["makefile"])
+    wrap_lines = [
+        ln.strip() for ln in master_mk_text.splitlines()
+        if "WRAP_FUNCS" in ln and "--wrap" in ln
+    ]
+    wrap_block = "\n".join(wrap_lines)
+
+    # Production source paths relative to unit_dir (not used in link; included via #include)
+    test_program = f"test_{safe_id}"
+    test_src = unit_test_file.name
+
+    # Validated stub bodies to link (will be updated by _sync_stub_srcs before each make test)
+    stub_srcs_list = [path for path, _ in _stub_srcs_relative(paths["test_dir"], unit_dir)]
+    stub_srcs_str = " ".join(stub_srcs_list)
+
+    content = f"""# Unit test Makefile for {func_id}
+# Auto-generated — do not edit manually
+
+CC = gcc
+
+# Flags from source Makefile
+CFLAGS = {flags.get('CFLAGS', '')}
+CFLAGS_LINUX = {flags.get('CFLAGS_LINUX', '')}
+CPPFLAGS = {flags.get('CPPFLAGS', '')}
+INCLUDE = {flags.get('INCLUDE', '')}
+LDFLAGS = {flags.get('LDFLAGS', '')}
+LDLIBS = {flags.get('LDLIBS', '')}
+LIBS = {flags.get('LIBS', '')}
+
+# Wrap flags from master (all validated stubs)
+{wrap_block}
+WRAP_FLAGS = $(WRAP_FUNCS)
+
+# Validated stub bodies (updated by pipeline before each make; excludes local overrides)
+STUB_SRCS = {stub_srcs_str}
+
+TEST_PROGRAM = {test_program}
+TEST_SRCS = {test_src}
+TEST_LIBS += -lcunit
+TEST_REPORT_FILE = {test_program}_report.txt
+TEST_LOG_FILE = {test_program}_log.txt
+COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
+
+.PHONY: test clean-test coverage-test
+
+test: clean-test $(TEST_PROGRAM)
+\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE)
+\t$(MAKE) coverage-test
+
+$(TEST_PROGRAM): $(TEST_SRCS) $(STUB_SRCS)
+\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) $(STUB_SRCS) \\
+\t-o $(TEST_PROGRAM) \\
+\t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
+\t-Wl,--gc-sections \\
+\t$(WRAP_FLAGS)
+
+coverage-test:
+\t@gcov -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
+\t@rm -f test_*.gcov
+
+clean-test:
+\trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
+"""
+    write_text(unit_dir / "Makefile", content)
+
+
+def _generate_unit_test_for_func(
+    cfg: PipelineConfig,
+    paths: dict,
+    func: dict,
+    flags: dict,
+    semantic_context_snapshot: dict,
+) -> tuple[str, dict]:
+    """
+    Generate, compile, and judge unit test for one function.
+    Runs entirely in _unit_tests/<func_id>/.
+    Loops until judge passes.
+    Returns (func_id, result_dict).
+    """
+    func_id = func["id"]
+    safe_id = _safe_filename(func_id)
+    test_dir: Path = paths["test_dir"]
+    process_name: str = paths["process_name"]
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
+    unit_test_file = unit_dir / f"test_{safe_id}.c"
+    unit_makefile = unit_dir / "Makefile"
+    judge_verdict_file = unit_dir / "judge_verdict.json"
+    coverage_file = unit_dir / "coverage.json"
+
+    # Continuation: already passed
+    if judge_verdict_file.exists():
+        try:
+            v = load_json(judge_verdict_file)
+            if v.get("passed"):
+                cached_coverage = None
+                if coverage_file.exists():
+                    try:
+                        cached_coverage = load_json(coverage_file)
+                    except Exception:
+                        cached_coverage = None
+                cached_pct = None
+                if isinstance(cached_coverage, dict):
+                    cached_pct = (cached_coverage.get("summary", {}) or {}).get("coverage_percent")
+                print(f"[pipeline] unit test already done: {func_id}", file=sys.stderr)
+                return func_id, {
+                    "passed": True,
+                    "coverage_pct": cached_pct,
+                    "semantic_score": v.get("score"),
+                    "verdict": v,
+                    "unit_dir": str(unit_dir),
+                }
+        except Exception:
+            pass
+
+    source_file_abs = _resolve_source_file(cfg, func["source_file"])
+    last_judge: Optional[dict] = None
+    if judge_verdict_file.exists():
+        try:
+            last_judge = load_json(judge_verdict_file)
+        except Exception:
+            pass
+
+    last_make_ok = True
+    cov: Optional[dict] = None
+    pct: Optional[float] = None
+    test_dir: Path = paths["test_dir"]
+
+    attempt = 1
+    while True:
+        func_for_prompt = {**func, "source_file": str(source_file_abs)}
+        semantic_context = dict(semantic_context_snapshot)
+
+        if last_judge and not last_judge.get("passed"):
+            prompt = prompt_for_semantic_test_repair(
+                process_name=process_name,
+                test_file=str(unit_test_file),
+                func=func_for_prompt,
+                coverage=cov or {},
+                judge_verdict=last_judge,
+                semantic_context=semantic_context,
+            )
+        else:
+            prompt = prompt_for_function_test_with_semantic_context(
+                func=func_for_prompt,
+                coverage=cov or {},
+                test_file=str(unit_test_file),
+                process_name=process_name,
+                attempt=attempt,
+                max_attempts=attempt,
+                make_ok=last_make_ok,
+                semantic_context=semantic_context,
+                last_judge_verdict=last_judge,
+            )
+
+        run_agent(
+            cfg, unit_dir, prompt,
+            f"{safe_id}_test_{int(time.time())}.json",
+            folder=repo_root,
+            history_dir=unit_dir / "agent_history",
+        )
+
+        _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+        sync_wrap_flags(unit_test_file, unit_makefile)
+        make_res = run_make_test(unit_dir)
+
+        if not make_res["ok"]:
+            diag = build_output_with_runtime_diagnostics(unit_dir, unit_test_file, make_res)
+            run_agent(
+                cfg, unit_dir,
+                prompt_for_compile_fix(
+                    str(unit_makefile), str(unit_test_file), diag,
+                    source_dir=str(cfg.source_dir.resolve()),
+                    source_makefile=str(cfg.source_dir.resolve() / "Makefile"),
+                    actual_source_files=[str(p) for p in _project_source_files(cfg)],
+                ),
+                f"{safe_id}_compile_fix_{int(time.time())}.json",
+                folder=repo_root,
+                history_dir=unit_dir / "agent_history",
+            )
+            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+            sync_wrap_flags(unit_test_file, unit_makefile)
+            make_res = run_make_test(unit_dir)
+
+        last_make_ok = make_res["ok"]
+        source_file_abs = _resolve_source_file(cfg, func["source_file"])
+        cov = check_function_coverage(
+            unit_dir, source_file_abs,
+            func["start_line"], func["end_line"],
+            source_root=cfg.source_dir.resolve(),
+        )
+        pct = None
+        if cov:
+            pct = (cov.get("summary", {}) or {}).get("coverage_percent")
+            if pct is None:
+                pct = cov.get("coverage_percent")
+
+        if pct is not None and pct >= cfg.coverage_threshold and make_res["ok"]:
+            judge = run_semantic_test_judge(
+                cfg,
+                test_dir=unit_dir,
+                repo_root=repo_root,
+                process_name=process_name,
+                test_file=unit_test_file,
+                func=func_for_prompt,
+                coverage=cov or {},
+                make_result=make_res,
+            )
+            write_json(coverage_file, cov or {})
+            write_json(judge_verdict_file, judge)
+            last_judge = judge
+            if judge.get("passed"):
+                print(f"[pipeline] unit test PASSED: {func_id} score={judge.get('score')}", file=sys.stderr)
+                return func_id, {
+                    "passed": True,
+                    "coverage_pct": pct,
+                    "semantic_score": judge.get("score"),
+                    "verdict": judge,
+                    "unit_dir": str(unit_dir),
+                }
+            print(f"[pipeline] judge FAILED: {func_id} score={judge.get('score')}", file=sys.stderr)
+        else:
+            print(f"[pipeline] {func_id} attempt {attempt} coverage={pct}% make_ok={make_res['ok']}", file=sys.stderr)
+        attempt += 1
+
+
+def parallel_generate_unit_tests(
+    cfg: PipelineConfig,
+    paths: dict,
+    analysis: dict,
+    flags: dict,
+) -> dict[str, dict]:
+    """
+    Stage 4: generate unit tests level-by-level, parallel within each level.
+    Waits for level N to fully complete before starting level N-1 so semantic
+    context flows upward correctly.
+    """
+    test_dir: Path = paths["test_dir"]
+    funcs = functions_leaf_first(analysis)
+
+    levels: dict[int, list[dict]] = {}
+    for f in funcs:
+        depth = int(f.get("depth", 0))
+        levels.setdefault(depth, []).append(f)
+
+    all_results: dict[str, dict] = {}
+    workers = max(1, int(getattr(cfg, "max_unit_test_workers", 4)))
+
+    for depth in sorted(levels.keys(), reverse=True):
+        remaining = (cfg.max_functions - len(all_results)) if cfg.max_functions is not None else None
+        if remaining is not None and remaining <= 0:
+            break
+        level_funcs = [
+            f for f in levels[depth]
+            if not (cfg.only_function and f["id"] != cfg.only_function)
+            and not (cfg.only_level is not None and f.get("depth") != cfg.only_level)
+        ]
+        if remaining is not None:
+            level_funcs = level_funcs[:remaining]
+        if not level_funcs:
+            continue
+
+        semantic_context = _load_semantic_context(test_dir)
+        print(f"[pipeline] Stage 4: depth={depth} {len(level_funcs)} funcs in parallel", file=sys.stderr)
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(level_funcs))) as pool:
+            futs = {
+                pool.submit(_generate_unit_test_for_func, cfg, paths, func, flags, semantic_context): func
+                for func in level_funcs
+            }
+            for fut in as_completed(futs):
+                func = futs[fut]
+                try:
+                    fid, result = fut.result()
+                    all_results[fid] = result
+                except Exception as e:
+                    print(f"[pipeline] unit test error {func['id']}: {e}", file=sys.stderr)
+                    all_results[func["id"]] = {"passed": False, "error": str(e)}
+
+        # After level done: persist semantic context for accepted funcs
+        for func in level_funcs:
+            result = all_results.get(func["id"], {})
+            if result.get("passed"):
+                src_abs = _resolve_source_file(cfg, func["source_file"])
+                _append_semantic_context(test_dir, {**func, "source_file": str(src_abs)}, result["verdict"])
+
+    return all_results
+
+# endregion Stage 4 — Parallel Unit Test Generation
+
+# region Stage 5 — Unit Test Integration
+def extract_test_additions(unit_test_file: Path) -> tuple[str, list[str]]:
+    """Extract test case functions and CU_add_test calls from a unit test file."""
+    text = read_text(unit_test_file)
+
+    cases_start = text.find("/* === Test Cases === */")
+    reg_start = text.find("/* === Test Registration === */")
+    if cases_start == -1:
+        return "", []
+
+    end = reg_start if reg_start != -1 else len(text)
+    test_cases = text[cases_start + len("/* === Test Cases === */"):end].strip()
+
+    reg_calls = re.findall(r'CU_add_test\s*\([^;]+\)\s*;', text)
+    return test_cases, reg_calls
+
+
+def integrate_all_unit_tests_sequential(
+    cfg: PipelineConfig,
+    paths: dict,
+    analysis: dict,
+    unit_test_results: dict[str, dict],
+    flags: dict,
+) -> bool:
+    """
+    Stage 5: integrate passed unit tests one-by-one into master test file.
+    After each: gcc -fsyntax-only check. Loop compile-fix on failure.
+    """
+    test_file: Path = paths["test_file"]
+    makefile: Path = paths["makefile"]
+    test_dir: Path = paths["test_dir"]
+    source_dir = cfg.source_dir.resolve()
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    cflags_str = " ".join(filter(None, [
+        flags.get("CFLAGS", ""), flags.get("CFLAGS_LINUX", ""),
+        flags.get("CPPFLAGS", ""), flags.get("INCLUDE", ""),
+    ]))
+
+    for func in functions_leaf_first(analysis):
+        func_id = func["id"]
+        safe_id = _safe_filename(func_id)
+        result = unit_test_results.get(func_id, {})
+        if not result.get("passed"):
+            continue
+
+        # Continuation check
+        if f"/* --- unit: {func_id} --- */" in read_text(test_file):
+            print(f"[pipeline] already integrated: {func_id}", file=sys.stderr)
+            continue
+
+        unit_dir = Path(result.get("unit_dir", ""))
+        unit_test_file = unit_dir / f"test_{safe_id}.c"
+        if not unit_test_file.exists():
+            continue
+
+        test_cases, reg_calls = extract_test_additions(unit_test_file)
+        if not test_cases.strip() and not reg_calls:
+            print(f"[pipeline] no additions to integrate for {func_id}", file=sys.stderr)
+            continue
+
+        print(f"[pipeline] Stage 5: integrating {func_id}", file=sys.stderr)
+        current = read_text(test_file)
+
+        cases_marker = "/* === Test Cases === */"
+        reg_marker = "CU_basic_set_mode"
+
+        if cases_marker in current and test_cases.strip():
+            insertion = f"\n\n/* --- unit: {func_id} --- */\n{test_cases}\n"
+            current = current.replace(cases_marker, cases_marker + insertion, 1)
+
+        if reg_calls and reg_marker in current:
+            reg_insertion = "    " + "\n    ".join(reg_calls) + "\n    "
+            current = current.replace(reg_marker, reg_insertion + reg_marker, 1)
+
+        write_text(test_file, current)
+        sync_wrap_flags(test_file, makefile)
+
+        attempt = 1
+        while True:
+            chk = subprocess.run(
+                f"gcc -fsyntax-only {cflags_str} {test_file}",
+                shell=True, cwd=str(test_dir),
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            if chk.returncode == 0:
+                print(f"[pipeline] master syntax OK after {func_id}", file=sys.stderr)
+                break
+            err = (chk.stderr + chk.stdout)[:6000]
+            print(f"[pipeline] syntax error after {func_id} attempt {attempt}, fixing", file=sys.stderr)
+            run_agent(
+                cfg, test_dir,
+                prompt_for_compile_fix(
+                    str(makefile), str(test_file), err,
+                    source_dir=str(source_dir),
+                    source_makefile=str(source_dir / "Makefile"),
+                    actual_source_files=[str(p) for p in _project_source_files(cfg)],
+                ),
+                f"_unit_integrate_fix_{safe_id}_{int(time.time())}.json",
+                folder=repo_root,
+            )
+            attempt += 1
+
+    # Final full build+run of master suite after all integrations
+    print("[pipeline] Stage 5: running final make test on master suite", file=sys.stderr)
+    final = run_make_test(test_dir)
+    if not final["ok"]:
+        print("[pipeline] WARN: final master make test failed after unit test integration", file=sys.stderr)
+        source_dir_f = cfg.source_dir.resolve()
+        repo_root_f = cfg.source_dir.parent.parent.resolve()
+        diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
+        attempt = 1
+        while True:
+            run_agent(
+                cfg, test_dir,
+                prompt_for_compile_fix(
+                    str(makefile), str(test_file), diag,
+                    source_dir=str(source_dir_f),
+                    source_makefile=str(source_dir_f / "Makefile"),
+                    actual_source_files=[str(p) for p in _project_source_files(cfg)],
+                ),
+                f"_final_master_fix_{int(time.time())}.json",
+                folder=repo_root_f,
+            )
+            sync_wrap_flags(test_file, makefile)
+            final = run_make_test(test_dir)
+            if final["ok"]:
+                print(f"[pipeline] final master make test passed on attempt {attempt}", file=sys.stderr)
+                break
+            diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
+            attempt += 1
+    return final["ok"]
+
+# endregion Stage 5 — Unit Test Integration
+
 # region Driver & CLI
 def run(cfg: PipelineConfig) -> int:
     paths = derive_paths(cfg)
@@ -2824,27 +3600,48 @@ def run(cfg: PipelineConfig) -> int:
 
     analysis = run_or_load_analysis(cfg, paths["analysis_path"])
 
-    ensure_test_file(cfg, paths)
-    handle_stubs(cfg, paths, analysis)
-    ensure_makefile(cfg, paths)
+    ensure_test_file(cfg, paths)                          # Stage 0a: bare skeleton
+    flags = build_annotated_makefile(cfg, paths)          # Stage 0b: Makefile + context
+    handle_stubs(cfg, paths, analysis)                    # Stage 1+2: stub gen+validate, integrate
 
-    if not ensure_skeleton_compiles(cfg, paths):
-        print("[pipeline] skeleton failed to compile after all fix attempts",
-            file=sys.stderr)
+    minimal_ok = ensure_minimal_test_runs(cfg, paths)     # Stage 3: smoke test master
+    if not minimal_ok:
+        print("[pipeline] minimal test never passed; aborting", file=sys.stderr)
+        write_json(paths["test_dir"] / "DONE.json", {
+            "finished_at": now_iso(), "source": str(cfg.source_dir),
+            "error": "minimal_test_failed",
+        })
         return 2
 
-    if not ensure_minimal_test_runs(cfg, paths):
-        print("[pipeline] WARNING: minimal test never passed; coverage tests may fail", file=sys.stderr)
+    unit_results = parallel_generate_unit_tests(cfg, paths, analysis, flags)  # Stage 4
+    master_ok = integrate_all_unit_tests_sequential(       # Stage 5
+        cfg, paths, analysis, unit_results, flags)
 
-    summary = process_functions(cfg, paths, analysis)
-
+    passed = sum(1 for r in unit_results.values() if r.get("passed"))
+    total = len(unit_results)
+    exit_code = 0 if master_ok else 3
     write_json(paths["test_dir"] / "DONE.json", {
         "finished_at": now_iso(),
         "source": str(cfg.source_dir),
-        **summary,
+        "master_suite_ok": master_ok,
+        "functions_total": total,
+        "functions_done": passed,
+        "functions_passed": passed,
+        "functions_skipped": sum(
+            1 for r in unit_results.values()
+            if r.get("passed") and r.get("coverage_pct") is None
+        ),
+        "coverage": {
+            k: round(v["coverage_pct"], 1) if v.get("coverage_pct") is not None else None
+            for k, v in unit_results.items()
+        },
+        "semantic_score": {
+            k: v.get("semantic_score") for k, v in unit_results.items()
+        },
+        "semantic_context_file": str(_semantic_context_path(paths["test_dir"])),
     })
-    print("[pipeline] finished.", file=sys.stderr)
-    return 0
+    print(f"[pipeline] finished. {passed}/{total} functions passed. master_ok={master_ok}", file=sys.stderr)
+    return exit_code
 
 def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
     ap = argparse.ArgumentParser(description="Simplified CUnit test-gen pipeline")
@@ -2855,8 +3652,18 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
     ap.add_argument("--system-json", type=Path, default=None)
     ap.add_argument("--agent-timeout-sec", type=int, default=1800)
     ap.add_argument("--max-agent-iterations", type=int, default=25)
-    ap.add_argument("--max-compile-fix-attempts", type=int, default=5)
-    ap.add_argument("--max-test-attempts", type=int, default=4)
+    ap.add_argument(
+        "--max-compile-fix-attempts",
+        type=int,
+        default=5,
+        help="Legacy/v1 compatibility only; v2 repair loops run until success.",
+    )
+    ap.add_argument(
+        "--max-test-attempts",
+        type=int,
+        default=4,
+        help="Legacy/v1 compatibility only; v2 per-function loops run until success.",
+    )
     ap.add_argument(
         "--coverage-threshold",
         type=float,
@@ -2875,9 +3682,24 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--python-bin", type=str, default=sys.executable,
                     help="Python binary used by agent.js for gcov analysis tool")
-    ap.add_argument("--max-stub-gen-retries", type=int, default=3)
-    ap.add_argument("--max-stub-integrate-retries", type=int, default=3)
-    ap.add_argument("--max-minimal-test-attempts", type=int, default=5)
+    ap.add_argument(
+        "--max-stub-gen-retries",
+        type=int,
+        default=3,
+        help="Legacy/v1 compatibility only; v2 stub generation runs until success.",
+    )
+    ap.add_argument(
+        "--max-stub-integrate-retries",
+        type=int,
+        default=3,
+        help="Legacy/v1 compatibility only; v2 stub integration runs until success.",
+    )
+    ap.add_argument(
+        "--max-minimal-test-attempts",
+        type=int,
+        default=5,
+        help="Legacy/v1 compatibility only; v2 minimal validation runs until success.",
+    )
     ap.add_argument(
         "--func-docs-dir",
         type=Path,
@@ -2889,6 +3711,18 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
         type=int,
         default=75,
         help="Minimum semantic score for a function to be considered done.",
+    )
+    ap.add_argument(
+        "--max-unit-test-workers",
+        type=int,
+        default=4,
+        help="ThreadPoolExecutor workers for parallel unit test generation.",
+    )
+    ap.add_argument(
+        "--max-fix-attempts",
+        type=int,
+        default=20,
+        help="Legacy/v1 compatibility only; v2 fix loops run until success.",
     )
 
     ns = ap.parse_args(argv)
@@ -2912,6 +3746,8 @@ def parse_args(argv: Optional[list[str]] = None) -> PipelineConfig:
         max_minimal_test_attempts=ns.max_minimal_test_attempts,
         func_docs_dir=ns.func_docs_dir.resolve(),
         semantic_judge_min_score=ns.semantic_judge_min_score,
+        max_unit_test_workers=ns.max_unit_test_workers,
+        max_fix_attempts=ns.max_fix_attempts,
     )
 
 def main(argv: Optional[list[str]] = None) -> int:
