@@ -119,17 +119,30 @@ def _safe_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
 
 def parse_source_makefile_flags(source_makefile: Path) -> dict:
-    """Extract CFLAGS/INCLUDE/LDFLAGS etc. from source Makefile via regex."""
+    """Extract build flags from Makefile assignments, including continuations."""
     text = read_text(source_makefile)
     flags: dict[str, str] = {}
-    for var in ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]:
-        parts: list[str] = []
-        for m in re.finditer(rf"^{var}\s*[\+:]?=[ \t]*(.+)$", text, re.MULTILINE):
-            val = m.group(1).strip().rstrip("\\").strip()
+    wanted = {"CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"}
+
+    current: Optional[str] = None
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:+?]?=\s*(.*)$", line)
+        if m and m.group(1) in wanted:
+            current = m.group(1)
+            val = m.group(2).strip().rstrip("\\").strip()
             if val:
-                parts.append(val)
-        if parts:
-            flags[var] = " ".join(parts)
+                flags[current] = (flags.get(current, "") + " " + val).strip()
+            if not line.rstrip().endswith("\\"):
+                current = None
+            continue
+
+        if current:
+            val = line.strip().rstrip("\\").strip()
+            if val and not val.startswith("#"):
+                flags[current] = (flags.get(current, "") + " " + val).strip()
+            if not line.rstrip().endswith("\\"):
+                current = None
+
     return flags
 
 # endregion Config & Infrastructure
@@ -598,6 +611,7 @@ Important:
 - Do not call `__real_*` from wrappers.
 - Do not hide crashes by deleting assertions or replacing them with always-pass assertions.
 - Do not edit production code to make the test pass.
+- Do not create fake data, headers, or types just to make the test pass.
 
 REFERENCE LOCATIONS
 - Source folder passed by user:
@@ -742,222 +756,6 @@ FIX:
    }}
    ```
 5. Run `make test` after fixing.
-
-When done, call submit_and_exit.
-"""
-
-def prompt_for_function_test(func: dict,
-                        coverage: Optional[dict],
-                        test_file: str,
-                        process_name: str,
-                        attempt: int,
-                        max_attempts: int,
-                        *,
-                        make_ok: bool = True) -> str:
-    fid = func["id"]
-    name = func["name"]
-    src = func["source_file"]
-    s = func["start_line"]
-    e = func["end_line"]
-    cov_pct = None
-    uncovered = []
-    matched_gcov_file = None
-    if coverage and isinstance(coverage, dict):
-        summary = coverage.get("summary", {}) or {}
-        cov_pct = summary.get("coverage_percent")
-        if cov_pct is None:
-            cov_pct = coverage.get("coverage_percent")
-        uncovered = coverage.get("uncovered_executable_lines", []) or []
-        matched_gcov_file = coverage.get("gcov_file")
-
-    if uncovered:
-        lines = []
-        for u in uncovered[:80]:
-            if isinstance(u, dict):
-                line_no = u.get("line", "?")
-                source_text = u.get("source", "")
-                lines.append(f"{str(line_no):>5}: {source_text}")
-            else:
-                lines.append(str(u))
-        uncovered_text = "\n".join(lines)
-    else:
-        if cov_pct == 0 or cov_pct == 0.0:
-            uncovered_text = (
-                "No uncovered-line list was extracted, but coverage is 0.0%.\n"
-                "Assume the target function is not being executed yet.\n"
-                "First add and register a CUnit test that directly calls the target production function."
-            )
-        elif cov_pct is None:
-            uncovered_text = (
-                "No gcov coverage data was available yet.\n"
-                "First add and register a CUnit test that directly calls the target production function."
-            )
-        else:
-            uncovered_text = (
-                "No uncovered executable lines were reported for this range.\n"
-                "If coverage is below threshold, inspect the matched production gcov file and add tests."
-            )
-
-    expected_gcov_path = Path(test_file).parent / f"{Path(src).name}.gcov"
-    gcov_tool_text = f"""9. After running `make test`, MUST call `analyze_function_coverage` to verify coverage:
-
-    gcov_file: {expected_gcov_path}
-    start_line: {s}
-    end_line: {e}
-
-CRITICAL: Use ONLY this exact gcov file path above.
-Do NOT use `test_{process_name}.c.gcov` or any `test_*.c.gcov` — those are test harness files and will always show wrong coverage.
-This production gcov file is created/updated every time `make test` runs.
-Call `analyze_function_coverage` BEFORE calling submit_and_exit to confirm lines {s}..{e} coverage increased."""
-
-    if name == "main":
-        production_call_rule = f"""CRITICAL HARNESS FACT
-The production source is included into the CUnit test file like this:
-```c
-#define main {process_name}_entry_main
-#include "...production source..."
-#undef main
-```
-Therefore the target production function:
-```c
-int main(int argc, char **argv)
-```
-is compiled and callable inside the test file as:
-```c
-{process_name}_entry_main(argc, argv)
-```
-The test file has its own CUnit `main()`. Do NOT call `main()` directly.
-
-For this target, add and register at least one CUnit test that directly calls the production main through the renamed symbol:
-```c
-char *argv[] = {{ "{process_name}", NULL }};
-int ret = {process_name}_entry_main(1, argv);
-```
-Wrapper-only smoke tests are NOT enough.
-The first goal is to make gcov change from:
-```text
-function {process_name}_entry_main called 0
-```
-to:
-```text
-function {process_name}_entry_main called 1
-```
-or higher."""
-    else:
-        production_call_rule = f"""MANDATORY PRODUCTION-CALL RULE
-Add and register at least one CUnit test that directly calls the current target production function itself:
-```text
-{name}
-```
-Wrapper-only smoke tests are NOT enough.
-
-If the function has static linkage but the production `.c` file is included directly into the test file, call it directly from the test because it is in the same translation unit.
-
-Use safe/minimal arguments:
-- For `int foo(void)`, call `foo()`.
-- For scalar args, use safe values like `0`, `1`, boundary values, or known constants.
-- For pointer args, create local zeroed objects or safe buffers when possible.
-- Do not pass `NULL` unless the function is expected to handle `NULL`.
-
-The first goal is to make gcov report the target function as called at least once.
-
-You are not allowed to write coverage-only tests.
-
-A valid test must satisfy all of these rules:
-
-1. Use Arrange / Act / Assert structure.
-2. Assert at least one externally observable behavior:
-   - return value,
-   - global state change,
-   - output structure contents,
-   - mock call count,
-   - mock argument values,
-   - pointer assignment,
-   - cleanup/reset behavior,
-   - error logging / exit behavior.
-3. Do not use meaningless assertions:
-   - CU_ASSERT_TRUE(1)
-   - CU_ASSERT_TRUE(counter >= 0)
-   - CU_ASSERT_PTR_NOT_NULL(any pointer that was manually assigned in the test without calling production code)
-4. Every mock must capture enough information to verify behavior:
-   - call count,
-   - last arguments,
-   - return value control.
-5. Each test must reset all mock state before running.
-6. Do not remove existing meaningful assertions to fix compilation.
-7. Prefer exact assertions over loose assertions:
-   - prefer CU_ASSERT_EQUAL(x, 1)
-   - avoid CU_ASSERT_TRUE(x >= 1) unless multiple calls are genuinely acceptable.
-8. If the target calls another function, verify the interaction:
-   - called or not called,
-   - number of calls,
-   - argument values.
-9. If the function mutates a struct, assert exact changed fields and exact unchanged fields where important.
-10. If testing an error path, assert the error effect:
-    - error log called,
-    - exit called,
-    - cleanup performed,
-    - return value indicates failure.
-"""
-
-    report_name = f"{test_file.split('/')[-1]}_report.txt"
-
-    return f"""You are improving CUnit coverage for ONE target function.
-
-TARGET FUNCTION
-id:           {fid}
-name:         {name}
-source:       {src}
-line range:   {s} .. {e} (inclusive)
-
-CURRENT STATUS
-attempt:        {attempt} / {max_attempts}
-coverage so far: {cov_pct if cov_pct is not None else 'unknown'}%
-{'WARNING: `make test` is FAILING — fix compilation before adding tests.' if not make_ok else ''}
-
-{production_call_rule}
-
-UNCOVERED EXECUTABLE LINES (from PRODUCTION gcov, not test harness gcov)
-{uncovered_text}
-
-FILE YOU MAY EDIT
-`{test_file}`
-(do NOT modify any production sources)
-
-RULES
-0. MANDATORY:
-Add and register at least one CUnit test that directly calls the current target production function itself. Do not only call `__wrap_*` stubs.
-
-If the target function is `main`, the harness renames it with:
-```c
-#define main {process_name}_entry_main
-```
-Call:
-    {process_name}_entry_main(argc, argv)
-not:
-    main(argc, argv).
-
-1. Focus ONLY on the target function above. Do not modify tests for other functions.
-2. Preserve ALL existing stubs, globals, helpers, and tests.
-3. Place each new CUnit test under: `/* === Test Cases === */`.
-4. Register every new test in the test registration area or in `all_tests()` using `CU_add_test()`. If the file does not literally contain `/* === Test Registration === */`, register it beside the existing `CU_add_test()` calls.
-5. Each new test MUST start with:
-```c
-/**
- * @brief Tests {name} for <contract>.
- * @details Exercises: normal / edges / errors.
- * @rationale <why this matters>.
- */
-static void test_<scenario>(void) {{
-    fprintf(stderr, "===Test case test_<scenario>===\n");
-    ...
-}}
-```
-6. Cover: normal path, NULL/zero/empty edges, early-return / error paths, boundary values, loop entry/skip, switch cases.
-7. Reuse existing `__wrap_*` stubs. If you need a NEW stub, add it under `/* === Linker Wrapper Stubs === */` with correct signature AND log.
-8. After editing, run `make test` and inspect `{report_name}`.
-{gcov_tool_text}
-10. Do NOT consider your task complete until coverage for lines `{s}..{e}` is non-zero, or you have a concrete explanation why it cannot be improved.
 
 When done, call submit_and_exit.
 """
@@ -1554,180 +1352,6 @@ def integrate_all_stubs_sequential(
             attempt += 1
 
 
-def _integrate_stubs_and_compile_with_agent_LEGACY(
-    cfg: PipelineConfig,
-    paths: dict,
-    generated_bodies: dict[str, str],
-    missing_stub_names: list[str],
-    *,
-    batch_index: int = 1,
-    batch_total: int = 1,
-) -> None:
-    """
-    Integrate a batch of generated stubs.
-
-    Critical:
-    - Provide actual absolute source file list to the agent.
-    - Tell it not to guess src/<process>.c.
-    """
-    test_dir: Path = paths["test_dir"]
-    test_file: Path = paths["test_file"]
-    makefile: Path = paths["makefile"]
-    process_name: str = paths["process_name"]
-
-    source_dir = cfg.source_dir.resolve()
-    source_makefile = source_dir / "Makefile"
-
-    # Better repo_root fallback; not used for source guessing.
-    repo_root = source_dir
-    for parent in source_dir.parents:
-        if (parent / ".git").exists():
-            repo_root = parent
-            break
-
-    actual_source_files = _project_source_files(cfg)
-
-    stub_gen_dir = test_dir / "_stub_gen"
-    stub_gen_dir.mkdir(parents=True, exist_ok=True)
-    stubs_json = stub_gen_dir / f"generated_stubs_batch_{batch_index:03d}_of_{batch_total:03d}.json"
-    write_json(stubs_json, {
-        "generated_at": now_iso(),
-        "batch_index": batch_index,
-        "batch_total": batch_total,
-        "process_name": process_name,
-        "source_dir": str(source_dir),
-        "source_makefile": str(source_makefile),
-        "actual_source_files": [str(p) for p in actual_source_files],
-        "test_file": str(test_file),
-        "makefile": str(makefile),
-        "func_docs_dir": str(cfg.func_docs_dir),
-        "missing_stub_names": missing_stub_names,
-        "stubs": generated_bodies,
-    })
-
-    wrap_flags_text = "\n".join(
-        f" -Wl,--wrap={name}" for name in missing_stub_names
-    )
-
-    actual_source_files_text = _source_files_json_for_prompt(cfg)
-
-    prompt = f"""You are integrating a BATCH of generated linker-wrapper stub into a CUnit test.
-This is batch {batch_index} / {batch_total}.
-
-REPOSITORY ROOT
-{repo_root}
-
-SOURCE FOLDER PASSED BY USER
-{source_dir}
-
-ORIGINAL SOURCE MAKEFILE
-{source_makefile}
-
-ACTUAL SOURCE FILES UNDER SOURCE FOLDER
-{actual_source_files_text}
-
-TEST DIRECTORY
-{test_dir}
-
-TEST FILE TO EDIT
-{test_file}
-
-TEST MAKEFILE TO EDIT
-{makefile}
-
-GENERATED STUBS JSON FOR THIS BATCH
-{stubs_json}
-
-REQUIRED WRAP FLAGS FOR THIS BATCH
-{wrap_flags_text or " (none)"}
-
-CRITICAL PATH RULES
-- Do NOT invent paths like:
-  {source_dir.parent}/{process_name}.c
-- Do NOT guess:
-  `src/{process_name}.c`
-- Use only the actual source files listed above or in `actual_source_files` from the JSON.
-- The user already provided the source folder. Treat:
-  {source_dir}
-  as the source of truth.
-
-IMPORTANT MAKEFILE CONTEXT
-- The test Makefile should be generated by:
-  `cd {test_dir} && do_mkmf {source_dir}`
-- Do NOT replace the whole Makefile with a homemade Makefile.
-- If missing headers, macros, or libraries occur, read:
-  {source_makefile}
-  and copy/append relevant settings into:
-  {makefile}
-- Preserve existing do_mkmf-generated content.
-- Preserve existing wrapper flags.
-
-TASK
-1. Read `{stubs_json}`.
-2. Read `{test_file}`.
-3. Read `{makefile}`.
-4. Read the original source Makefile:
-  `{source_makefile}`
-5. Integrate all usable `__wrap_*` stubs from this batch into `{test_file}`.
-6. Add wrapper flags for this batch to `{makefile}`:
-  {wrap_flags_text or " (none)"}
-7. Ensure there is at least one simple CUnit smoke test.
-8. Run:
-   make test
-   from:
-   `{test_dir}`
-9. If compile fails, fix only `{test_file}` and `{makefile}`.
-   If failure is missing include/macro/library config, copy needed settings from `{source_makefile}`.
-
-STRICT EDIT RULES
-- You may modify only:
-  - `{test_file}`
-  - `{makefile}`
-- Do NOT modify production source files.
-- Do NOT modify production headers.
-- Do NOT create random extra source/header files.
-
-TEST FILE ORGANIZATION
-Use these existing markers:
-- `/* === Includes === */`
-- `/* === Compatibility Definitions === */`
-- `/* === Test Globals === */`
-- `/* === Test Helpers === */`
-- `/* === Linker Wrapper Stubs === */`
-- `/* === Test Cases === */`
-- `/* === Test Registration === */`
-
-STUB RULES
-- Put wrappers only under `/* === Linker Wrapper Stubs === */`.
-- Do not duplicate wrappers.
-- If a wrapper already exists, update/improve it.
-- Remove any calls to `__real_*`.
-- Every wrapper must be deterministic.
-- Every wrapper should log:
-  `fprintf(stderr, "__wrap_NAME called\n")`;
-- Fix signatures if compile errors show mismatch.
-
-MAKEFILE RULES
-- Add each wrapper flag as:
-  `WRAP_FUNCS += -Wl,--wrap=name`
-- Do not remove existing WRAP_FUNCS.
-- Do not replace the do_mkmf template.
-- Copy missing build config from original source Makefile if needed.
-
-When done, call submit_and_exit.
-"""
-
-    run_agent(
-        cfg,
-        work_dir=repo_root,
-        folder=repo_root,
-        history_dir=test_dir / "agent_history",
-        prompt=prompt,
-        history_name=f"__integrate_stubs_batch_{batch_index:03d}_of_{batch_total:03d}.json",
-        max_iterations=max(cfg.max_agent_iterations, 60),
-        timeout_sec=max(cfg.agent_timeout_sec, 3600),
-    )
-
 def insert_stub_into_test_file(test_file: Path, func_name: str, body: str) -> bool:
     """
     Insert `body` after the `/* === Linker Wrapper Stubs === */` marker.
@@ -1928,6 +1552,15 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
     else:
         print(" (none found)", file=sys.stderr)
 
+    flags = parse_source_makefile_flags(source_makefile) if source_makefile.exists() else {}
+    merged_flag_keys = ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]
+    merged_flag_lines: list[str] = []
+    for key in merged_flag_keys:
+        value = (flags or {}).get(key)
+        if value:
+            merged_flag_lines.append(f"{key} += {value}")
+    merged_flag_block = "\n".join(merged_flag_lines)
+
     # -------------------------------------------------------------------------
     # 3. Append/update test target block.
     # -------------------------------------------------------------------------
@@ -1939,6 +1572,8 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
 
     test_block = f"""
 {block_start}
+# TODO: review merged source Makefile flags below and keep the unit build aligned with production.
+{merged_flag_block}
 TEST_PROGRAM = {test_program}
 TEST_SRCS = {test_src}
 PRODUCTION_SRCS = {production_srcs_text}
@@ -1962,7 +1597,6 @@ $(TEST_PROGRAM): $(TEST_SRCS)
 
 coverage-test:
 \t@gcov -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
-\t@rm -f test_*.gcov
 
 clean-test:
 \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
@@ -1987,7 +1621,6 @@ clean-test:
     # -------------------------------------------------------------------------
     # 4. Parse source Makefile flags and write _pipeline_context.json.
     # -------------------------------------------------------------------------
-    flags = parse_source_makefile_flags(source_makefile) if source_makefile.exists() else {}
     write_json(context_file, {
         "process_name": process_name,
         "source_dir": str(source_dir),
@@ -2021,36 +1654,6 @@ def sync_wrap_flags(test_file: Path, makefile: Path) -> None:
 
 # region Stage 5 & 6 Helpers
 
-def _read_json_loose(path: Path) -> dict:
-    """
-    Read JSON written by the agent.
-
-    The agent is instructed to write strict JSON, but this parser is tolerant
-    of accidental surrounding text.
-    """
-    if not path.exists():
-        return {}
-
-    raw = path.read_text(errors="ignore").strip()
-    if not raw:
-        return {}
-
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(raw[start:end + 1])
-        except Exception:
-            return {}
-
-    return {}
-
-
 def _semantic_context_path(test_dir: Path) -> Path:
     return test_dir / "_leaf_to_root_semantic_context.json"
 
@@ -2081,6 +1684,93 @@ def _append_semantic_context(test_dir: Path, func: dict, verdict: dict) -> None:
     write_json(path, data)
 
 
+import json
+import re
+import shutil
+import time
+from pathlib import Path
+from typing import Optional
+
+
+def _read_json_loose(path: Path) -> dict:
+    """
+    Read JSON written by the agent.
+
+    Tolerates:
+    - surrounding text
+    - markdown json fences
+    - extra prose before/after object
+    """
+    if not path.exists():
+        return {}
+
+    raw = path.read_text(errors="ignore").strip()
+    if not raw:
+        return {}
+
+    raw2 = raw.strip()
+
+    # Strip markdown fences.
+    raw2 = re.sub(r"^\s*```(?:json)?", "", raw2, flags=re.I).strip()
+    raw2 = re.sub(r"```\s*$", "", raw2).strip()
+
+    try:
+        return json.loads(raw2)
+    except Exception:
+        pass
+
+    start = raw2.find("{")
+    end = raw2.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw2[start:end + 1])
+        except Exception:
+            return {}
+
+    return {}
+
+
+def _normalize_simple_judge_verdict(
+    verdict: dict,
+    *,
+    min_score: int,
+) -> Optional[dict]:
+    """
+    Required judge output:
+      {"score": 85, "reason": "..."}
+
+    Pipeline-compatible returned object:
+      {
+        "parse_ok": True,
+        "score": 85,
+        "reason": "...",
+        "summary": "...",
+        "passed": True/False
+      }
+    """
+    if not isinstance(verdict, dict):
+        return None
+
+    if "score" not in verdict:
+        return None
+
+    try:
+        score = int(verdict.get("score"))
+    except Exception:
+        return None
+
+    score = max(0, min(100, score))
+    reason = str(verdict.get("reason") or "").strip()
+
+    return {
+        "parse_ok": True,
+        "score": score,
+        "reason": reason,
+        "summary": reason,
+        "passed": score >= min_score,
+    }
+
+
 def prompt_for_semantic_test_judge(
     *,
     process_name: str,
@@ -2098,8 +1788,14 @@ def prompt_for_semantic_test_judge(
 You are a semantic unit-test judge for generated CUnit tests.
 
 You are NOT fixing code in this step.
-You must inspect the real repository source and judge whether the existing tests
-for the target function are meaningful.
+
+Judge whether the existing CUnit tests for the target function are meaningful.
+
+Important:
+- Do NOT automatically fail only because make_result says CUnit failed.
+- If coverage is valid, decide whether the failing assertion is a meaningful
+  production behavior check or just a bad/generated test.
+- Fail smoke/coverage-only tests even if coverage is high.
 
 Process:
 {process_name}
@@ -2128,59 +1824,47 @@ Verdict output file:
 Minimum acceptable semantic score:
 {min_score}
 
-You must inspect:
-1. the target function implementation,
-2. headers defining structs/macros/globals used by the function,
-3. callees and wrappers/mocks,
+Inspect:
+1. target function implementation,
+2. real headers/macros/globals,
+3. callees/wrappers/mocks,
 4. current CUnit tests,
-5. parent/caller functions if needed to understand why this function matters,
-6. previous accepted leaf-function context.
+5. parent/caller functions if useful.
 
-Judge semantically, not by simple text patterns.
+Score high only if tests would fail when important production behavior is broken.
 
-A passing test set must demonstrate that the tests would fail if important
-production behavior was broken.
-
-Evaluate whether tests verify:
+Evaluate:
 - return values,
-- state transitions,
-- global variable changes,
+- state/global changes,
 - struct field changes,
 - timer/counter behavior,
 - dependency call count,
 - dependency arguments,
 - payload structs passed to dependencies,
 - error/cleanup behavior,
-- null/boundary/error branches where relevant.
+- boundary/null/error paths where relevant.
 
-Also judge whether the test file now contains useful comments/explanations for
-this function so parent-function tests can use the behavior context later.
-
-Fail if the tests are mostly smoke/coverage-only, even if coverage is high.
-
-Write ONLY valid JSON to:
+You MUST write ONLY valid JSON to:
 {verdict_file}
 
-JSON object fields:
-- passed: boolean
-- score: integer from 0 to 100
-- summary: string
-- function_explanation: string
-- tested_behaviors: array of strings
-- important_state: array of strings
-- important_dependencies: array of strings
-- parent_context_value: string
-- missing_cases: array of strings
-- weak_or_meaningless_checks: array of strings
-- required_fixes: array of strings
-- remaining_risks: array of strings
+Required JSON format, exactly two fields:
+{{
+ "score": 0,
+ "reason": "short reason explaining semantic strength or weakness"
+}}
 
-Set passed=true only if score >= {min_score} and the tests are semantically meaningful.
+Rules:
+- No markdown.
+- No code fence.
+- No prose outside JSON.
+- No extra fields.
+- score must be integer 0 to 100.
+- reason must be a string.
 """
 
 
 def run_semantic_test_judge(
-    cfg: PipelineConfig,
+    cfg,
     *,
     test_dir: Path,
     repo_root: Path,
@@ -2190,23 +1874,51 @@ def run_semantic_test_judge(
     coverage: dict,
     make_result: dict,
 ) -> dict:
-    """LLM-based semantic quality gate."""
+    """
+    Retry semantic judge until readable simple JSON is produced.
+
+    Important:
+    - JSON parse failure is judge infrastructure failure.
+    - It does NOT become score=0.
+    - It does NOT trigger unit-test regeneration.
+    """
     min_score = int(getattr(cfg, "semantic_judge_min_score", 75))
+    max_parse_retries = int(getattr(cfg, "semantic_judge_parse_retries", 10))
+
     fid = func.get("id") or func.get("name") or "unknown_function"
+    safe_fid = _safe_filename(fid)
 
-    verdict_file = test_dir / f"_semantic_judge_{_safe_filename(fid)}.json"
-
-    try:
-        verdict_file.unlink()
-    except FileNotFoundError:
-        pass
-
+    verdict_file = test_dir / f"_semantic_judge_{safe_fid}.json"
     semantic_context = _load_semantic_context(test_dir)
 
-    run_agent(
-        cfg,
-        test_dir,
-        prompt_for_semantic_test_judge(
+    last_raw = ""
+
+    for i in range(1, max_parse_retries + 1):
+        try:
+            verdict_file.unlink()
+        except FileNotFoundError:
+            pass
+
+        retry_note = ""
+        if i > 1:
+            retry_note = f"""
+
+PREVIOUS ATTEMPT FAILED TO PRODUCE PARSEABLE JSON.
+
+Retry:
+{i}/{max_parse_retries}
+
+You must write exactly this shape:
+
+{{"score": 75, "reason": "your reason"}}
+
+No markdown.
+No prose.
+No code fence.
+No extra fields.
+"""
+
+        prompt = prompt_for_semantic_test_judge(
             process_name=process_name,
             test_file=str(test_file),
             func=func,
@@ -2215,34 +1927,159 @@ def run_semantic_test_judge(
             semantic_context=semantic_context,
             verdict_file=str(verdict_file),
             min_score=min_score,
-        ),
-        f"{_safe_filename(fid)}_semantic_judge.json",
-        folder=repo_root,
+        ) + retry_note
+
+        run_agent(
+            cfg,
+            test_dir,
+            prompt,
+            f"{_safe_filename(fid)}_semantic_judge.json",
+            folder=repo_root,
+        )
+
+        verdict_raw = {}
+        if verdict_file.exists():
+            last_raw = verdict_file.read_text(errors="ignore")[-4000:]
+            verdict_raw = _read_json_loose(verdict_file)
+
+        verdict = _normalize_simple_judge_verdict(
+            verdict_raw,
+            min_score=min_score,
+        )
+
+        if verdict is not None:
+            verdict["judge_attempts"] = i
+            return verdict
+
+        print(
+            f"[pipeline] judge JSON parse failed for {fid}, retry {i}/{max_parse_retries}",
+            file=sys.stderr,
+        )
+
+    raise RuntimeError(
+        "Semantic judge failed to produce parseable JSON after "
+        f"{max_parse_retries} attempts for {fid}. "
+        "Not regenerating tests because this is judge infrastructure failure.\n"
+        f"Last judge output:\n{last_raw}"
     )
 
-    verdict = _read_json_loose(verdict_file)
 
-    if not verdict:
-        return {
-            "passed": False,
-            "score": 0,
-            "summary": "Semantic judge did not produce a readable JSON verdict.",
-            "function_explanation": "",
-            "tested_behaviors": [],
-            "important_state": [],
-            "important_dependencies": [],
-            "parent_context_value": "",
-            "missing_cases": ["No semantic judge verdict was produced."],
-            "weak_or_meaningless_checks": [],
-            "required_fixes": ["Run semantic repair and ensure judge JSON is written."],
-            "remaining_risks": [],
-        }
+def _backup_root_for_func(unit_dir: Path, func: dict) -> Path:
+    fid = func.get("id") or func.get("name") or "unknown_function"
+    return unit_dir / "_cunit_backups" / _safe_filename(fid)
 
-    score = int(verdict.get("score") or 0)
-    verdict["score"] = score
-    verdict["passed"] = bool(verdict.get("passed")) and score >= min_score
 
-    return verdict
+def _best_backup_meta_path(unit_dir: Path, func: dict) -> Path:
+    return _backup_root_for_func(unit_dir, func) / "_best.json"
+
+
+def _load_best_backup_meta(unit_dir: Path, func: dict) -> dict:
+    p = _best_backup_meta_path(unit_dir, func)
+    if not p.exists():
+        return {}
+    return _read_json_loose(p)
+
+
+def backup_good_cunit_if_best(
+    *,
+    unit_dir: Path,
+    unit_test_file: Path,
+    unit_makefile: Path,
+    func: dict,
+    coverage_pct: Optional[float],
+    coverage: dict,
+    make_result: dict,
+    judge_verdict: dict,
+    cfg,
+) -> None:
+    """
+    Save best known CUnit test and Makefile.
+
+    Backup condition:
+    - coverage exists
+    - coverage >= cfg.coverage_threshold
+    - judge score >= previous best score
+    """
+    if coverage_pct is None:
+        return
+
+    threshold = float(getattr(cfg, "coverage_threshold", 100.0))
+    coverage_pct = float(coverage_pct)
+
+    if coverage_pct < threshold:
+        return
+
+    score = int(judge_verdict.get("score") or 0)
+
+    root = _backup_root_for_func(unit_dir, func)
+    root.mkdir(parents=True, exist_ok=True)
+
+    best_meta = _load_best_backup_meta(unit_dir, func)
+    old_best = int(best_meta.get("score") or -1)
+    if score < old_best:
+        return
+
+    fid = func.get("id") or func.get("name") or "unknown_function"
+    ts = str(int(time.time()))
+    backup_dir = root / f"score_{score}_{ts}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    if unit_test_file.exists():
+        shutil.copy2(unit_test_file, backup_dir / unit_test_file.name)
+
+    if unit_makefile.exists():
+        shutil.copy2(unit_makefile, backup_dir / unit_makefile.name)
+
+    meta = {
+        "function": fid,
+        "timestamp": ts,
+        "score": score,
+        "reason": judge_verdict.get("reason", ""),
+        "passed": bool(judge_verdict.get("passed")),
+        "coverage_pct": coverage_pct,
+        "coverage_threshold": threshold,
+        "make_ok": bool(make_result.get("ok")),
+        "backup_dir": str(backup_dir),
+        "test_file": str(backup_dir / unit_test_file.name),
+        "makefile": str(backup_dir / unit_makefile.name),
+        "coverage": coverage or {},
+    }
+
+    write_json(backup_dir / "meta.json", meta)
+    write_json(_best_backup_meta_path(unit_dir, func), meta)
+
+    latest = root / "latest_best"
+    latest.mkdir(parents=True, exist_ok=True)
+
+    if unit_test_file.exists():
+        shutil.copy2(unit_test_file, latest / unit_test_file.name)
+
+    if unit_makefile.exists():
+        shutil.copy2(unit_makefile, latest / unit_makefile.name)
+
+    write_json(latest / "meta.json", meta)
+
+    print(
+        f"[pipeline] backed up best CUnit for {fid}: score={score} coverage={coverage_pct}%",
+        file=sys.stderr,
+    )
+
+
+def _extract_coverage_pct(coverage: dict) -> Optional[float]:
+    """
+    Accept common coverage dict shapes.
+    """
+    if not isinstance(coverage, dict):
+        return None
+
+    for key in ("coverage_percent", "percent", "coverage", "pct"):
+        if key in coverage and coverage.get(key) is not None:
+            try:
+                return float(coverage.get(key))
+            except Exception:
+                pass
+
+    return None
 
 
 def prompt_for_semantic_test_repair(
@@ -2259,7 +2096,7 @@ def prompt_for_semantic_test_repair(
     return f"""
 You are editing an existing CUnit test file.
 
-The tests compile/run or partially compile/run, but the semantic judge says
+The tests already reached coverage threshold, but the semantic judge says
 they are not meaningful enough.
 
 Process:
@@ -2277,6 +2114,12 @@ Current coverage:
 Semantic judge verdict:
 {json.dumps(judge_verdict, indent=2, default=str)}
 
+The judge returns only:
+- score
+- reason
+
+Use judge_verdict["reason"] as the main repair instruction.
+
 Existing leaf-to-root semantic context:
 {json.dumps(semantic_context, indent=2, default=str)}
 
@@ -2293,11 +2136,16 @@ You must inspect the real source before editing:
 Do NOT add generic template tests.
 Do NOT add coverage-only tests.
 Do NOT guess field names or signatures.
+Do NOT create fake project headers/types/macros/functions.
+
+If compilation fails because of missing headers/types/macros, inspect real
+production headers and Makefiles, then fix INCLUDE/CPPFLAGS/LDFLAGS/LIBS in
+the unit Makefile.
 
 Fix the tests so they semantically prove behavior.
 
 Required repair behavior:
-1. Cover the judge's missing_cases and required_fixes.
+1. Address the judge reason.
 2. Add or strengthen assertions so tests fail when production behavior is wrong.
 3. Assert exact return values/state/mocks/arguments where possible.
 4. Capture dependency arguments in wrappers when behavior depends on them.
@@ -2305,16 +2153,106 @@ Required repair behavior:
 6. Add comments near the tests explaining:
    - what {fid} does,
    - why each scenario matters,
-   - what parent/root functions can rely on from this leaf/intermediate function.
+   - what parent/root functions can rely on from this function.
 7. Extend reset_mocks/reset helpers for any new mock state.
 8. Preserve existing meaningful tests and assertions.
 9. Keep the test binary non-blocking and terminating.
 
 Do not weaken tests just to compile.
-If compilation fails because of wrong assumptions, inspect headers/source and correct them.
+If something does not compile, inspect headers/source and correct it.
 
 When done, call submit_and_exit.
 """
+
+
+def judge_and_backup_if_covered(
+    cfg,
+    *,
+    test_dir: Path,
+    unit_dir: Path,
+    repo_root: Path,
+    process_name: str,
+    unit_test_file: Path,
+    unit_makefile: Path,
+    func: dict,
+    coverage: dict,
+    coverage_pct: Optional[float],
+    make_result: dict,
+) -> dict:
+    """
+    Run semantic judge when coverage is above threshold, regardless of make_ok.
+
+    Also backs up the current CUnit test/Makefile if coverage is good and
+    judge score is best so far.
+
+    Raises RuntimeError if judge cannot produce parseable JSON after retries.
+    """
+    if coverage_pct is None:
+        return {
+            "covered": False,
+            "accepted": False,
+            "judge_verdict": None,
+            "reason": "coverage_pct is None",
+        }
+
+    coverage_pct = float(coverage_pct)
+    threshold = float(getattr(cfg, "coverage_threshold", 100.0))
+    if coverage_pct < threshold:
+        return {
+            "covered": False,
+            "accepted": False,
+            "judge_verdict": None,
+            "reason": "coverage below threshold",
+        }
+
+    judge_verdict = run_semantic_test_judge(
+        cfg,
+        test_dir=test_dir,
+        repo_root=repo_root,
+        process_name=process_name,
+        test_file=unit_test_file,
+        func=func,
+        coverage=coverage or {},
+        make_result=make_result or {},
+    )
+
+    backup_good_cunit_if_best(
+        unit_dir=unit_dir,
+        unit_test_file=unit_test_file,
+        unit_makefile=unit_makefile,
+        func=func,
+        coverage_pct=coverage_pct,
+        coverage=coverage or {},
+        make_result=make_result or {},
+        judge_verdict=judge_verdict,
+        cfg=cfg,
+    )
+
+    fid = func.get("id") or func.get("name") or "unknown_function"
+
+    if judge_verdict.get("passed"):
+        print(
+            f"[pipeline] judge PASSED: {fid} score={judge_verdict.get('score')}",
+            file=sys.stderr,
+        )
+        _append_semantic_context(test_dir, func, judge_verdict)
+        return {
+            "covered": True,
+            "accepted": True,
+            "judge_verdict": judge_verdict,
+            "reason": "semantic judge passed",
+        }
+
+    print(
+        f"[pipeline] judge FAILED: {fid} score={judge_verdict.get('score')}",
+        file=sys.stderr,
+    )
+    return {
+        "covered": True,
+        "accepted": False,
+        "judge_verdict": judge_verdict,
+        "reason": "semantic judge failed",
+    }
 
 
 def prompt_for_function_test_with_semantic_context(
@@ -2332,7 +2270,7 @@ def prompt_for_function_test_with_semantic_context(
     fid = func.get("id") or func.get("name") or "unknown_function"
 
     return f"""
-You are editing an existing CUnit test file for production C code.
+You are writing or repairing a real CUnit unit test file for production C code.
 
 Process:
 {process_name}
@@ -2342,21 +2280,6 @@ Target function:
 
 Target metadata:
 {json.dumps(func, indent=2, default=str)}
-
-Current coverage:
-{json.dumps(coverage, indent=2, default=str)}
-
-Attempt:
-{attempt}/{max_attempts}
-
-Previous make_ok:
-{make_ok}
-
-Existing leaf-to-root semantic context from already accepted lower-level functions:
-{json.dumps(semantic_context, indent=2, default=str)}
-
-Previous semantic judge verdict for this function, if any:
-{json.dumps(last_judge_verdict or {}, indent=2, default=str)}
 
 Test file:
 {test_file}
@@ -2372,11 +2295,6 @@ Inspect:
 7. current test file,
 8. current mocks/wrappers,
 9. Makefile wrapping style.
-
-Because this pipeline processes leaf-to-root, use the semantic_context above
-to understand what lower-level functions already guarantee. Parent tests should
-not be random coverage calls; they should verify orchestration and integration
-of the child behaviors.
 
 Add meaningful tests for realistic use cases of {fid}.
 
@@ -2651,21 +2569,13 @@ def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> s
 # endregion Stage 5 & 6 Helpers
 
 # region Stage 5 — Minimal Test Validation
+
 def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
     """
-    Write a minimal production-call/smoke test and iterate until the binary
-    compiles, runs, terminates, and passes.
+    Stage 5 infrastructure validation.
 
-    This stage intentionally does NOT run the semantic judge.
-
-    Stage 5 is infrastructure validation only:
-    - Makefile works
-    - wrappers/stubs link
-    - CUnit binary runs
-    - binary terminates
-    - no immediate runtime crash/hang
-
-    Semantic judging happens later in Stage 6, leaf -> root.
+    First try the current test exactly as-is.
+    If it already compiles, runs, terminates, and passes, do nothing else.
     """
     test_dir: Path = paths["test_dir"]
     test_file: Path = paths["test_file"]
@@ -2675,7 +2585,26 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
     entry_sym = f"{process_name}_entry_main"
 
     print(
-        f"[pipeline] minimal test phase: ensuring {entry_sym}() runs and terminates",
+        f"[pipeline] minimal test phase: checking existing test binary first",
+        file=sys.stderr,
+    )
+
+    # SIMPLE FIX:
+    # If the current test already compiles/runs/passes, do not let the agent
+    # rewrite it with a minimal smoke test.
+    sync_wrap_flags(test_file, makefile)
+    existing_res = run_make_test(test_dir, timeout=90)
+
+    if existing_res["ok"]:
+        print(
+            f"[pipeline] existing test already compiles, runs, terminates, and passes; "
+            f"skipping minimal-test generation",
+            file=sys.stderr,
+        )
+        return True
+
+    print(
+        f"[pipeline] existing test did not pass; running minimal validation for {entry_sym}()",
         file=sys.stderr,
     )
 
@@ -2754,273 +2683,6 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
 
 # endregion Stage 5 — Minimal Test Validation
 
-# region Stage 6 — Per-Function Coverage Loop
-def process_functions(cfg: PipelineConfig, paths: dict, analysis: dict) -> dict:
-    """
-    Process target functions leaf -> root.
-
-    Continuation behavior:
-    - Check existing gcov data without rebuilding.
-    - If coverage >= threshold, still require LLM semantic judge pass.
-    - Accepted leaf/intermediate function explanations are stored and passed upward.
-
-    Runtime diagnostic addition:
-    - On every make/test failure, append runtime logs/direct-run/gdb diagnostics
-      to the compile-fix prompt input.
-    """
-    test_dir: Path = paths["test_dir"]
-    test_file: Path = paths["test_file"]
-    process_name: str = paths["process_name"]
-
-    repo_root = cfg.source_dir.parent.parent.resolve()
-    funcs = functions_leaf_first(analysis)
-    print(
-        f"[pipeline] {len(funcs)} functions to process (leaf -> root)",
-        file=sys.stderr,
-    )
-    print(
-        f"[pipeline] continuation skip threshold: {cfg.coverage_threshold:.1f}%",
-        file=sys.stderr,
-    )
-    print(
-        f"[pipeline] semantic judge min score: {getattr(cfg, 'semantic_judge_min_score', 75)}",
-        file=sys.stderr,
-    )
-
-    done = 0
-    skipped = 0
-    coverage_results: dict[str, Optional[float]] = {}
-    semantic_results: dict[str, Optional[int]] = {}
-    for func in funcs:
-        if cfg.only_function and func["id"] != cfg.only_function:
-            continue
-
-        if cfg.only_level is not None and func.get("depth") != cfg.only_level:
-            continue
-
-        if cfg.max_functions is not None and done >= cfg.max_functions:
-            break
-
-        print(
-            f"[pipeline] coverage pre-check for {func['id']} "
-            f"lines {func['start_line']}..{func['end_line']}",
-            file=sys.stderr,
-        )
-        source_file_abs = _resolve_source_file(cfg, func["source_file"])
-        print(
-            f"[pipeline] resolved coverage source: {func['source_file']} -> {source_file_abs}",
-            file=sys.stderr,
-        )
-        cov = check_function_coverage(
-            test_dir,
-            source_file_abs,
-            func["start_line"],
-            func["end_line"],
-            source_root=cfg.source_dir.resolve(),
-        )
-
-        pct = None
-        if cov is not None and isinstance(cov, dict):
-            pct = (cov.get("summary", {}) or {}).get("coverage_percent")
-            if pct is None:
-                pct = cov.get("coverage_percent")
-
-        last_judge: Optional[dict] = None
-
-        if pct is not None and pct >= cfg.coverage_threshold:
-            func_for_judge = dict(func)
-            func_for_judge["source_file"] = str(source_file_abs)
-
-            judge = run_semantic_test_judge(
-                cfg,
-                test_dir=test_dir,
-                repo_root=repo_root,
-                process_name=process_name,
-                test_file=test_file,
-                func=func_for_judge,
-                coverage=cov or {},
-                make_result={"ok": True, "note": "coverage pre-check semantic judge"},
-            )
-            semantic_results[func["id"]] = judge.get("score")
-
-            if judge.get("passed"):
-                print(
-                    f"[pipeline] SKIP {func['id']} coverage={pct:.1f}% "
-                    f">= threshold={cfg.coverage_threshold:.1f}% "
-                    f"and semantic score={judge.get('score')}",
-                    file=sys.stderr,
-                )
-                _append_semantic_context(test_dir, func_for_judge, judge)
-                coverage_results[func["id"]] = pct
-                skipped += 1
-                done += 1
-                continue
-
-            last_judge = judge
-            print(
-                f"[pipeline] coverage OK but semantic judge FAILED for {func['id']}; "
-                f"score={judge.get('score')} summary={judge.get('summary')}",
-                file=sys.stderr,
-            )
-
-        print(
-            f"[pipeline] --> PROCESS {func['id']} current coverage={pct}%, "
-            f"threshold={cfg.coverage_threshold:.1f}%",
-            file=sys.stderr,
-        )
-
-        last_make_ok = True
-        attempt = 1
-        while True:
-            func_for_prompt = dict(func)
-            func_for_prompt["source_file"] = str(source_file_abs)
-
-            semantic_context = _load_semantic_context(test_dir)
-
-            if last_judge:
-                prompt = prompt_for_semantic_test_repair(
-                    process_name=process_name,
-                    test_file=str(test_file),
-                    func=func_for_prompt,
-                    coverage=cov or {},
-                    judge_verdict=last_judge,
-                    semantic_context=semantic_context,
-                )
-            else:
-                prompt = prompt_for_function_test_with_semantic_context(
-                    func=func_for_prompt,
-                    coverage=cov or {},
-                    test_file=str(test_file),
-                    process_name=process_name,
-                    attempt=attempt,
-                    max_attempts=attempt,
-                    make_ok=last_make_ok,
-                    semantic_context=semantic_context,
-                    last_judge_verdict=last_judge,
-                )
-
-            run_agent(
-                cfg,
-                test_dir,
-                prompt,
-                f"{_safe_filename(func['id'])}_attempt_{attempt:02d}.json",
-                folder=repo_root,
-            )
-
-            sync_wrap_flags(test_file, paths["makefile"])
-            make_res = run_make_test(test_dir)
-            if not make_res["ok"]:
-                print(
-                    f"[pipeline] make test failed after attempt {attempt} for {func['id']}; "
-                    f"collecting diagnostics and running compile-fix",
-                    file=sys.stderr,
-                )
-                _src_dir = cfg.source_dir.resolve()
-                diagnostic_build_output = build_output_with_runtime_diagnostics(
-                    test_dir,
-                    test_file,
-                    make_res,
-                )
-                run_agent(
-                    cfg,
-                    test_dir,
-                    prompt_for_compile_fix(
-                        str(paths["makefile"]),
-                        str(test_file),
-                        diagnostic_build_output,
-                        source_dir=str(_src_dir),
-                        source_makefile=str(_src_dir / "Makefile"),
-                        actual_source_files=[str(p) for p in _project_source_files(cfg)],
-                    ),
-                    f"{_safe_filename(func['id'])}_attempt_{attempt:02d}_compile_fix.json",
-                    folder=repo_root,
-                )
-                sync_wrap_flags(test_file, paths["makefile"])
-                make_res = run_make_test(test_dir)
-
-            last_make_ok = make_res["ok"]
-            source_file_abs = _resolve_source_file(cfg, func["source_file"])
-            print(
-                f"[pipeline] resolved coverage source after attempt {attempt}: "
-                f"{func['source_file']} -> {source_file_abs}",
-                file=sys.stderr,
-            )
-            cov = check_function_coverage(
-                test_dir,
-                source_file_abs,
-                func["start_line"],
-                func["end_line"],
-                source_root=cfg.source_dir.resolve(),
-            )
-
-            pct = None
-            if cov is not None and isinstance(cov, dict):
-                pct = (cov.get("summary", {}) or {}).get("coverage_percent")
-                if pct is None:
-                    pct = cov.get("coverage_percent")
-
-            if pct is not None and pct >= cfg.coverage_threshold and make_res["ok"]:
-                func_for_judge = dict(func)
-                func_for_judge["source_file"] = str(source_file_abs)
-
-                judge = run_semantic_test_judge(
-                    cfg,
-                    test_dir=test_dir,
-                    repo_root=repo_root,
-                    process_name=process_name,
-                    test_file=test_file,
-                    func=func_for_judge,
-                    coverage=cov or {},
-                    make_result=make_res,
-                )
-                semantic_results[func["id"]] = judge.get("score")
-
-                if judge.get("passed"):
-                    print(
-                        f"[pipeline] -> DONE {func['id']} coverage={pct:.1f}% "
-                        f">= threshold={cfg.coverage_threshold:.1f}% "
-                        f"semantic score={judge.get('score')}",
-                        file=sys.stderr,
-                    )
-                    _append_semantic_context(test_dir, func_for_judge, judge)
-                    last_judge = None
-                    break
-
-                last_judge = judge
-                print(
-                    f"[pipeline] -> semantic judge FAILED for {func['id']} after attempt {attempt}; "
-                    f"coverage={pct}% score={judge.get('score')} summary={judge.get('summary')}",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"[pipeline] -> attempt {attempt} coverage={pct}%",
-                    file=sys.stderr,
-                )
-            attempt += 1
-
-        coverage_results[func["id"]] = pct
-        done += 1
-
-    print(
-        f"[pipeline] processed {done}/{len(funcs)} functions "
-        f"({skipped} skipped at threshold after semantic judge)",
-        file=sys.stderr,
-    )
-    return {
-        "functions_total": len(funcs),
-        "functions_done": done,
-        "functions_skipped_at_threshold": skipped,
-        "coverage": {
-            k: round(v, 1) if v is not None else None
-            for k, v in coverage_results.items()
-        },
-        "semantic_score": semantic_results,
-        "semantic_context_file": str(_semantic_context_path(test_dir)),
-    }
-
-# endregion Stage 6 — Per-Function Coverage Loop
-
 # region Stage 4 — Parallel Unit Test Generation
 import shutil as _shutil
 
@@ -3066,6 +2728,7 @@ def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path, u
     if new_mk != mk_text:
         write_text(unit_makefile, new_mk)
 
+
 def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Path:
     """Create _unit_tests/<func_id>/ with skeleton test file + generated Makefile."""
     test_dir: Path = paths["test_dir"]
@@ -3081,64 +2744,26 @@ def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Pat
     unit_makefile = unit_dir / "Makefile"
 
     if not unit_test_file.exists():
-        prod_lines = _source_includes_for_test_file(cfg, unit_test_file)
-        prod_block = (
-            f"\n/* Production sources — main renamed so CUnit owns int main(void). */\n"
-            f"#define main {process_name}_entry_main\n"
-            + "\n".join(prod_lines)
-            + "\n#undef main\n"
-        ) if prod_lines else ""
-        skeleton = f"""/* CUnit unit test for {func_id} */
-{TEST_FILE_MARKERS[0]}
-#include <CUnit/CUnit.h>
-#include <CUnit/Basic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-{prod_block}
-{TEST_FILE_MARKERS[1]}
-/* Compatibility definitions go here if needed. */
-
-{TEST_FILE_MARKERS[2]}
-/* Test globals go here. */
-
-{TEST_FILE_MARKERS[3]}
-/* Test helpers go here. */
-
-/* === Local Stub Overrides === */
-/* Override __wrap_* stubs here for this function only. */
-
-{TEST_FILE_MARKERS[4]}
-/* Stubs linked from master via Makefile WRAP_FUNCS. */
-
-{TEST_FILE_MARKERS[5]}
-/* Test cases for {func_id} go here. */
-
-{TEST_FILE_MARKERS[6]}
-int main(void)
-{{
-    CU_pSuite suite = NULL;
-    if (CU_initialize_registry() != CUE_SUCCESS)
-        return CU_get_error();
-    suite = CU_add_suite("{func_id}_suite", NULL, NULL);
-    if (suite == NULL) {{
-        CU_cleanup_registry();
-        return CU_get_error();
-    }}
-    CU_basic_set_mode(CU_BRM_VERBOSE);
-    CU_basic_run_tests();
-    {{
-        unsigned int failures = CU_get_number_of_failures();
-        CU_cleanup_registry();
-        return failures == 0 ? 0 : 1;
-    }}
-}}
+        skeleton = f"""/*
+ * PLACEHOLDER ONLY.
+ *
+ * Target:
+ * {func_id}
+ *
+ * This file must be completely rewritten by the unit-test agent.
+ *
+ * Required final file:
+ *   - complete CUnit test file
+ *   - at least one CU_add_test()
+ *   - real test function(s)
+ *   - calls target function directly or through a real caller
+ *   - uses wrappers/stubs from the master test or _stub_gen as needed
+ */
 """
         write_text(unit_test_file, skeleton)
 
     if not unit_makefile.exists():
-        _generate_unit_test_makefile(cfg, paths, func_id, safe_id, unit_dir, unit_test_file)
+        _generate_unit_test_makefile(cfg, paths, func, safe_id, unit_dir, unit_test_file)
 
     return unit_dir
 
@@ -3146,12 +2771,12 @@ int main(void)
 def _generate_unit_test_makefile(
     cfg: PipelineConfig,
     paths: dict,
-    func_id: str,
+    func: dict,
     safe_id: str,
     unit_dir: Path,
     unit_test_file: Path,
 ) -> None:
-    """Generate Makefile for a unit test dir from _pipeline_context.json."""
+    """Generate Makefile for a unit test dir, inheriting the master test Makefile."""
     context_file = paths["test_dir"] / "_pipeline_context.json"
     flags: dict = {}
     if context_file.exists():
@@ -3160,66 +2785,120 @@ def _generate_unit_test_makefile(
         except Exception:
             pass
 
-    # Inherit WRAP_FUNCS lines from master Makefile
-    master_mk_text = read_text(paths["makefile"])
-    wrap_lines = [
-        ln.strip() for ln in master_mk_text.splitlines()
-        if "WRAP_FUNCS" in ln and "--wrap" in ln
-    ]
-    wrap_block = "\n".join(wrap_lines)
+    func_id = func["id"]
+    process_name: str = paths["process_name"]
+    entry_sym = f"{process_name}_entry_main"
 
-    # Production source paths relative to unit_dir (not used in link; included via #include)
+    # Include the master Makefile using a path relative to this unit test dir.
+    master_makefile_rel = Path(
+        os.path.relpath(paths["makefile"].resolve(), start=unit_dir)
+    ).as_posix()
+
+    # Production source is compiled separately so gcov can emit <source>.c.gcov.
+    source_file_abs = _resolve_source_file(cfg, func["source_file"])
+    prod_src_rel = Path(
+        os.path.relpath(source_file_abs.resolve(), start=unit_dir)
+    ).as_posix()
+
     test_program = f"test_{safe_id}"
     test_src = unit_test_file.name
 
-    # Validated stub bodies to link (will be updated by _sync_stub_srcs before each make test)
+    # Validated stub bodies to link.
+    # This is refreshed by _sync_stub_srcs before each make test.
     stub_srcs_list = [path for path, _ in _stub_srcs_relative(paths["test_dir"], unit_dir)]
     stub_srcs_str = " ".join(stub_srcs_list)
 
     content = f"""# Unit test Makefile for {func_id}
 # Auto-generated — do not edit manually
 
-CC = gcc
+# Pull in the same include paths, libraries, architecture flags, and wrap flags
+# as the master test Makefile. Unit-specific rules below override only what
+# must differ for this per-function test.
+MASTER_MAKEFILE = {master_makefile_rel}
+include $(MASTER_MAKEFILE)
 
-# Flags from source Makefile
-CFLAGS = {flags.get('CFLAGS', '')}
-CFLAGS_LINUX = {flags.get('CFLAGS_LINUX', '')}
-CPPFLAGS = {flags.get('CPPFLAGS', '')}
-INCLUDE = {flags.get('INCLUDE', '')}
-LDFLAGS = {flags.get('LDFLAGS', '')}
-LDLIBS = {flags.get('LDLIBS', '')}
-LIBS = {flags.get('LIBS', '')}
+.DEFAULT_GOAL := test
 
-# Wrap flags from master (all validated stubs)
-{wrap_block}
-WRAP_FLAGS = $(WRAP_FUNCS)
+#CC = gcc
 
-# Validated stub bodies (updated by pipeline before each make; excludes local overrides)
-STUB_SRCS = {stub_srcs_str}
+# Fallbacks from pipeline_context.json, used only if the master Makefile did
+# not define them.
+CFLAGS ?= {flags.get('CFLAGS', '')}
+CFLAGS_LINUX ?= {flags.get('CFLAGS_LINUX', '')}
+CPPFLAGS ?= {flags.get('CPPFLAGS', '')}
+INCLUDE ?= {flags.get('INCLUDE', '')}
+LDFLAGS ?= {flags.get('LDFLAGS', '')}
+LDLIBS ?= {flags.get('LDLIBS', '')}
+LIBS ?= {flags.get('LIBS', '')}
 
+# Unit-specific files
 TEST_PROGRAM = {test_program}
 TEST_SRCS = {test_src}
+PROD_SRC = {prod_src_rel}
+PROD_OBJ = prod_under_test.o
+
+# Keep only the production gcov output.
+# Example:
+# PROD_SRC = ../../../../src/dio100d/dio100d.c
+# TARGET_GCOV = dio100d.c.gcov
+TARGET_GCOV = $(notdir $(PROD_SRC)).gcov
+
+# Validated stub bodies.
+# Local __wrap_* overrides in TEST_SRCS should be excluded by the pipeline.
+STUB_SRCS = {stub_srcs_str}
+
 TEST_LIBS += -lcunit
 TEST_REPORT_FILE = {test_program}_report.txt
 TEST_LOG_FILE = {test_program}_log.txt
+
+# Coverage flags for this isolated unit build.
 COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
+
+# Use the same wrap functions as the master Makefile.
+WRAP_FLAGS = $(WRAP_FUNCS)
 
 .PHONY: test clean-test coverage-test
 
 test: clean-test $(TEST_PROGRAM)
-\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE)
-\t$(MAKE) coverage-test
+\t@set +e; \\
+\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE); \\
+\tstatus=$$?; \\
+\t$(MAKE) coverage-test; \\
+\texit $$status
 
-$(TEST_PROGRAM): $(TEST_SRCS) $(STUB_SRCS)
-\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) $(STUB_SRCS) \\
+$(PROD_OBJ): $(PROD_SRC)
+\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) -Dmain={entry_sym} -c $(PROD_SRC) -o $(PROD_OBJ)
+
+$(TEST_PROGRAM): $(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS)
+\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS) \\
 \t-o $(TEST_PROGRAM) \\
 \t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
 \t-Wl,--gc-sections \\
 \t$(WRAP_FLAGS)
 
 coverage-test:
-\t@gcov -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
-\t@rm -f test_*.gcov
+\t@echo "=== coverage-test ===" >> $(TEST_REPORT_FILE)
+\t@echo "PWD=$$(pwd)" >> $(TEST_REPORT_FILE)
+\t@echo "Target production gcov file: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
+\t@echo "Files before gcov:" >> $(TEST_REPORT_FILE)
+\t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
+\t@found=0; \\
+\tfor f in *.gcno; do \\
+\t\t[ -e "$$f" ] || continue; \\
+\t\tfound=1; \\
+\t\techo "Running gcov -b -c $$f" >> $(TEST_REPORT_FILE); \\
+\t\tgcov -b -c "$$f" >> $(TEST_REPORT_FILE) 2>&1 || true; \\
+\tdone; \\
+\tif [ "$$found" -eq 0 ]; then \\
+\t\techo "WARNING: no .gcno files found for gcov" >> $(TEST_REPORT_FILE); \\
+\tfi
+\t@echo "Filtering .gcov files. Keeping only: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
+\t@find . -maxdepth 1 -name '*.gcov' ! -name '$(TARGET_GCOV)' -delete
+\t@if [ ! -f "$(TARGET_GCOV)" ]; then \\
+\t\techo "WARNING: target production gcov file was not generated: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE); \\
+\tfi
+\t@echo "Files after gcov filtering:" >> $(TEST_REPORT_FILE)
+\t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
 
 clean-test:
 \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
@@ -3235,10 +2914,14 @@ def _generate_unit_test_for_func(
     semantic_context_snapshot: dict,
 ) -> tuple[str, dict]:
     """
-    Generate, compile, and judge unit test for one function.
-    Runs entirely in _unit_tests/<func_id>/.
-    Loops until judge passes.
-    Returns (func_id, result_dict).
+    Generate, compile/run, coverage-check, semantic-judge, and repair one unit test.
+
+    Updated behavior:
+      - if an existing test already produces valid gcov above threshold, start from judge
+      - judge runs when coverage is above threshold, even if make/test returned non-zero
+      - judge JSON parse failure raises and does NOT regenerate tests
+      - backs up best CUnit test + Makefile by coverage >= threshold and best judge score
+      - semantic judge JSON is simple: {"score": int, "reason": str}
     """
     func_id = func["id"]
     safe_id = _safe_filename(func_id)
@@ -3252,7 +2935,255 @@ def _generate_unit_test_for_func(
     judge_verdict_file = unit_dir / "judge_verdict.json"
     coverage_file = unit_dir / "coverage.json"
 
-    # Continuation: already passed
+    master_test_file = test_dir / f"test_{process_name}.c"
+    master_makefile = paths["makefile"]
+    stub_gen_dir = test_dir / "_stub_gen"
+
+    source_file_abs = _resolve_source_file(cfg, func["source_file"])
+
+    source_makefile_candidates: list[Path] = []
+    try:
+        resolved_source_dir = cfg.source_dir.resolve()
+        if resolved_source_dir.is_dir():
+            source_makefile_candidates.append(resolved_source_dir / "Makefile")
+        source_makefile_candidates.append(source_file_abs.parent / "Makefile")
+        source_makefile_candidates.append(source_file_abs.parent.parent / "Makefile")
+        source_makefile_candidates.append(repo_root / "Makefile")
+    except Exception:
+        pass
+
+    source_makefile_candidates = list(dict.fromkeys(source_makefile_candidates))
+    existing_source_makefiles = [p for p in source_makefile_candidates if p.exists()]
+    source_makefile_for_compile_fix = (
+        str(existing_source_makefiles[0])
+        if existing_source_makefiles
+        else str(cfg.source_dir.resolve() / "Makefile")
+    )
+
+    actual_source_files_text = _source_files_json_for_prompt(cfg)
+
+    def _strip_c_comments_and_strings_for_test_check(text: str) -> str:
+        try:
+            text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+            text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+            text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+            return text
+        except Exception:
+            return text
+
+    def _has_real_cu_add_test(path: Path) -> bool:
+        try:
+            txt = read_text(path)
+        except Exception:
+            return False
+
+        cleaned = _strip_c_comments_and_strings_for_test_check(txt)
+        return re.search(r"\bCU_add_test\s*\(", cleaned) is not None
+
+    def _safe_build_diag(make_res: dict) -> str:
+        parts: list[str] = []
+        try:
+            diag = build_output_with_runtime_diagnostics(
+                unit_dir,
+                unit_test_file,
+                make_res,
+            )
+            if diag:
+                parts.append(str(diag))
+        except Exception as e:
+            parts.append(
+                f"\nbuild_output_with_runtime_diagnostics failed: {type(e).__name__}: {e}\n"
+            )
+
+        try:
+            parts.append(
+                "\n===== make_res object =====\n"
+                + json.dumps(make_res, ensure_ascii=False, indent=2, default=str)
+            )
+        except Exception:
+            parts.append(f"\n===== make_res repr =====\n{make_res!r}")
+
+        possible_logs = [
+            unit_dir / f"test_{safe_id}_report.txt",
+            unit_dir / f"test_{safe_id}_log.txt",
+            unit_dir / "make.log",
+            unit_dir / "build.log",
+        ]
+
+        try:
+            possible_logs.extend(sorted(unit_dir.glob("*_report.txt")))
+            possible_logs.extend(sorted(unit_dir.glob("*_log.txt")))
+            possible_logs.extend(sorted(unit_dir.glob("*.log")))
+        except Exception:
+            pass
+
+        seen_logs: set[Path] = set()
+        for log_path in possible_logs:
+            try:
+                log_path = log_path.resolve()
+            except Exception:
+                pass
+
+            if log_path in seen_logs:
+                continue
+            seen_logs.add(log_path)
+
+            try:
+                if log_path.exists() and log_path.is_file():
+                    txt = read_text(log_path)
+                    if len(txt) > 40000:
+                        txt = "[truncated to last 40000 chars]\n" + txt[-40000:]
+                    parts.append(f"\n===== log file: {log_path} =====\n{txt}")
+            except Exception as e:
+                parts.append(
+                    f"\n===== log file read failed: {log_path} =====\n"
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if not parts:
+            return "(no diagnostics available)"
+
+        return "\n".join(parts)
+
+    def _validated_stub_text() -> str:
+        try:
+            validated_stub_srcs = _stub_srcs_relative(test_dir, unit_dir)
+            lines = []
+            for rel_stub, stub_func_name in validated_stub_srcs:
+                abs_stub = (unit_dir / rel_stub).resolve()
+                lines.append(
+                    f" - func={stub_func_name} rel_from_unit={rel_stub} abs={abs_stub}"
+                )
+            return "\n".join(lines) if lines else " - none"
+        except Exception as e:
+            return f" - could not list validated stubs: {type(e).__name__}: {e}"
+
+    def _source_makefile_text() -> str:
+        return (
+            "\n".join(f" - {p}" for p in existing_source_makefiles)
+            if existing_source_makefiles
+            else " - none found"
+        )
+
+    def _coverage_pct(cov_obj: Optional[dict]) -> Optional[float]:
+        if not isinstance(cov_obj, dict):
+            return None
+
+        pct_val = (cov_obj.get("summary", {}) or {}).get("coverage_percent")
+        if pct_val is None:
+            pct_val = cov_obj.get("coverage_percent")
+        if pct_val is None:
+            pct_val = cov_obj.get("percent")
+        if pct_val is None:
+            pct_val = cov_obj.get("coverage")
+        if pct_val is None:
+            pct_val = cov_obj.get("pct")
+
+        if pct_val is None:
+            return None
+
+        try:
+            return float(pct_val)
+        except Exception:
+            return None
+
+    def _run_current_coverage() -> tuple[Optional[dict], Optional[float]]:
+        current_source = _resolve_source_file(cfg, func["source_file"])
+        cov_obj = check_function_coverage(
+            unit_dir,
+            current_source,
+            func["start_line"],
+            func["end_line"],
+            source_root=cfg.source_dir.resolve(),
+        )
+        return cov_obj, _coverage_pct(cov_obj)
+
+    def _location_context(
+        func_for_prompt: dict,
+        last_feedback: Optional[str],
+    ) -> str:
+        previous_diag_block = ""
+        if last_feedback:
+            previous_diag_block = f"""
+================================================================================
+PREVIOUS ATTEMPT FAILURE / DIAGNOSTICS
+================================================================================
+
+The previous attempt failed or did not satisfy requirements.
+Read this before editing so you do not repeat the same mistake.
+
+{last_feedback}
+"""
+
+        return f"""
+You are running inside an agent with repository folder:
+
+ {repo_root}
+
+The current unit test file is only a placeholder or previous failed attempt.
+Rewrite it from scratch if needed.
+
+TARGET FUNCTION
+ {func_id}
+
+function object:
+{json.dumps(func_for_prompt, ensure_ascii=False, indent=2)}
+
+production source file:
+ {source_file_abs}
+
+source line range:
+ {func.get("start_line")} - {func.get("end_line")}
+
+Do not create fake project headers/types/macros/functions to spoof the build
+harness just to make the build pass.
+
+Unit test file to write/repair:
+ {unit_test_file}
+
+FILES YOU MAY EDIT
+Unit Makefile to edit only if required for this one unit build:
+ {unit_makefile}
+
+FILES TO READ
+Production source:
+ {source_file_abs}
+
+Master integrated test file with working wrappers/stubs/helpers:
+ {master_test_file}
+
+Master test Makefile:
+ {master_makefile}
+
+Source Makefile candidates:
+{_source_makefile_text()}
+
+Generated stub directory:
+ {stub_gen_dir}
+
+Validated generated stubs currently linked by unit Makefile:
+{_validated_stub_text()}
+
+Actual project .c source files discovered:
+{actual_source_files_text}
+
+BUILD / CONTENT RULES
+1. Keep the unit test focused on the target function and its real observable behavior.
+2. For static targets, execute through a real caller or include the production .c in the test harness when needed.
+3. If compilation fails, fix the Makefile/include-path issue first instead of stripping source inclusion.
+4. Use the master test file only as a narrow reference for wrappers/helpers when needed.
+5. Do not preserve old failed attempts unless they are still useful.
+6. Do not add coverage-only tests or empty smoke tests.
+7. Do not create fake project headers/types/macros/functions.
+8. The final file must define real tests and real `CU_add_test(...)` registrations.
+
+{previous_diag_block}
+================================================================================
+END UNIT TEST GENERATION FILESYSTEM CONTEXT
+================================================================================
+"""
+
+    # Continuation: already passed,
     if judge_verdict_file.exists():
         try:
             v = load_json(judge_verdict_file)
@@ -3263,9 +3194,9 @@ def _generate_unit_test_for_func(
                         cached_coverage = load_json(coverage_file)
                     except Exception:
                         cached_coverage = None
-                cached_pct = None
-                if isinstance(cached_coverage, dict):
-                    cached_pct = (cached_coverage.get("summary", {}) or {}).get("coverage_percent")
+
+                cached_pct = _coverage_pct(cached_coverage)
+
                 print(f"[pipeline] unit test already done: {func_id}", file=sys.stderr)
                 return func_id, {
                     "passed": True,
@@ -3277,7 +3208,6 @@ def _generate_unit_test_for_func(
         except Exception:
             pass
 
-    source_file_abs = _resolve_source_file(cfg, func["source_file"])
     last_judge: Optional[dict] = None
     if judge_verdict_file.exists():
         try:
@@ -3288,12 +3218,98 @@ def _generate_unit_test_for_func(
     last_make_ok = True
     cov: Optional[dict] = None
     pct: Optional[float] = None
-    test_dir: Path = paths["test_dir"]
+    last_build_diag: Optional[str] = None
+
+    max_attempts = int(getattr(cfg, "max_unit_test_attempts", 4) or 4)
+
+    # Fast path: if existing test already gives valid coverage, start from judge.
+    if unit_test_file.exists() and unit_makefile.exists() and _has_real_cu_add_test(unit_test_file):
+        try:
+            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+            sync_wrap_flags(unit_test_file, unit_makefile)
+
+            existing_make_res = run_make_test(unit_dir)
+            last_make_ok = bool(existing_make_res.get("ok"))
+
+            cov, pct = _run_current_coverage()
+
+            if pct is not None and pct >= float(cfg.coverage_threshold):
+                print(
+                    f"[pipeline] existing test has coverage={pct}%, starting from judge for {func_id}",
+                    file=sys.stderr,
+                )
+                source_file_abs = _resolve_source_file(cfg, func["source_file"])
+                func_for_prompt = {**func, "source_file": str(source_file_abs)}
+
+                judge = run_semantic_test_judge(
+                    cfg,
+                    test_dir=unit_dir,
+                    repo_root=repo_root,
+                    process_name=process_name,
+                    test_file=unit_test_file,
+                    func=func_for_prompt,
+                    coverage=cov or {},
+                    make_result=existing_make_res or {},
+                )
+
+                backup_good_cunit_if_best(
+                    unit_dir=unit_dir,
+                    unit_test_file=unit_test_file,
+                    unit_makefile=unit_makefile,
+                    func=func_for_prompt,
+                    coverage_pct=pct,
+                    coverage=cov or {},
+                    make_result=existing_make_res or {},
+                    judge_verdict=judge,
+                    cfg=cfg,
+                )
+
+                write_json(coverage_file, cov or {})
+                write_json(judge_verdict_file, judge)
+                last_judge = judge
+
+                if judge.get("passed"):
+                    print(
+                        f"[pipeline] unit test PASSED from existing gcov: {func_id} score={judge.get('score')}",
+                        file=sys.stderr,
+                    )
+                    return func_id, {
+                        "passed": True,
+                        "coverage_pct": pct,
+                        "semantic_score": judge.get("score"),
+                        "verdict": judge,
+                        "unit_dir": str(unit_dir),
+                    }
+
+                last_build_diag = (
+                    "Existing test reached coverage threshold, but semantic judge failed.\n"
+                    + json.dumps(judge, ensure_ascii=False, indent=2, default=str)
+                )
+            else:
+                print(
+                    f"[pipeline] existing test coverage={pct}% below threshold for {func_id}",
+                    file=sys.stderr,
+                )
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(
+                f"[pipeline] existing-test judge fast path skipped for {func_id}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     attempt = 1
-    while True:
+
+    while attempt <= max_attempts:
+        source_file_abs = _resolve_source_file(cfg, func["source_file"])
         func_for_prompt = {**func, "source_file": str(source_file_abs)}
         semantic_context = dict(semantic_context_snapshot)
+
+        unit_agent_location_context = _location_context(
+            func_for_prompt=func_for_prompt,
+            last_feedback=last_build_diag,
+        )
 
         if last_judge and not last_judge.get("passed"):
             prompt = prompt_for_semantic_test_repair(
@@ -3311,55 +3327,130 @@ def _generate_unit_test_for_func(
                 test_file=str(unit_test_file),
                 process_name=process_name,
                 attempt=attempt,
-                max_attempts=attempt,
+                max_attempts=max_attempts,
                 make_ok=last_make_ok,
                 semantic_context=semantic_context,
                 last_judge_verdict=last_judge,
             )
 
+        prompt = f"""{prompt}
+
+{unit_agent_location_context}
+
+FINAL TASK:
+- Rewrite or repair this file with real CUnit tests:
+    {unit_test_file}
+
+FINAL REQUIREMENTS:
+- Add at least one real CU_add_test().
+- Execute target range {func.get("start_line")}-{func.get("end_line")} directly
+- Read the master integrated test as wrapper/helper reference:
+    {master_test_file}
+- Read/use generated stubs as needed:
+    {stub_gen_dir}
+- Edit the unit Makefile only if required:
+    {unit_makefile}
+- Do not create fake project headers, fake replacement headers, spoof typedefs,
+  spoof structs, spoof enums, spoof macros, or fake production functions.
+- If compilation fails due to missing headers/types/macros, fix the unit
+  Makefile include paths/flags using the real source Makefile and real headers.
+- Prefer real project definitions from production headers over local test declarations.
+"""
+
         run_agent(
-            cfg, unit_dir, prompt,
+            cfg,
+            unit_dir,
+            prompt,
             f"{safe_id}_test_{int(time.time())}.json",
             folder=repo_root,
             history_dir=unit_dir / "agent_history",
         )
 
-        _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
-        sync_wrap_flags(unit_test_file, unit_makefile)
-        make_res = run_make_test(unit_dir)
+        if not _has_real_cu_add_test(unit_test_file):
+            no_test_prompt = f"""
+The previous edit is invalid because the unit test still has no real CU_add_test().
 
-        if not make_res["ok"]:
-            diag = build_output_with_runtime_diagnostics(unit_dir, unit_test_file, make_res)
+Rewrite the unit test file from scratch. Do not preserve placeholder content.
+
+UNIT TEST FILE TO REWRITE:
+ {unit_test_file}
+
+TARGET SOURCE TO READ:
+ {source_file_abs}
+
+TARGET LINE RANGE:
+ {func.get("start_line")} - {func.get("end_line")}
+
+MASTER INTEGRATED TEST TO READ FOR WORKING WRAPPERS/STUBS/HELPERS:
+ {master_test_file}
+
+MASTER MAKEFILE:
+ {master_makefile}
+
+UNIT MAKEFILE:
+ {unit_makefile}
+
+VALIDATED GENERATED STUBS:
+{_validated_stub_text()}
+
+BUILD COMMAND:
+ cd {unit_dir}
+ make test
+
+Requirements:
+- Create a complete CUnit file.
+- Include CUnit headers.
+- Add at least one test function.
+- Register it with CU_add_test().
+- Execute the target line range directly or through a real caller.
+- Use/copy only needed wrappers/helpers from the master integrated test.
+- Do not blindly include the master integrated test.
+- Do not leave an empty CUnit suite.
+- Do not create fake project headers or spoof project types/macros/functions.
+- If headers/types/macros are missing, inspect the real production headers and
+  original Makefile, then fix INCLUDE/CPPFLAGS/LDFLAGS in the unit Makefile.
+- Use real project definitions whenever available.
+"""
+
+            if last_build_diag:
+                no_test_prompt = f"""{no_test_prompt}
+
+PREVIOUS FAILURE CONTEXT:
+{last_build_diag}
+"""
+
             run_agent(
-                cfg, unit_dir,
-                prompt_for_compile_fix(
-                    str(unit_makefile), str(unit_test_file), diag,
-                    source_dir=str(cfg.source_dir.resolve()),
-                    source_makefile=str(cfg.source_dir.resolve() / "Makefile"),
-                    actual_source_files=[str(p) for p in _project_source_files(cfg)],
-                ),
-                f"{safe_id}_compile_fix_{int(time.time())}.json",
+                cfg,
+                unit_dir,
+                no_test_prompt,
+                f"{safe_id}_empty_test_fix_{int(time.time())}.json",
                 folder=repo_root,
                 history_dir=unit_dir / "agent_history",
             )
-            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
-            sync_wrap_flags(unit_test_file, unit_makefile)
-            make_res = run_make_test(unit_dir)
 
-        last_make_ok = make_res["ok"]
-        source_file_abs = _resolve_source_file(cfg, func["source_file"])
-        cov = check_function_coverage(
-            unit_dir, source_file_abs,
-            func["start_line"], func["end_line"],
-            source_root=cfg.source_dir.resolve(),
-        )
-        pct = None
-        if cov:
-            pct = (cov.get("summary", {}) or {}).get("coverage_percent")
-            if pct is None:
-                pct = cov.get("coverage_percent")
+        if not _has_real_cu_add_test(unit_test_file):
+            last_build_diag = (
+                "The previous agent attempt still produced no real CU_add_test(). "
+                "The unit test file is still empty or placeholder-only. "
+                f"File: {unit_test_file}"
+            )
+            print(
+                f"[pipeline] {func_id} attempt {attempt}: still no CU_add_test after repair",
+                file=sys.stderr,
+            )
+            attempt += 1
+            continue
 
-        if pct is not None and pct >= cfg.coverage_threshold and make_res["ok"]:
+        _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+        sync_wrap_flags(unit_test_file, unit_makefile)
+
+        make_res = run_make_test(unit_dir)
+        last_make_ok = bool(make_res.get("ok"))
+
+        cov, pct = _run_current_coverage()
+
+        # Judge immediately if coverage is good, even when make/test failed.
+        if pct is not None and pct >= float(cfg.coverage_threshold):
             judge = run_semantic_test_judge(
                 cfg,
                 test_dir=unit_dir,
@@ -3368,13 +3459,30 @@ def _generate_unit_test_for_func(
                 test_file=unit_test_file,
                 func=func_for_prompt,
                 coverage=cov or {},
-                make_result=make_res,
+                make_result=make_res or {},
             )
+
+            backup_good_cunit_if_best(
+                unit_dir=unit_dir,
+                unit_test_file=unit_test_file,
+                unit_makefile=unit_makefile,
+                func=func_for_prompt,
+                coverage_pct=pct,
+                coverage=cov or {},
+                make_result=make_res or {},
+                judge_verdict=judge,
+                cfg=cfg,
+            )
+
             write_json(coverage_file, cov or {})
             write_json(judge_verdict_file, judge)
             last_judge = judge
+
             if judge.get("passed"):
-                print(f"[pipeline] unit test PASSED: {func_id} score={judge.get('score')}", file=sys.stderr)
+                print(
+                    f"[pipeline] unit test PASSED: {func_id} score={judge.get('score')}",
+                    file=sys.stderr,
+                )
                 return func_id, {
                     "passed": True,
                     "coverage_pct": pct,
@@ -3382,10 +3490,251 @@ def _generate_unit_test_for_func(
                     "verdict": judge,
                     "unit_dir": str(unit_dir),
                 }
-            print(f"[pipeline] judge FAILED: {func_id} score={judge.get('score')}", file=sys.stderr)
-        else:
-            print(f"[pipeline] {func_id} attempt {attempt} coverage={pct}% make_ok={make_res['ok']}", file=sys.stderr)
+
+            print(
+                f"[pipeline] judge FAILED: {func_id} score={judge.get('score')}",
+                file=sys.stderr,
+            )
+
+            try:
+                last_build_diag = (
+                    "Semantic judge failed even though target coverage met threshold.\n"
+                    + json.dumps(judge, ensure_ascii=False, indent=2, default=str)
+                )
+            except Exception:
+                last_build_diag = f"Semantic judge failed: {judge!r}"
+
+            attempt += 1
+            continue
+
+        # Only compile-fix when coverage is not good enough and make/test failed.
+        if not make_res["ok"]:
+            diag = _safe_build_diag(make_res)
+
+            compile_fix_prompt = prompt_for_compile_fix(
+                str(unit_makefile),
+                str(unit_test_file),
+                diag,
+                source_dir=str(cfg.source_dir.resolve()),
+                source_makefile=source_makefile_for_compile_fix,
+                actual_source_files=[str(p) for p in _project_source_files(cfg)],
+            )
+
+            compile_fix_prompt = f"""{compile_fix_prompt}
+
+{_location_context(func_for_prompt=func_for_prompt, last_feedback=diag)}
+
+COMPILE/RUNTIME FIX INSTRUCTIONS:
+- You may edit:
+    {unit_test_file}
+    {unit_makefile}
+
+- Use this master integrated test as reference for working wrappers/helpers:
+    {master_test_file}
+
+- Use this production source:
+    {source_file_abs}
+
+- Use generated stubs from:
+    {stub_gen_dir}
+
+- Use the real source Makefile/header layout before changing declarations:
+    {source_makefile_for_compile_fix}
+
+- Fix the compile/link/runtime issue with minimal changes.
+- Preserve real CU_add_test registrations.
+- Do not revert to an empty scaffold.
+- If compile/runtime logs are missing, use the make_res object and current files
+  to infer the failure.
+
+STRICT COMPILE-FIX RULES:
+- Do not create fake project headers.
+- Do not create spoof replacement headers with names matching real project headers.
+- Do not invent typedefs, structs, enums, macros, globals, or prototypes that
+  already exist in the real project.
+- Do not define fake production functions to satisfy the linker.
+- Do not bypass the real production source under test.
+- If a header is missing, fix INCLUDE/CPPFLAGS using the original Makefile or
+  real project include directories.
+- If a macro is missing, find where the real build defines it and add the same
+  macro to this unit Makefile.
+- If a type is missing, include the real header that defines it.
+- If a symbol is unresolved, prefer adding the real source object/library or a
+  real stub.
+"""
+
+            run_agent(
+                cfg,
+                unit_dir,
+                compile_fix_prompt,
+                f"{safe_id}_compile_fix_{int(time.time())}.json",
+                folder=repo_root,
+                history_dir=unit_dir / "agent_history",
+            )
+
+            if not _has_real_cu_add_test(unit_test_file):
+                last_build_diag = (
+                    "The compile-fix attempt removed or failed to add real CU_add_test(). "
+                    f"File: {unit_test_file}"
+                )
+                print(
+                    f"[pipeline] {func_id} attempt {attempt}: no CU_add_test after compile_fix",
+                    file=sys.stderr,
+                )
+                attempt += 1
+                continue
+
+            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+            sync_wrap_flags(unit_test_file, unit_makefile)
+
+            make_res = run_make_test(unit_dir)
+            last_make_ok = bool(make_res.get("ok"))
+
+            cov, pct = _run_current_coverage()
+
+            if pct is not None and pct >= float(cfg.coverage_threshold):
+                judge = run_semantic_test_judge(
+                    cfg,
+                    test_dir=unit_dir,
+                    repo_root=repo_root,
+                    process_name=process_name,
+                    test_file=unit_test_file,
+                    func=func_for_prompt,
+                    coverage=cov or {},
+                    make_result=make_res or {},
+                )
+
+                backup_good_cunit_if_best(
+                    unit_dir=unit_dir,
+                    unit_test_file=unit_test_file,
+                    unit_makefile=unit_makefile,
+                    func=func_for_prompt,
+                    coverage_pct=pct,
+                    coverage=cov or {},
+                    make_result=make_res or {},
+                    judge_verdict=judge,
+                    cfg=cfg,
+                )
+
+                write_json(coverage_file, cov or {})
+                write_json(judge_verdict_file, judge)
+                last_judge = judge
+
+                if judge.get("passed"):
+                    print(
+                        f"[pipeline] unit test PASSED after compile_fix: {func_id} score={judge.get('score')}",
+                        file=sys.stderr,
+                    )
+                    return func_id, {
+                        "passed": True,
+                        "coverage_pct": pct,
+                        "semantic_score": judge.get("score"),
+                        "verdict": judge,
+                        "unit_dir": str(unit_dir),
+                    }
+
+                print(
+                    f"[pipeline] judge FAILED after compile_fix: {func_id} score={judge.get('score')}",
+                    file=sys.stderr,
+                )
+
+                last_build_diag = (
+                    "Semantic judge failed after compile/runtime fix even though coverage met threshold.\n"
+                    + json.dumps(judge, ensure_ascii=False, indent=2, default=str)
+                )
+            else:
+                if not make_res["ok"]:
+                    last_build_diag = _safe_build_diag(make_res)
+                else:
+                    try:
+                        cov_text = json.dumps(cov or {}, ensure_ascii=False, indent=2, default=str)
+                    except Exception:
+                        cov_text = repr(cov)
+
+                    last_build_diag = f"""
+Build succeeded after compile fix, but target coverage did not meet threshold.
+
+Target:
+ {func_id}
+
+Required threshold:
+ {cfg.coverage_threshold}
+
+Coverage object:
+{cov_text}
+
+The next attempt should make the test execute lines {func.get("start_line")}-{func.get("end_line")}
+in:
+ {source_file_abs}
+"""
+
+            attempt += 1
+            continue
+
+        # Build/test was okay but coverage was low/missing.
+        print(
+            f"[pipeline] {func_id} attempt {attempt} coverage={pct}% make_ok={make_res['ok']}",
+            file=sys.stderr,
+        )
+
+        try:
+            cov_text = json.dumps(cov or {}, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            cov_text = repr(cov)
+
+        last_build_diag = f"""
+Build succeeded, but target coverage did not meet threshold.
+
+Target:
+ {func_id}
+
+Required threshold:
+ {cfg.coverage_threshold}
+
+Observed coverage:
+ {pct}
+
+Coverage object:
+{cov_text}
+
+The next attempt should make the test execute lines {func.get("start_line")}-{func.get("end_line")}
+in:
+ {source_file_abs}
+"""
+
         attempt += 1
+
+    try:
+        write_json(
+            unit_dir / "unit_test_failed.json",
+            {
+                "func_id": func_id,
+                "attempts": max_attempts,
+                "coverage_pct": pct,
+                "make_ok": last_make_ok,
+                "last_judge": last_judge,
+                "last_build_diag": last_build_diag,
+                "unit_dir": str(unit_dir),
+            },
+        )
+    except Exception:
+        pass
+
+    print(
+        f"[pipeline] unit test FAILED after {max_attempts} attempts: "
+        f"{func_id} coverage={pct}% make_ok={last_make_ok}",
+        file=sys.stderr,
+    )
+
+    return func_id, {
+        "passed": False,
+        "coverage_pct": pct,
+        "semantic_score": None if not last_judge else last_judge.get("score"),
+        "verdict": last_judge,
+        "unit_dir": str(unit_dir),
+        "error": f"max attempts reached: {max_attempts}",
+        "last_make_ok": last_make_ok,
+    }
 
 
 def parallel_generate_unit_tests(
@@ -3410,7 +3759,7 @@ def parallel_generate_unit_tests(
     all_results: dict[str, dict] = {}
     workers = max(1, int(getattr(cfg, "max_unit_test_workers", 4)))
 
-    for depth in sorted(levels.keys(), reverse=True):
+    for depth in sorted(levels.keys()):
         remaining = (cfg.max_functions - len(all_results)) if cfg.max_functions is not None else None
         if remaining is not None and remaining <= 0:
             break
