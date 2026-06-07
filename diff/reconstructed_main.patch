@@ -1,0 +1,911 @@
+--- a/main.py
++++ b/main.py
+@@ -123,8 +123,8 @@
+     text = read_text(source_makefile)
+     flags: dict[str, str] = {}
+     wanted = {"CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"}
+-
+     current: Optional[str] = None
++
+     for line in text.splitlines():
+         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:+?]?=\s*(.*)$", line)
+         if m and m.group(1) in wanted:
+@@ -437,21 +437,9 @@
+     if source_root is not None:
+         source_root = Path(source_root).resolve()
+ 
+-    # Refresh gcov outputs from generated .gcno files.
+-    for gcno in sorted(test_dir.glob("*.gcno")):
+-        subprocess.run(
+-            ["gcov", "-b", "-c", gcno.name],
+-            cwd=str(test_dir),
+-            text=True,
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.PIPE,
+-            timeout=120,
+-        )
+-    for _f in test_dir.glob("test_*.gcov"):
+-        try:
+-            _f.unlink()
+-        except Exception:
+-            pass
++    # Do not run gcov here.
++    # The generated Makefile owns gcov generation and filtering.
++    # This function only reads existing .gcov files.
+ 
+     gcov_files = sorted(test_dir.glob("*.gcov"))
+ 
+@@ -608,10 +596,10 @@
+ - Mock return values may be wrong. If production dereferences a returned pointer, return valid static fake storage.
+ - Global fake data may be uninitialized. Initialize required fake globals in reset/setup or mock open/init functions.
+ - Linker wrap flags may be missing or stale. Preserve existing wrap flags, but add/remove test Makefile wrap flags if required by the test harness.
++- If the failure is a missing header, define, library, or include-path issue, fix the unit Makefile first instead of only changing the test C file.
+ - Do not call `__real_*` from wrappers.
+ - Do not hide crashes by deleting assertions or replacing them with always-pass assertions.
+ - Do not edit production code to make the test pass.
+-- Do not create fake data, headers, or types just to make the test pass.
+ 
+ REFERENCE LOCATIONS
+ - Source folder passed by user:
+@@ -1708,6 +1696,11 @@
+     if not raw:
+         return {}
+ 
++    try:
++        return json.loads(raw)
++    except Exception:
++        pass
++
+     raw2 = raw.strip()
+ 
+     # Strip markdown fences.
+@@ -1933,40 +1926,40 @@
+             cfg,
+             test_dir,
+             prompt,
+-            f"{_safe_filename(fid)}_semantic_judge.json",
++            f"{safe_fid}_semantic_judge_try_{i}.json",
+             folder=repo_root,
+         )
+ 
+         verdict_raw = {}
+         if verdict_file.exists():
+             last_raw = verdict_file.read_text(errors="ignore")[-4000:]
+             verdict_raw = _read_json_loose(verdict_file)
+ 
+         verdict = _normalize_simple_judge_verdict(
+             verdict_raw,
+             min_score=min_score,
+         )
+ 
+         if verdict is not None:
+             verdict["judge_attempts"] = i
+             return verdict
+ 
+         print(
+             f"[pipeline] judge JSON parse failed for {fid}, retry {i}/{max_parse_retries}",
+             file=sys.stderr,
+         )
+ 
+     raise RuntimeError(
+         "Semantic judge failed to produce parseable JSON after "
+         f"{max_parse_retries} attempts for {fid}. "
+         "Not regenerating tests because this is judge infrastructure failure.\n"
+         f"Last judge output:\n{last_raw}"
+     )
+ 
+ 
+ def _backup_root_for_func(unit_dir: Path, func: dict) -> Path:
+     fid = func.get("id") or func.get("name") or "unknown_function"
+-    return unit_dir / "_cunit_backups" / _safe_filename(fid)
++    return unit_dir / "agent_history" / "good_cunit_backups" / _safe_filename(fid)
+ 
+ 
+ def _best_backup_meta_path(unit_dir: Path, func: dict) -> Path:
+@@ -2016,11 +2009,13 @@
+ 
+     best_meta = _load_best_backup_meta(unit_dir, func)
+     old_best = int(best_meta.get("score") or -1)
++
+     if score < old_best:
+         return
++    ts = int(time.time())
+ 
+     fid = func.get("id") or func.get("name") or "unknown_function"
+-    ts = str(int(time.time()))
++
+     backup_dir = root / f"score_{score}_{ts}"
+     backup_dir.mkdir(parents=True, exist_ok=True)
+ 
+@@ -2072,7 +2067,7 @@
+     if not isinstance(coverage, dict):
+         return None
+ 
+-    for key in ("coverage_percent", "percent", "coverage", "pct"):
++    for key in ["percent", "coverage", "pct", "line_percent"]:
+         if key in coverage and coverage.get(key) is not None:
+             try:
+                 return float(coverage.get(key))
+@@ -2202,7 +2197,7 @@
+             "covered": False,
+             "accepted": False,
+             "judge_verdict": None,
+-            "reason": "coverage below threshold",
++            "reason": f"coverage {coverage_pct}% below threshold {threshold}%",
+         }
+ 
+     judge_verdict = run_semantic_test_judge(
+@@ -2745,188 +2740,292 @@
+ 
+     if not unit_test_file.exists():
+         skeleton = f"""/*
+- * PLACEHOLDER ONLY.
+- *
+- * Target:
+- * {func_id}
+- *
+- * This file must be completely rewritten by the unit-test agent.
+- *
+- * Required final file:
+- *   - complete CUnit test file
+- *   - at least one CU_add_test()
+- *   - real test function(s)
+- *   - calls target function directly or through a real caller
+- *   - uses wrappers/stubs from the master test or _stub_gen as needed
+- */
+-"""
++     * PLACEHOLDER ONLY.
++     *
++     * Target:
++     *   {func_id}
++     *
++     * This file must be completely rewritten by the unit-test agent.
++     *
++     * Required final file:
++     *   - complete CUnit test file
++     *   - at least one CU_add_test()
++     *   - real test function(s)
++     *   - calls target function directly or through a real caller
++     *   - uses wrappers/stubs from the master test or _stub_gen as needed
++     */
++     """
+         write_text(unit_test_file, skeleton)
+ 
+     if not unit_makefile.exists():
+         _generate_unit_test_makefile(cfg, paths, func, safe_id, unit_dir, unit_test_file)
+ 
+     return unit_dir
+ 
+ 
+ def _generate_unit_test_makefile(
+     cfg: PipelineConfig,
+     paths: dict,
+     func: dict,
+     safe_id: str,
+     unit_dir: Path,
+     unit_test_file: Path,
+ ) -> None:
+-    """Generate Makefile for a unit test dir, inheriting the master test Makefile."""
++    """Generate Makefile for a unit test dir, inheriting the master test Makefile.
++
++    Important behavior:
++    - If the unit test includes the production .c file directly, the production
++      code is compiled as part of TEST_SRCS. In that mode, do not build/link
++      prod_under_test.o, otherwise gcov may report coverage from an unexecuted
++      duplicate object.
++    - If the unit test does not include the production .c file, compile and link
++      PROD_OBJ normally.
++    """
++    import os
++    import re
++
+     context_file = paths["test_dir"] / "_pipeline_context.json"
+     flags: dict = {}
+     if context_file.exists():
+         try:
+             flags = load_json(context_file).get("flags", {})
+         except Exception:
+             pass
+ 
+     func_id = func["id"]
+     process_name: str = paths["process_name"]
+     entry_sym = f"{process_name}_entry_main"
+ 
+     # Include the master Makefile using a path relative to this unit test dir.
+     master_makefile_rel = Path(
+         os.path.relpath(paths["makefile"].resolve(), start=unit_dir)
+     ).as_posix()
+ 
+-    # Production source is compiled separately so gcov can emit <source>.c.gcov.
+     source_file_abs = _resolve_source_file(cfg, func["source_file"])
+     prod_src_rel = Path(
+         os.path.relpath(source_file_abs.resolve(), start=unit_dir)
+     ).as_posix()
+ 
+     test_program = f"test_{safe_id}"
+     test_src = unit_test_file.name
+ 
+     # Validated stub bodies to link.
+     # This is refreshed by _sync_stub_srcs before each make test.
+-    stub_srcs_list = [path for path, _ in _stub_srcs_relative(paths["test_dir"], unit_dir)]
++    stub_srcs_list = [
++        path for path, _ in _stub_srcs_relative(paths["test_dir"], unit_dir)
++    ]
+     stub_srcs_str = " ".join(stub_srcs_list)
+ 
++    # -------------------------------------------------------------------------
++    # Detect whether TEST_SRCS includes the production .c file directly.
++    # -------------------------------------------------------------------------
++    # Example:
++    #   #define main dio100d_entry_main
++    #   #include "../../../../src/dio100d/dio100d.c"
++    #   #undef main
++    #
++    # If true:
++    # - production code is compiled through TEST_SRCS
++    # - do NOT build/link prod_under_test.o
++    #
++    # If false:
++    # - compile PROD_SRC separately into prod_under_test.o
++    # - link prod_under_test.o into the test executable
++    # -------------------------------------------------------------------------
++    try:
++        test_text = unit_test_file.read_text(encoding="utf-8", errors="ignore")
++    except Exception:
++        test_text = ""
++
++    test_text_norm = test_text.replace("\\", "/")
++    source_file_abs_norm = source_file_abs.resolve().as_posix()
++    prod_src_rel_norm = prod_src_rel.replace("\\", "/")
++    prod_src_basename = source_file_abs.name
++
++    include_paths = re.findall(
++        r'^\s*#\s*include\s*[<"]([^">]+)[">]',
++        test_text_norm,
++        flags=re.MULTILINE,
++    )
++    include_paths_norm = [p.replace("\\", "/") for p in include_paths]
++
++    production_included_in_test = False
++    for inc in include_paths_norm:
++        # Direct match against the generated relative path.
++        if inc == prod_src_rel_norm:
++            production_included_in_test = True
++            break
++
++        # Basename match, e.g. "dio100d.c".
++        if inc == prod_src_basename:
++            production_included_in_test = True
++            break
++
++        # Suffix match, e.g. "../../../../src/dio100d/dio100d.c".
++        if inc.endswith("/" + prod_src_basename):
++            # Try to resolve relative include path from unit_dir.
++            try:
++                resolved_inc = (unit_dir / inc).resolve().as_posix()
++                if resolved_inc == source_file_abs_norm:
++                    production_included_in_test = True
++                    break
++            except Exception:
++                # If resolution fails, suffix match is still a useful fallback.
++                production_included_in_test = True
++                break
++
++    # Fallback detection by raw text in case the include is generated oddly.
++    if not production_included_in_test:
++        production_included_in_test = (
++            prod_src_rel_norm in test_text_norm
++            or source_file_abs_norm in test_text_norm
++            or f"/{prod_src_basename}" in test_text_norm
++            or f'"{prod_src_basename}"' in test_text_norm
++            or f"<{prod_src_basename}>" in test_text_norm
++        )
++
++    if production_included_in_test:
++        # Include-production mode:
++        # The production .c is compiled as part of TEST_SRCS.
++        # Do not build/link PROD_OBJ.
++        prod_obj_value = ""
++        prod_obj_rule = ""
++        test_program_deps = "$(TEST_SRCS) $(STUB_SRCS)"
++        test_program_inputs = "$(TEST_SRCS) $(STUB_SRCS)"
++    else:
++        # Separate-object mode:
++        # The production .c is compiled separately and linked into the test.
++        prod_obj_value = "prod_under_test.o"
++        prod_obj_rule = f"""
++$(PROD_OBJ): $(PROD_SRC)
++\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) -Dmain={entry_sym} -c $(PROD_SRC) -o $(PROD_OBJ)
++"""
++        test_program_deps = "$(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS)"
++        test_program_inputs = "$(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS)"
++
+     content = f"""# Unit test Makefile for {func_id}
+-# Auto-generated — do not edit manually
+ 
+ # Pull in the same include paths, libraries, architecture flags, and wrap flags
+ # as the master test Makefile. Unit-specific rules below override only what
+ # must differ for this per-function test.
+ MASTER_MAKEFILE = {master_makefile_rel}
+ include $(MASTER_MAKEFILE)
++HOME = ../../../../.
+ 
+ .DEFAULT_GOAL := test
+ 
+-#CC = gcc
++CC ?= gcc
+ 
+-# Fallbacks from pipeline_context.json, used only if the master Makefile did
++# Fallbacks from _pipeline_context.json, used only if the master Makefile did
+ # not define them.
+ CFLAGS ?= {flags.get('CFLAGS', '')}
+ CFLAGS_LINUX ?= {flags.get('CFLAGS_LINUX', '')}
+ CPPFLAGS ?= {flags.get('CPPFLAGS', '')}
+ INCLUDE ?= {flags.get('INCLUDE', '')}
+ LDFLAGS ?= {flags.get('LDFLAGS', '')}
+ LDLIBS ?= {flags.get('LDLIBS', '')}
+ LIBS ?= {flags.get('LIBS', '')}
+ 
+ # Unit-specific files
+ TEST_PROGRAM = {test_program}
+ TEST_SRCS = {test_src}
+ PROD_SRC = {prod_src_rel}
+-PROD_OBJ = prod_under_test.o
++PROD_OBJ = {prod_obj_value}
+ 
+ # Keep only the production gcov output.
+ # Example:
+-# PROD_SRC = ../../../../src/dio100d/dio100d.c
+-# TARGET_GCOV = dio100d.c.gcov
++#    PROD_SRC = ../../../../src/dio100d/dio100d.c
++#    TARGET_GCOV = dio100d.c.gcov
+ TARGET_GCOV = $(notdir $(PROD_SRC)).gcov
+ 
++# Test object gcno. In include-production mode, this is the object that contains
++# the included production .c coverage.
++TEST_GCNO = $(TEST_SRCS:.c=.gcno)
++
+ # Validated stub bodies.
+ # Local __wrap_* overrides in TEST_SRCS should be excluded by the pipeline.
+ STUB_SRCS = {stub_srcs_str}
+ 
+ TEST_LIBS += -lcunit
+ TEST_REPORT_FILE = {test_program}_report.txt
+ TEST_LOG_FILE = {test_program}_log.txt
+ 
+ # Coverage flags for this isolated unit build.
+ COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
+ 
+ # Use the same wrap functions as the master Makefile.
+ WRAP_FLAGS = $(WRAP_FUNCS)
+ 
+ .PHONY: test clean-test coverage-test
+ 
+ test: clean-test $(TEST_PROGRAM)
+ \t@set +e; \\
+ \t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE); \\
+ \tstatus=$$?; \\
+ \t$(MAKE) coverage-test; \\
+ \texit $$status
+ 
+-$(PROD_OBJ): $(PROD_SRC)
+-\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) -Dmain={entry_sym} -c $(PROD_SRC) -o $(PROD_OBJ)
+-
+-$(TEST_PROGRAM): $(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS)
+-\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS) \\
++{prod_obj_rule}
++$(TEST_PROGRAM): {test_program_deps}
++\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) {test_program_inputs} \\
+ \t-o $(TEST_PROGRAM) \\
+ \t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
+ \t-Wl,--gc-sections \\
+ \t$(WRAP_FLAGS)
+ 
+ coverage-test:
+ \t@echo "=== coverage-test ===" >> $(TEST_REPORT_FILE)
+ \t@echo "PWD=$$(pwd)" >> $(TEST_REPORT_FILE)
+ \t@echo "Target production gcov file: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
++\t@echo "Test gcno file: $(TEST_GCNO)" >> $(TEST_REPORT_FILE)
+ \t@echo "Files before gcov:" >> $(TEST_REPORT_FILE)
+ \t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
+ \t@found=0; \\
+-\tfor f in *.gcno; do \\
++\tfor f in $(TEST_GCNO) $(PROD_OBJ:.o=.gcno); do \\
+ \t\t[ -e "$$f" ] || continue; \\
+ \t\tfound=1; \\
+ \t\techo "Running gcov -b -c $$f" >> $(TEST_REPORT_FILE); \\
+ \t\tgcov -b -c "$$f" >> $(TEST_REPORT_FILE) 2>&1 || true; \\
+ \tdone; \\
+ \tif [ "$$found" -eq 0 ]; then \\
+-\t\techo "WARNING: no .gcno files found for gcov" >> $(TEST_REPORT_FILE); \\
++\t\techo "No .gcno files found; coverage cannot be generated." >> $(TEST_REPORT_FILE); \\
+ \tfi
+ \t@echo "Filtering .gcov files. Keeping only: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
+ \t@find . -maxdepth 1 -name '*.gcov' ! -name '$(TARGET_GCOV)' -delete
+ \t@if [ ! -f "$(TARGET_GCOV)" ]; then \\
+ \t\techo "WARNING: target production gcov file was not generated: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE); \\
+ \tfi
+ \t@echo "Files after gcov filtering:" >> $(TEST_REPORT_FILE)
+ \t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
+ 
+ clean-test:
+ \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
+ """
+     write_text(unit_dir / "Makefile", content)
+ 
+ 
+ def _generate_unit_test_for_func(
+     cfg: PipelineConfig,
+     paths: dict,
+     func: dict,
+     flags: dict,
+     semantic_context_snapshot: dict,
+ ) -> tuple[str, dict]:
+     """
+     Generate, compile/run, coverage-check, semantic-judge, and repair one unit test.
+ 
+     Updated behavior:
+       - if an existing test already produces valid gcov above threshold, start from judge
+       - judge runs when coverage is above threshold, even if make/test returned non-zero
+       - judge JSON parse failure raises and does NOT regenerate tests
+       - backs up best CUnit test + Makefile by coverage >= threshold and best judge score
+       - semantic judge JSON is simple: {"score": int, "reason": str}
+     """
+     func_id = func["id"]
+     safe_id = _safe_filename(func_id)
+     test_dir: Path = paths["test_dir"]
+     process_name: str = paths["process_name"]
++
+     repo_root = cfg.source_dir.parent.parent.resolve()
+ 
+     unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
+@@ -2982,17 +3081,19 @@
+ 
+     def _safe_build_diag(make_res: dict) -> str:
+         parts: list[str] = []
++
+         try:
+             diag = build_output_with_runtime_diagnostics(
+                 unit_dir,
+                 unit_test_file,
+                 make_res,
+             )
+             if diag:
+                 parts.append(str(diag))
+         except Exception as e:
+             parts.append(
+-                f"\nbuild_output_with_runtime_diagnostics failed: {type(e).__name__}: {e}\n"
++                "[pipeline diagnostic fallback]\n"
++                f"build_output_with_runtime_diagnostics failed: {type(e).__name__}: {e}\n"
+             )
+ 
+         try:
+@@ -3041,7 +3142,10 @@
+                 )
+ 
+         if not parts:
+-            return "(no diagnostics available)"
++            return (
++                "No build diagnostics were available. "
++                "make_res contained no readable output and no log files were found."
++            )
+ 
+         return "\n".join(parts)
+ 
+@@ -3113,77 +3217,126 @@
+ Read this before editing so you do not repeat the same mistake.
+ 
+ {last_feedback}
++
++========================
++END PREVIOUS ATTEMPT FAILURE / DIAGNOSTICS
++========================
++
+ """
+ 
+         return f"""
++========================
++UNIT TEST GENERATION FILESYSTEM CONTEXT
++========================
++
+ You are running inside an agent with repository folder:
+ 
+  {repo_root}
+ 
+ The current unit test file is only a placeholder or previous failed attempt.
+ Rewrite it from scratch if needed.
+ 
+ TARGET FUNCTION
++-------------
++id:
+  {func_id}
+ 
+ function object:
+-{json.dumps(func_for_prompt, ensure_ascii=False, indent=2)}
++ {json.dumps(func_for_prompt, ensure_ascii=False, indent=2)}
+ 
+ production source file:
+  {source_file_abs}
+ 
+ source line range:
+  {func.get("start_line")} - {func.get("end_line")}
+ 
+-Do not create fake project headers/types/macros/functions to spoof the build
+-harness just to make the build pass.
++This is a test-writing task, not a compile-fix task.
++Prefer a fresh, meaningful unit test over patching around old broken attempts.
++Do not remove production-source wiring or replace it with an empty compile-only harness just to make the build pass.
+ 
++FILES YOU MAY EDIT
++-------------
+ Unit test file to write/repair:
+  {unit_test_file}
+ 
+-FILES YOU MAY EDIT
+ Unit Makefile to edit only if required for this one unit build:
+  {unit_makefile}
+ 
+ FILES TO READ
++-------------
+ Production source:
+  {source_file_abs}
+ 
++Make sure to include this in the test like this:
++
++#define main dio100d_entry_main
++#include "{source_file_abs}"
++#undef main
++
+ Master integrated test file with working wrappers/stubs/helpers:
+  {master_test_file}
+ 
+ Master test Makefile:
+  {master_makefile}
+ 
+ Source Makefile candidates:
+ {_source_makefile_text()}
+ 
+ Generated stub directory:
+  {stub_gen_dir}
+ 
+ Validated generated stubs currently linked by unit Makefile:
+ {_validated_stub_text()}
+ 
+ Actual project .c source files discovered:
+ {actual_source_files_text}
+ 
+ BUILD / CONTENT RULES
+ 1. Keep the unit test focused on the target function and its real observable behavior.
+ 2. For static targets, execute through a real caller or include the production .c in the test harness when needed.
+ 3. If compilation fails, fix the Makefile/include-path issue first instead of stripping source inclusion.
+ 4. Use the master test file only as a narrow reference for wrappers/helpers when needed.
+ 5. Do not preserve old failed attempts unless they are still useful.
+ 6. Do not add coverage-only tests or empty smoke tests.
+ 7. Do not create fake project headers/types/macros/functions.
+ 8. The final file must define real tests and real `CU_add_test(...)` registrations.
++9. A compiling test is not enough. The generated CUnit executable must actually run the registered tests and execute the real production target function.
++   Always call CU_initialize_registry() before CU_add_suite(), register tests with
++   CU_add_test(), call CU_basic_run_tests(), and verify the target function is
++   called at least once in gcov. If gcov says "function <target> called 0" or the
++   target lines are still "#####", the test is invalid even if make succeeded.
++10. If testing a static function by including the production .c file, make sure
++    the Makefile does not also compile/link that same production .c separately.
++    Generate gcov from the object that contains the included production source.
++11. If the target calls a terminating function such as pmf_exit(), exit(), or abort(), add linker wrappers and safe __wrap_* functions so the test process continues long enough to write coverage data.
+ 
+ {previous_diag_block}
+-================================================================================
++
+ END UNIT TEST GENERATION FILESYSTEM CONTEXT
+-================================================================================
++
++Use the provided source snippet, current unit test, Makefile, and build log as the primary evidence.
++
++Infer as much as possible from the given code before using tools.
++
++Do not search broadly through the repository unless the build log identifies a specific missing symbol, type, macro, field, or header that cannot be resolved from the provided context.
++
++If searching is necessary:
++- Search only production source/include directories.
++- Try to infer as much as you can from the source itself, prefer hit and trial in the given allowed code locations.
++- Do not search tests/, _unit_tests/, backup directories, or agent_history/.
++- Do not inspect previous agent transcripts.
++- Do not run broad commands like:
++    find / -...
++    find <repo-root> -name ...
++    ls -R <large-dir>
++    grep -r <repo-root> ...
++- Prefer one narrow query for the exact symbol/header.
++- Stop after 2 failed searches and make the smallest reasonable inference.
++
++Dont exit until you have written the test code in target test file and made sure it compiles and generates a .gcov file. Read the makefile to know what you can do.
+ """
+ 
+-    # Continuation: already passed,
++    # Continuation: already passed.
+     if judge_verdict_file.exists():
+         try:
+             v = load_json(judge_verdict_file)
+@@ -3235,9 +3388,10 @@
+ 
+             if pct is not None and pct >= float(cfg.coverage_threshold):
+                 print(
+-                    f"[pipeline] existing test has coverage={pct}%, starting from judge for {func_id}",
++                    f"[pipeline] existing test has coverage={pct}%, starting from semantic judge: {func_id}",
+                     file=sys.stderr,
+                 )
++
+                 source_file_abs = _resolve_source_file(cfg, func["source_file"])
+                 func_for_prompt = {**func, "source_file": str(source_file_abs)}
+ 
+@@ -3287,7 +3441,7 @@
+                 )
+             else:
+                 print(
+-                    f"[pipeline] existing test coverage={pct}% below threshold for {func_id}",
++                    f"[pipeline] existing test judge FAILED: {func_id} score={judge.get('score')}",
+                     file=sys.stderr,
+                 )
+ 
+@@ -3343,53 +3497,141 @@
+ 
+ FINAL REQUIREMENTS:
+ - Add at least one real CU_add_test().
+-- Execute target range {func.get("start_line")}-{func.get("end_line")} directly
++- Execute target range {func.get("start_line")}-{func.get("end_line")} directly or through a real caller.
++- Read the production source:
++    {source_file_abs}
+ - Read the master integrated test as wrapper/helper reference:
+     {master_test_file}
+ - Read/use generated stubs as needed:
+     {stub_gen_dir}
+ - Edit the unit Makefile only if required:
+     {unit_makefile}
+ - Do not create fake project headers, fake replacement headers, spoof typedefs,
+   spoof structs, spoof enums, spoof macros, or fake production functions.
+ - If compilation fails due to missing headers/types/macros, fix the unit
+   Makefile include paths/flags using the real source Makefile and real headers.
+ - Prefer real project definitions from production headers over local test declarations.
++
++CRITICAL EXECUTION / COVERAGE REQUIREMENTS
++----------------------------------------
++A unit test is valid only if it compiles, runs, and executes the real production
++source code for the target function.
++
++You must ensure all of the following:
++
++1. CUnit must be initialized correctly:
++   - Call CU_initialize_registry() before CU_add_suite().
++   - Check CU_add_suite() and CU_add_test() return values.
++   - Call CU_basic_run_tests().
++   - Do not exit before CU_basic_run_tests().
++
++2. Register real tests:
++   - The file must contain at least one real CU_add_test(...).
++   - The registered test function must execute the target function or a real caller
++     that reaches the target function.
++
++3. Execute the real production code:
++   - Do not create a fake implementation of the target function.
++   - Do not replace the target function with a stub.
++   - Do not only test mocks or wrappers.
++   - The test must cause the real source lines in the target range to run.
++
++4. For static target functions:
++   - Prefer including the production .c file directly in the test file:
++     #define main <renamed_main>
++     #include "path/to/production.c"
++     #undef main
++   - Then call the static target function directly from the test.
++   - If the production .c file is included in the test file, do NOT also compile
++     or link that same production .c separately, because that can cause duplicate
++     definitions or coverage mismatch.
++
++5. For non-static target functions:
++   - Either link the real production object or include the production .c.
++   - Do not declare or define a fake local copy of the function.
++
++6. Prevent premature process termination:
++   - If the target calls exit(), pmf_exit(), abort(), longjmp-like framework exits,
++     or similar terminating functions, add proper linker wrappers such as:
++     -Wl,--wrap=pmf_exit
++     -Wl,--wrap=exit
++   - Implement __wrap_<symbol>() in the test file so the test can continue.
++   - The wrapper should record arguments and return safely if possible.
++
++7. Wrappers must match actual called symbols:
++   - If production calls pmf_exit(), implement __wrap_pmf_exit().
++   - If production calls pmf_rmtimer(), implement __wrap_pmf_rmtimer().
++   - Make sure the Makefile contains the matching -Wl,--wrap=<symbol> flag.
++   - If a function is a macro that expands to another symbol, wrap or stub the expanded symbol, not only the macro name.
++
++8. Coverage must be generated from the object that contains the production code:
++   - Compile with --coverage or equivalent gcov flags.
++   - Run the test binary so .gcda files are produced.
++   - Run gcov on the .gcno file for the object that actually contains the included
++     or linked production source.
++   - The resulting .gcov must correspond to the real production source file.
++
++9. The generated gcov must prove execution:
++   - The target function must not show:
++     function <target> called 0
++     #####: lines in the target range
++   - It should show:
++     function <target> called 1 or more
++     numeric execution counts on the target lines
++
++10. Do not mistake successful build for successful coverage:
++   - A test that compiles but never calls the target is invalid.
++   - A test that initializes CUnit incorrectly and exits before running tests is invalid.
++   - A test that only verifies stub counters without reaching the target source is invalid.
++
++Before finishing, run:
++  make clean-test test
++
++Then verify:
++ - test binary executed
++ - CUnit tests ran
++ - .gcno exists
++ - .gcda exists after running the test
++ - .gcov exists
++ - target function has called count >= 1 in gcov
+ """
+ 
+         run_agent(
+             cfg,
+             unit_dir,
+             prompt,
+             f"{safe_id}_test_{int(time.time())}.json",
+             folder=repo_root,
+             history_dir=unit_dir / "agent_history",
+         )
+ 
+         if not _has_real_cu_add_test(unit_test_file):
+             no_test_prompt = f"""
+ The previous edit is invalid because the unit test still has no real CU_add_test().
+ 
+ Rewrite the unit test file from scratch. Do not preserve placeholder content.
+ 
+ UNIT TEST FILE TO REWRITE:
+  {unit_test_file}
+ 
+ TARGET SOURCE TO READ:
+  {source_file_abs}
+ 
+ TARGET LINE RANGE:
+  {func.get("start_line")} - {func.get("end_line")}
+ 
+ MASTER INTEGRATED TEST TO READ FOR WORKING WRAPPERS/STUBS/HELPERS:
+  {master_test_file}
+ 
+ MASTER MAKEFILE:
+  {master_makefile}
+ 
+ UNIT MAKEFILE:
+  {unit_makefile}
+ 
++GENERATED STUB DIRECTORY:
++ {stub_gen_dir}
++
+ VALIDATED GENERATED STUBS:
+ {_validated_stub_text()}
+ 
+@@ -3510,57 +3752,60 @@
+         # Only compile-fix when coverage is not good enough and make/test failed.
+         if not make_res["ok"]:
+             diag = _safe_build_diag(make_res)
++            last_build_diag = diag
+ 
+             compile_fix_prompt = prompt_for_compile_fix(
+                 str(unit_makefile),
+                 str(unit_test_file),
+                 diag,
+                 source_dir=str(cfg.source_dir.resolve()),
+                 source_makefile=source_makefile_for_compile_fix,
+                 actual_source_files=[str(p) for p in _project_source_files(cfg)],
+             )
+ 
+             compile_fix_prompt = f"""{compile_fix_prompt}
+ 
+ {_location_context(func_for_prompt=func_for_prompt, last_feedback=diag)}
+ 
+ COMPILE/RUNTIME FIX INSTRUCTIONS:
+ - You may edit:
+     {unit_test_file}
+     {unit_makefile}
+ 
+ - Use this master integrated test as reference for working wrappers/helpers:
+     {master_test_file}
+ 
+ - Use this production source:
+     {source_file_abs}
+ 
+ - Use generated stubs from:
+     {stub_gen_dir}
+ 
+ - Use the real source Makefile/header layout before changing declarations:
+     {source_makefile_for_compile_fix}
+ 
+ - Fix the compile/link/runtime issue with minimal changes.
+ - Preserve real CU_add_test registrations.
+ - Do not revert to an empty scaffold.
+ - If compile/runtime logs are missing, use the make_res object and current files
+-  to infer the failure.
++to infer the failure.
+ 
+ STRICT COMPILE-FIX RULES:
+ - Do not create fake project headers.
+ - Do not create spoof replacement headers with names matching real project headers.
+ - Do not invent typedefs, structs, enums, macros, globals, or prototypes that
+   already exist in the real project.
+ - Do not define fake production functions to satisfy the linker.
+ - Do not bypass the real production source under test.
+ - If a header is missing, fix INCLUDE/CPPFLAGS using the original Makefile or
+   real project include directories.
+ - If a macro is missing, find where the real build defines it and add the same
+   macro to this unit Makefile.
+ - If a type is missing, include the real header that defines it.
+ - If a symbol is unresolved, prefer adding the real source object/library or a
+-  real stub.
++  proper __wrap_<symbol>() wrapper over fake implementations.
++- Only add a local extern declaration when no usable real header exists and the
++  declaration matches the production source exactly.
+ """
+ 
+             run_agent(
+@@ -3652,14 +3897,17 @@
+                         cov_text = repr(cov)
+ 
+                     last_build_diag = f"""
+-Build succeeded after compile fix, but target coverage did not meet threshold.
++Build succeeded after compile_fix, but target coverage did not meet threshold.
+ 
+ Target:
+  {func_id}
+ 
+ Required threshold:
+  {cfg.coverage_threshold}
+ 
++Observed coverage:
++ {pct}
++
+ Coverage object:
+ {cov_text}
+ 
+@@ -3708,35 +3956,35 @@
+         write_json(
+             unit_dir / "unit_test_failed.json",
+             {
++                "passed": False,
+                 "func_id": func_id,
+                 "attempts": max_attempts,
+                 "coverage_pct": pct,
+                 "make_ok": last_make_ok,
+                 "last_judge": last_judge,
+                 "last_build_diag": last_build_diag,
+                 "unit_dir": str(unit_dir),
+             },
+         )
+     except Exception:
+         pass
+ 
+     print(
+         f"[pipeline] unit test FAILED after {max_attempts} attempts: "
+         f"{func_id} coverage={pct}% make_ok={last_make_ok}",
+         file=sys.stderr,
+     )
+ 
+     return func_id, {
+         "passed": False,
+         "coverage_pct": pct,
+         "semantic_score": None if not last_judge else last_judge.get("score"),
+         "verdict": last_judge,
+         "unit_dir": str(unit_dir),
+         "error": f"max attempts reached: {max_attempts}",
+         "last_make_ok": last_make_ok,
+     }
+ 
+-
+ def parallel_generate_unit_tests(
+     cfg: PipelineConfig,
+     paths: dict,

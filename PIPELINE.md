@@ -276,6 +276,114 @@ runtime crashes, not just compile errors.
 
 ---
 
+## OCR Diff Reconciliation Update
+
+This section records the later patch reconstructed from the printed/OCR diff and
+applied to `main.py`.
+
+### Coverage ownership
+
+- `check_function_coverage()` no longer runs `gcov` or deletes `test_*.gcov`.
+- Coverage generation and filtering are owned by the generated Makefiles.
+- `check_function_coverage()` only reads existing `.gcov` files and matches them
+  back to the production source via the `Source:` header.
+- Per-unit Makefiles now run `gcov` only for the object that can contain the
+  production code:
+  - `$(TEST_GCNO)` when the unit test includes the production `.c` directly.
+  - `$(PROD_OBJ:.o=.gcno)` when the production source is compiled separately.
+
+### Unit Makefile production-source mode
+
+`_generate_unit_test_makefile()` now detects whether the unit test already
+includes the production `.c` file.
+
+- If the production file is included in `TEST_SRCS`, the Makefile leaves
+  `PROD_OBJ` empty and does not separately compile/link `prod_under_test.o`.
+- If the production file is not included, the Makefile builds and links
+  `prod_under_test.o` as before.
+- Detection checks direct include paths, basenames, resolved relative suffixes,
+  and raw text fallbacks.
+- This prevents duplicate definitions and misleading gcov output from an
+  unexecuted duplicate production object.
+
+### Semantic judge and good backups
+
+- `_read_json_loose()` first attempts to parse the raw file as JSON before
+  stripping markdown fences or extracting an object from surrounding prose.
+- Semantic judge agent history files are named per retry:
+  `<safe_func_id>_semantic_judge_try_<n>.json`.
+- Best accepted CUnit backups moved from `_cunit_backups/` to
+  `agent_history/good_cunit_backups/`.
+- Best-backup timestamps are captured before the function id is read, matching
+  the reconstructed diff.
+- `_extract_coverage_pct()` now accepts `percent`, `coverage`, `pct`, and
+  `line_percent` keys.
+- Coverage-below-threshold results include the observed value and configured
+  threshold in the reason string.
+
+### Unit-agent prompt hardening
+
+The unit test generation prompt now includes a more explicit filesystem context:
+
+- `UNIT TEST GENERATION FILESYSTEM CONTEXT`
+- `FILES YOU MAY EDIT`
+- `FILES TO READ`
+- `BUILD / CONTENT RULES`
+- explicit production-source include example
+- strict instructions to avoid broad repository searches
+- explicit requirement to keep working until the target test file compiles and
+  produces a `.gcov`
+
+Additional content rules now require:
+
+- real CUnit initialization (`CU_initialize_registry`, suite/test registration,
+  `CU_basic_run_tests`)
+- at least one real `CU_add_test`
+- execution of the real target function or a real caller
+- no fake local target implementations
+- no separate production-object link when the production `.c` is directly
+  included in the test file
+- wrappers for terminating calls such as `pmf_exit`, `exit`, or `abort`
+- coverage proof that the target function was called and target lines are not
+  `#####`
+
+The no-test repair prompt also now lists the generated stub directory.
+
+### Compile-fix prompt updates
+
+- Missing headers, defines, libraries, and include-path failures should be fixed
+  in the unit Makefile first instead of only editing the test C file.
+- Compile/runtime diagnostics are cached in `last_build_diag` immediately after
+  `_safe_build_diag(make_res)`.
+- If diagnostic collection itself fails, the fallback text is labeled with
+  `[pipeline diagnostic fallback]`.
+- If no diagnostics are available, the prompt now says that `make_res` had no
+  readable output and no log files were found.
+- Compile-fix instructions prefer a real object/library or a proper
+  `__wrap_<symbol>()` over fake implementations.
+- Local `extern` declarations are allowed only when no usable real header exists
+  and the declaration exactly matches production source.
+
+### Failure metadata and scaffold details
+
+- `unit_test_failed.json` now includes `"passed": false`.
+- The placeholder unit test scaffold text was reformatted to match the
+  reconstructed diff.
+- Build-failed-after-compile-fix diagnostics now say `compile_fix` and include
+  the observed coverage value.
+
+### Reconstructed patch file
+
+The OCR-derived patch was rebuilt into `diff/reconstructed_main.patch` and
+validated with:
+
+```bash
+git apply --check diff/reconstructed_main.patch
+python3 -m py_compile main.py
+```
+
+---
+
 ## Config Reference
 
 | Flag | Default | Description |
