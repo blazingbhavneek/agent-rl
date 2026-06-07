@@ -1,0 +1,773 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from .config import PipelineConfig
+
+
+# region IO helpers
+
+def read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def append_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now().astimezone().isoformat()
+
+
+def _safe_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+
+
+def _read_json_loose(path: Path) -> dict:
+    """
+    Read JSON written by the agent.
+
+    Tolerates:
+    - surrounding text
+    - markdown json fences
+    - extra prose before/after object
+    """
+    if not path.exists():
+        return {}
+
+    raw = path.read_text(errors="ignore").strip()
+    if not raw:
+        return {}
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    raw2 = raw.strip()
+    raw2 = re.sub(r"^\s*```(?:json)?", "", raw2, flags=re.I).strip()
+    raw2 = re.sub(r"```\s*$", "", raw2).strip()
+
+    try:
+        return json.loads(raw2)
+    except Exception:
+        pass
+
+    start = raw2.find("{")
+    end = raw2.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw2[start:end + 1])
+        except Exception:
+            return {}
+
+    return {}
+
+# endregion IO helpers
+
+
+# region Source file helpers
+
+TEST_FILE_MARKERS = [
+    "/* === Includes === */",
+    "/* === Compatibility Definitions === */",
+    "/* === Test Globals === */",
+    "/* === Test Helpers === */",
+    "/* === Linker Wrapper Stubs === */",
+    "/* === Test Cases === */",
+    "/* === Test Registration === */",
+]
+
+
+def _project_source_files(cfg: PipelineConfig) -> list[Path]:
+    """
+    Return actual absolute .c files under cfg.source_dir.
+    """
+    source_dir = cfg.source_dir.resolve()
+    if source_dir.is_file() and source_dir.suffix == ".c":
+        return [source_dir]
+    if not source_dir.exists():
+        return []
+    return sorted(
+        p.resolve()
+        for p in source_dir.rglob("*.c")
+        if p.is_file()
+    )
+
+
+def _resolve_source_file(cfg: PipelineConfig, source_file: str | Path) -> Path:
+    source_dir = cfg.source_dir.resolve()
+    src = Path(source_file)
+    if src.is_absolute():
+        return src.resolve()
+    direct = (source_dir / src).resolve()
+    if direct.exists():
+        return direct
+    matches = sorted(
+        p.resolve()
+        for p in source_dir.rglob(src.name)
+        if p.is_file()
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        wanted_suffix = src.as_posix()
+        for m in matches:
+            if m.as_posix().endswith(wanted_suffix):
+                return m
+        return matches[0]
+    return direct
+
+
+def _source_files_json_for_prompt(cfg: PipelineConfig) -> str:
+    files = _project_source_files(cfg)
+    if not files:
+        return " (no .c files found under cfg.source_dir)"
+    return "\n".join(f" - {p}" for p in files)
+
+
+def _source_includes_for_test_file(cfg: PipelineConfig, test_file: Path) -> list[str]:
+    """
+    Build production #include lines using actual discovered source files.
+    Example: #include "../../src/dio100d/dio100d.c"
+    """
+    lines: list[str] = []
+    for src in _project_source_files(cfg):
+        rel = Path(os.path.relpath(src, start=test_file.parent)).as_posix()
+        lines.append(f'#include "{rel}"')
+    return lines
+
+# endregion Source file helpers
+
+
+# region Makefile wrap flag helpers
+
+def ensure_wrap_flag(makefile: Path, func_name: str) -> bool:
+    """Append -Wl,--wrap=<name> to WRAP_FUNCS if not already present."""
+    flag = f"-Wl,--wrap={func_name}"
+    text = read_text(makefile)
+    if flag in text:
+        return False
+    append_text(makefile, f"WRAP_FUNCS += {flag}\n")
+    return True
+
+
+def sync_wrap_flags(test_file: Path, makefile: Path) -> None:
+    """Ensure every __wrap_* symbol in the test file has a WRAP_FUNCS entry."""
+    text = read_text(test_file)
+    for name in re.findall(r'__wrap_(\w+)\b', text):
+        ensure_wrap_flag(makefile, name)
+
+# endregion Makefile wrap flag helpers
+
+
+# region Agent runner
+
+def _snapshot_dir(d: Path) -> dict[Path, bytes]:
+    snap: dict[Path, bytes] = {}
+    try:
+        for f in d.rglob("*"):
+            if f.is_file():
+                try:
+                    snap[f] = f.read_bytes()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return snap
+
+
+def _restore_from_snapshot(snap: dict[Path, bytes], protect_dir: Path) -> None:
+    for f, orig in snap.items():
+        try:
+            if f.exists() and f.read_bytes() != orig:
+                f.write_bytes(orig)
+                print(f"[pipeline] GUARD: restored {f}", file=sys.stderr)
+        except OSError:
+            pass
+    try:
+        for f in protect_dir.rglob("*"):
+            if f.is_file() and f not in snap:
+                try:
+                    f.unlink()
+                    print(f"[pipeline] GUARD: deleted agent-created file {f}", file=sys.stderr)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def run_agent(
+    cfg: PipelineConfig,
+    work_dir: Path,
+    prompt: str,
+    history_name: str,
+    *,
+    folder: Optional[Path] = None,
+    history_dir: Optional[Path] = None,
+    max_iterations: Optional[int] = None,
+    timeout_sec: Optional[int] = None,
+    protect_source: bool = True,
+) -> dict:
+    """Invoke agent.js with an external prompt."""
+    agent_folder = folder or work_dir
+    hist_dir = history_dir or (work_dir / "agent_history")
+    history_path = hist_dir / history_name
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    prompt_file = history_path.with_suffix(".prompt.txt")
+    write_text(prompt_file, prompt)
+
+    cmd = [
+        "node", str(cfg.agent_js),
+        "--folder", str(agent_folder),
+        "--prompt-file", str(prompt_file),
+        "--history", str(history_path),
+        "--capture-raw-http-trace",
+    ]
+
+    env = os.environ.copy()
+    env["MAX_ITERATIONS"] = str(
+        max_iterations if max_iterations is not None else cfg.max_agent_iterations
+    )
+    env["PYTHON_BIN"] = cfg.python_bin
+
+    actual_timeout = timeout_sec if timeout_sec is not None else cfg.agent_timeout_sec
+
+    if cfg.dry_run:
+        print(f"[pipeline][dry-run] would run: {' '.join(cmd)}", file=sys.stderr)
+        return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    _protect_dir = cfg.source_dir.parent.resolve() if protect_source else None
+    _snap = _snapshot_dir(_protect_dir) if _protect_dir is not None else {}
+
+    print(f"[pipeline] agent -> {history_name}", file=sys.stderr)
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(work_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=actual_timeout,
+        )
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc = None
+
+    elapsed = time.time() - t0
+    res = {
+        "exit_code": proc.returncode if proc else -1,
+        "stdout": (proc.stdout if proc else "")[:4000],
+        "stderr": (proc.stderr if proc else "")[:4000],
+        "timed_out": timed_out,
+        "elapsed": elapsed,
+    }
+    write_json(history_path.with_suffix(".result.json"), res)
+    print(
+        f"[pipeline] agent exit={res['exit_code']} "
+        f"elapsed={elapsed:.1f}s timed_out={timed_out}",
+        file=sys.stderr,
+    )
+    if _snap:
+        _restore_from_snapshot(_snap, _protect_dir)
+    return res
+
+# endregion Agent runner
+
+
+# region Build & coverage
+
+def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
+    cmd = ["make", "test"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(test_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": -1, "stdout": "",
+            "stderr": f"make test timed out after {timeout}s", "timed_out": True}
+
+
+def check_function_coverage(
+    test_dir: Path,
+    source_file: str | Path,
+    start_line: int,
+    end_line: int,
+    source_root: Optional[Path] = None,
+) -> Optional[dict]:
+    """
+    Check coverage for original production source.
+    Ignores test_*.c.gcov.
+    Matches .gcov by Source: header.
+    """
+    test_dir = Path(test_dir).resolve()
+    source_abs = Path(source_file).resolve()
+    if source_root is not None:
+        source_root = Path(source_root).resolve()
+
+    gcov_files = sorted(test_dir.glob("*.gcov"))
+
+    def _gcov_source(gcov_file: Path) -> Optional[Path]:
+        try:
+            lines = read_text(gcov_file).splitlines()
+        except Exception:
+            return None
+        for line in lines[:40]:
+            if "Source:" not in line:
+                continue
+            raw = line.split("Source:", 1)[1].strip()
+            p = Path(raw)
+            if p.is_absolute():
+                return p.resolve()
+            return (test_dir / p).resolve()
+        return None
+
+    matched_gcov = None
+    print(f"[pipeline] coverage wanted source: {source_abs}", file=sys.stderr)
+    for gcov_file in gcov_files:
+        src = _gcov_source(gcov_file)
+        print(
+            f"[pipeline] coverage candidate: {gcov_file.name} -> {src}",
+            file=sys.stderr,
+        )
+        if src is None:
+            continue
+        try:
+            src.relative_to(test_dir)
+            continue
+        except ValueError:
+            pass
+        if src.name.startswith("test_"):
+            continue
+        if source_root is not None:
+            try:
+                src.relative_to(source_root)
+            except ValueError:
+                continue
+        if src == source_abs:
+            matched_gcov = gcov_file
+            break
+
+    if matched_gcov is None:
+        print(
+            "[pipeline] coverage: no matching production .gcov found\n"
+            f" wanted source: {source_abs}\n"
+            f" source_root: {source_root}\n"
+            f" gcov files:\n"
+            + "\n".join(f"    - {p}" for p in gcov_files),
+            file=sys.stderr,
+        )
+        return None
+
+    covered_lines = 0
+    executable_lines = 0
+    for line in read_text(matched_gcov).splitlines():
+        m = re.match(r"^\s*([^:]+):\s*(\d+):", line)
+        if not m:
+            continue
+        count_text = m.group(1).strip()
+        line_no = int(m.group(2))
+        if line_no < start_line or line_no > end_line:
+            continue
+        if count_text == "-":
+            continue
+        executable_lines += 1
+        if count_text in ("#####", "====="):
+            continue
+        try:
+            count = int(count_text.rstrip("*"))
+        except ValueError:
+            count = 0
+        if count > 0:
+            covered_lines += 1
+
+    coverage_percent = (
+        0.0
+        if executable_lines == 0
+        else (covered_lines / executable_lines) * 100.0
+    )
+
+    return {
+        "source_file": str(source_abs),
+        "gcov_file": str(matched_gcov),
+        "range": {
+            "start_line": start_line,
+            "end_line": end_line,
+        },
+        "summary": {
+            "covered_lines": covered_lines,
+            "executable_lines": executable_lines,
+            "coverage_percent": coverage_percent,
+        },
+    }
+
+# endregion Build & coverage
+
+
+# region Diagnostics
+
+def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
+    chunks: list[str] = []
+
+    test_binary_name = Path(test_file).stem
+    test_bin = test_dir / test_binary_name
+
+    chunks.append("AUTOMATIC FAILURE DIAGNOSTICS")
+    chunks.append(f"test_dir: {test_dir}")
+    chunks.append(f"test_file: {test_file}")
+    chunks.append(f"test_binary: {test_bin}")
+
+    base_output = (res.get("stderr") or "") + "\n---\n" + (res.get("stdout") or "")
+    chunks.append("\n--- original make/test output ---")
+    chunks.append(base_output[-30000:])
+
+    for name in [
+        f"{test_binary_name}_log.txt",
+        f"{test_binary_name}_report.txt",
+    ]:
+        p = test_dir / name
+        if p.exists():
+            try:
+                chunks.append(f"\n--- {name} ---")
+                chunks.append(p.read_text(errors="ignore")[-12000:])
+            except Exception as e:
+                chunks.append(f"\n--- {name} unreadable: {e} ---")
+
+    if not test_bin.exists():
+        chunks.append(
+            "\n--- binary check ---\n"
+            "Test binary does not exist. This is likely a compile or link failure."
+        )
+        return "\n".join(chunks)
+
+    try:
+        direct = subprocess.run(
+            [str(test_bin)],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            f"returncode={direct.returncode}\n"
+            f"stdout:\n{direct.stdout[-8000:]}\n"
+            f"stderr:\n{direct.stderr[-8000:]}"
+        )
+    except subprocess.TimeoutExpired:
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            "Timed out after 20 seconds. This is likely a runtime hang/blocking call."
+        )
+    except Exception as e:
+        chunks.append(f"\n--- direct binary run failed ---\n{e}")
+
+    try:
+        gdb = subprocess.run(
+            [
+                "gdb", "-q", "-batch",
+                "-ex", "set pagination off",
+                "-ex", "run",
+                "-ex", "bt",
+                "-ex", "bt full",
+                "--args", str(test_bin),
+            ],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=40,
+        )
+        chunks.append(
+            "\n--- gdb backtrace ---\n"
+            f"returncode={gdb.returncode}\n"
+            f"stdout:\n{gdb.stdout[-20000:]}\n"
+            f"stderr:\n{gdb.stderr[-8000:]}"
+        )
+    except FileNotFoundError:
+        chunks.append("\n--- gdb backtrace ---\ngdb not installed.")
+    except subprocess.TimeoutExpired:
+        chunks.append("\n--- gdb backtrace ---\ngdb timed out after 40 seconds.")
+    except Exception as e:
+        chunks.append(f"\n--- gdb backtrace failed ---\n{e}")
+
+    return "\n".join(chunks)
+
+
+def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> str:
+    chunks: list[str] = []
+    test_bin = test_dir / test_binary_name
+
+    chunks.append("RUNTIME DIAGNOSTICS")
+    chunks.append(f"test_dir: {test_dir}")
+    chunks.append(f"test_binary: {test_bin}")
+
+    for name in [f"{test_binary_name}_log.txt", f"{test_binary_name}_report.txt"]:
+        p = test_dir / name
+        if p.exists():
+            try:
+                chunks.append(
+                    f"\n--- {name} ---\n"
+                    f"{p.read_text(errors='ignore')[-12000:]}"
+                )
+            except Exception as e:
+                chunks.append(f"\n--- {name} unreadable: {e} ---")
+
+    if not test_bin.exists():
+        chunks.append(
+            "\n--- binary check ---\n"
+            "Test binary does not exist. This is probably a compile/link failure, "
+            "not a runtime crash."
+        )
+        return "\n".join(chunks)
+
+    try:
+        direct = subprocess.run(
+            [str(test_bin)],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            f"returncode={direct.returncode}\n"
+            f"stdout:\n{direct.stdout[-8000:]}\n"
+            f"stderr:\n{direct.stderr[-8000:]}"
+        )
+    except subprocess.TimeoutExpired:
+        chunks.append(
+            "\n--- direct binary run ---\n"
+            "Timed out after 20 seconds. The test binary may be hanging."
+        )
+    except Exception as e:
+        chunks.append(f"\n--- direct binary run failed ---\n{e}")
+
+    try:
+        gdb = subprocess.run(
+            [
+                "gdb", "-q", "-batch",
+                "-ex", "set pagination off",
+                "-ex", "run",
+                "-ex", "bt",
+                "-ex", "bt full",
+                "--args", str(test_bin),
+            ],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=40,
+        )
+        chunks.append(
+            "\n--- gdb backtrace ---\n"
+            f"returncode={gdb.returncode}\n"
+            f"stdout:\n{gdb.stdout[-20000:]}\n"
+            f"stderr:\n{gdb.stderr[-8000:]}"
+        )
+    except FileNotFoundError:
+        chunks.append("\n--- gdb backtrace ---\ngdb not installed.")
+    except subprocess.TimeoutExpired:
+        chunks.append("\n--- gdb backtrace ---\ngdb timed out after 40 seconds.")
+    except Exception as e:
+        chunks.append(f"\n--- gdb backtrace failed ---\n{e}")
+
+    return "\n".join(chunks)
+
+
+def build_output_with_runtime_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
+    base_output = collect_failure_diagnostics(test_dir, test_file, res)
+    test_binary_name = Path(test_file).stem
+    diagnostics = collect_runtime_crash_diagnostics(test_dir, test_binary_name)
+
+    return (
+        base_output
+        + "\n\n==================== RUNTIME / EXECUTION DIAGNOSTICS ====================\n"
+        + diagnostics
+        + "\n======================\n"
+        + "\nNOTE TO AGENT:\n"
+        + "- If compilation/link failed, fix the compile/link error first.\n"
+        + "- If the binary exists and direct run or gdb shows a crash, fix that runtime crash.\n"
+        + "- For segfaults, inspect the backtrace and likely wrapper/mock/global pointer cause.\n"
+        + "- Do not treat a runtime segfault as a normal compiler error.\n"
+    )
+
+# endregion Diagnostics
+
+
+# region Shared prompt
+
+def prompt_for_compile_fix(
+    makefile: str,
+    test_file: str,
+    build_output: str,
+    source_dir: Optional[str] = None,
+    source_makefile: Optional[str] = None,
+    actual_source_files: Optional[list[str]] = None,
+) -> str:
+    source_dir_text = source_dir or "(not provided)"
+    source_makefile_text = source_makefile or "(not provided)"
+    if actual_source_files:
+        actual_source_files_text = "\n".join(f" - {p}" for p in actual_source_files)
+    else:
+        actual_source_files_text = " (not provided)"
+
+    return f"""
+
+The CUnit test failed to compile, link, or run.
+
+Fix the failure shown in the output below. It may be a compiler error, linker error, CUnit assertion failure, runtime crash, segfault, abort, or other execution failure.
+
+After fix, make sure to compile them again and run them to make sure its ok now.
+
+FILES YOU MAY EDIT
+- Test Makefile:
+  `{makefile}`
+- Test C file:
+  `{test_file}`
+
+TEST HARNESS FIXING RULES
+You are expected to fix the test harness, not production code.
+
+You MAY change:
+- the test C file,
+- wrapper stubs,
+- mock return values,
+- fake/static test data,
+- test setup/reset functions,
+- local prototypes used only by the test,
+- linker wrap flags in the test Makefile,
+- include/compiler/linker settings in the test Makefile if needed.
+
+You MUST NOT change:
+- production source files,
+- production headers,
+- original source Makefile,
+- generated external dependencies,
+- system headers.
+
+Important:
+- Wrapper/stub signatures may be wrong. Inspect the real function prototypes and fix wrappers to match exactly.
+- Mock return values may be wrong. If production dereferences a returned pointer, return valid static fake storage.
+- Global fake data may be uninitialized. Initialize required fake globals in reset/setup or mock open/init functions.
+- Linker wrap flags may be missing or stale. Preserve existing wrap flags, but add/remove test Makefile wrap flags if required by the test harness.
+- If the failure is a missing header, define, library, or include-path issue, fix the unit Makefile first instead of only changing the test C file.
+- Do not call `__real_*` from wrappers.
+- Do not hide crashes by deleting assertions or replacing them with always-pass assertions.
+- Do not edit production code to make the test pass.
+
+REFERENCE LOCATIONS
+- Source folder passed by user:
+  `{source_dir_text}`
+- Original source Makefile:
+  `{source_makefile_text}`
+
+ACTUAL SOURCE FILES
+{actual_source_files_text}
+
+CRITICAL PATH RULES
+- Do NOT invent source paths.
+- Do NOT guess `src/<process>.c`.
+- Do NOT guess a sibling file like:
+  `source_dir.parent / "<process>.c"`
+- Use only the actual source files listed above.
+- If the test file includes production code, include from actual files under:
+  `{source_dir_text}`
+
+MAKEFILE RULE
+The test Makefile should be based on:
+```bash
+cd <test_dir> && do_mkmf <source_folder>
+```
+Do NOT replace the whole Makefile.
+If compile errors show missing headers, flags, defines, or libraries:
+1. Read the original source Makefile:
+   `{source_makefile_text}`
+2. Copy or append missing relevant settings from the source Makefile into the test Makefile:
+   - CFLAGS
+   - CFLAGS_LINUX
+   - CPPFLAGS
+   - INCLUDE
+   - LDFLAGS
+   - LDLIBS
+   - LIBS
+3. Preserve existing do_mkmf-generated content.
+4. Preserve existing WRAP_FUNCS and wrapper flags.
+
+FAILING `make test` OUTPUT
+{build_output}
+
+COMMON FIXES
+- Missing header:
+  copy/include correct `INCLUDE += -I...` path from source Makefile.
+- Missing macro/type:
+  copy needed `CFLAGS += -D...` or include path from source Makefile.
+- Missing library:
+  copy needed `LDFLAGS`, `LDLIBS`, or `LIBS`.
+- Stub signature mismatch:
+  fix wrapper signature in `{test_file}`.
+- Missing local prototype/type for wrapper:
+  define it inside `{test_file}`, above `/* === Linker Wrapper Stubs === */`.
+
+STRICT RULES
+- You may edit only:
+  - `{makefile}`
+  - `{test_file}`
+- Do NOT edit production source.
+- Do NOT edit production headers.
+- Do NOT create extra dependency headers.
+- Preserve all existing tests and stubs.
+- Do not call `__real_*` from wrappers.
+
+After editing, run:
+make test
+
+When done, call submit_and_exit.
+"""
+
+# endregion Shared prompt

@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+from .config import PipelineConfig
+from .common import (
+    _project_source_files,
+    append_text,
+    load_json,
+    read_text,
+    sync_wrap_flags,
+    write_json,
+    write_text,
+)
+
+
+def parse_source_makefile_flags(source_makefile: Path) -> dict:
+    """Extract build flags from Makefile assignments, including continuations."""
+    text = read_text(source_makefile)
+    flags: dict[str, str] = {}
+    wanted = {"CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"}
+    current: Optional[str] = None
+
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:+?]?=\s*(.*)$", line)
+        if m and m.group(1) in wanted:
+            current = m.group(1)
+            val = m.group(2).strip().rstrip("\\").strip()
+            if val:
+                flags[current] = (flags.get(current, "") + " " + val).strip()
+            if not line.rstrip().endswith("\\"):
+                current = None
+            continue
+
+        if current:
+            val = line.strip().rstrip("\\").strip()
+            if val and not val.startswith("#"):
+                flags[current] = (flags.get(current, "") + " " + val).strip()
+            if not line.rstrip().endswith("\\"):
+                current = None
+
+    return flags
+
+
+def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
+    """
+    Stage 0: create annotated master Makefile + write _pipeline_context.json.
+
+    Returns extracted flags dict so every downstream stage can use them
+    without re-reading the Makefile.
+
+    Skips Makefile rebuild if _pipeline_context.json already exists.
+    """
+    test_dir: Path = paths["test_dir"]
+    context_file = test_dir / "_pipeline_context.json"
+    if context_file.exists():
+        try:
+            ctx = load_json(context_file)
+            print("[pipeline] Stage 0: using cached _pipeline_context.json", file=sys.stderr)
+            return ctx.get("flags", {})
+        except Exception:
+            pass
+    test_file: Path = paths["test_file"]
+    makefile: Path = paths["makefile"]
+    process_name: str = paths["process_name"]
+
+    source_dir = cfg.source_dir.resolve()
+    source_makefile = source_dir / "Makefile"
+
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run_do_mkmf() -> None:
+        print(
+            f"[pipeline] generating Makefile with: cd {test_dir} && do_mkmf {source_dir}",
+            file=sys.stderr,
+        )
+        res = subprocess.run(
+            ["do_mkmf", str(source_dir)],
+            cwd=str(test_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                "do_mkmf failed\n"
+                f"command: cd {test_dir} && do_mkmf {source_dir}\n"
+                f"exit={res.returncode}\n"
+                f"stdout:\n{res.stdout}\n"
+                f"stderr:\n{res.stderr}\n"
+            )
+        if not makefile.exists():
+            raise RuntimeError(
+                "do_mkmf completed but Makefile was not created\n"
+                f"test_dir={test_dir}\n"
+                f"stdout:\n{res.stdout}\n"
+                f"stderr:\n{res.stderr}\n"
+            )
+
+    if not makefile.exists():
+        _run_do_mkmf()
+    else:
+        text = read_text(makefile)
+        trash_markers = [
+            "# === Auto-generated CUnit pipeline rules ===",
+            "# === End Auto-generated CUnit pipeline rules ===",
+        ]
+        if any(marker in text for marker in trash_markers):
+            backup = makefile.with_name("Makefile.bad_pipeline_backup")
+            write_text(backup, text)
+            makefile.unlink()
+            print(
+                f"[pipeline] backed up bad generated Makefile to: {backup}",
+                file=sys.stderr,
+            )
+            _run_do_mkmf()
+        else:
+            print(
+                f"[pipeline] using existing Makefile template: {makefile}",
+                file=sys.stderr,
+            )
+
+    production_srcs: list[str] = []
+    for src in _project_source_files(cfg):
+        rel = Path(os.path.relpath(src.resolve(), start=test_dir)).as_posix()
+        production_srcs.append(rel)
+    production_srcs_text = " ".join(production_srcs)
+
+    print(f"[pipeline] source folder: {source_dir}", file=sys.stderr)
+    print(f"[pipeline] source Makefile: {source_makefile}", file=sys.stderr)
+    print("[pipeline] production source files for gcov:", file=sys.stderr)
+    if production_srcs:
+        for src in production_srcs:
+            print(f" - {src}", file=sys.stderr)
+    else:
+        print(" (none found)", file=sys.stderr)
+
+    flags = parse_source_makefile_flags(source_makefile) if source_makefile.exists() else {}
+    merged_flag_keys = ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]
+    merged_flag_lines: list[str] = []
+    for key in merged_flag_keys:
+        value = (flags or {}).get(key)
+        if value:
+            merged_flag_lines.append(f"{key} += {value}")
+    merged_flag_block = "\n".join(merged_flag_lines)
+
+    test_program = test_file.stem
+    test_src = test_file.name
+
+    block_start = f"# === TEST TARGET FOR {process_name} ==="
+    block_end = f"# === END TEST TARGET FOR {process_name} ==="
+
+    test_block = f"""
+{block_start}
+# TODO: review merged source Makefile flags below and keep the unit build aligned with production.
+{merged_flag_block}
+TEST_PROGRAM = {test_program}
+TEST_SRCS = {test_src}
+PRODUCTION_SRCS = {production_srcs_text}
+TEST_LIBS += -lcunit
+TEST_REPORT_FILE = {test_program}_report.txt
+TEST_LOG_FILE = {test_program}_log.txt
+COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
+WRAP_FLAGS = $(WRAP_FUNCS)
+
+.PHONY: test clean-test coverage-test
+
+test: clean-test $(TEST_PROGRAM)
+\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE)
+\t$(MAKE) coverage-test
+
+$(TEST_PROGRAM): $(TEST_SRCS)
+\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) -o $(TEST_PROGRAM) \\
+\t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
+\t-Wl,--gc-sections \\
+\t$(WRAP_FLAGS)
+
+coverage-test:
+\t@gcov -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
+
+clean-test:
+\trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
+{block_end}
+""".strip() + "\n"
+
+    import re as _re
+    text = read_text(makefile)
+    pattern = _re.compile(
+        rf"{_re.escape(block_start)}.*?{_re.escape(block_end)}",
+        _re.DOTALL,
+    )
+    if pattern.search(text):
+        new_text = pattern.sub(test_block.strip(), text)
+    else:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        new_text = text + "\n" + test_block
+
+    if new_text != text:
+        write_text(makefile, new_text)
+
+    write_json(context_file, {
+        "process_name": process_name,
+        "source_dir": str(source_dir),
+        "source_makefile": str(source_makefile),
+        "actual_source_files": [str(p) for p in _project_source_files(cfg)],
+        "flags": flags,
+        "test_dir": str(paths["test_dir"]),
+        "test_file": str(paths["test_file"]),
+        "makefile": str(makefile),
+    })
+    sync_wrap_flags(paths["test_file"], makefile)
+    print(f"[pipeline] Stage 0: Makefile + context ready: {makefile}", file=sys.stderr)
+    return flags
