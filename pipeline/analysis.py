@@ -48,6 +48,9 @@ def functions_leaf_first(analysis: dict) -> list[dict]:
     for f in analysis.get("functions", []) or []:
         index[f["id"]] = f
 
+    # Sort descending: highest depth = leaves (deepest callees) come first.
+    # depth=0 is the entry-point root; tests are generated leaf-to-root so
+    # lower-level behavior is proven before the callers that depend on it.
     ordered: list[dict] = []
     for depth in sorted(levels.keys(), reverse=True):
         for fid in levels[depth]:

@@ -97,6 +97,10 @@ def integrate_all_unit_tests_sequential(
         write_text(test_file, current)
         sync_wrap_flags(test_file, makefile)
 
+        # Syntax-check the master test file after each merge.
+        # gcc -fsyntax-only is much faster than a full build + link and is
+        # enough to catch declaration conflicts or missing types introduced
+        # by the newly pasted test code.
         attempt = 1
         while True:
             chk = subprocess.run(

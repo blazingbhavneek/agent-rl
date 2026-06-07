@@ -16,7 +16,9 @@ class PipelineConfig:
     max_agent_iterations: int = 25
     max_compile_fix_attempts: int = 5
     max_test_attempts: int = 4
+    # Skip a function if it already has line coverage >= this value.
     coverage_threshold: float = 80.0
+    # Stubs are integrated one-at-a-time; kept for forward-compat.
     stub_batch_size: int = 8
     only_function: Optional[str] = None
     only_level: Optional[int] = None

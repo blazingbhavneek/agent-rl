@@ -337,6 +337,10 @@ def _validate_stub_locally(
         except Exception:
             pass
 
+    # The harness is intentionally shallow: a weak no-arg dummy satisfies the
+    # linker so --wrap redirects the call to __wrap_<func>. Real argument-type
+    # compatibility is checked in Stage 2 when the stub is linked against
+    # production code that includes the real headers.
     harness = f"""#include <stdio.h>
 /* Weak dummy — linker needs a real {func_name} to wrap; --wrap redirects calls to __wrap */
 __attribute__((weak)) int {func_name}() {{ return 0; }}
@@ -537,6 +541,9 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
         if cached:
             bodies[n] = cached
 
+    # Phase 1: generate stub bodies in parallel until every candidate has a
+    # validated body. Each round runs up to 6 concurrent agent calls.
+    # Already-cached stubs are skipped (loaded above).
     gen_round = 1
     while True:
         to_gen = [
@@ -566,6 +573,8 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
                     print(f"[pipeline] NO body: {name} round {gen_round}", file=sys.stderr)
         gen_round += 1
 
+    # Phase 2: integrate validated stubs one-at-a-time into the master test file.
+    # make test is run after each stub is inserted; failures are fixed by agent.
     context_file = test_dir / "_pipeline_context.json"
     flags: dict = {}
     if context_file.exists():

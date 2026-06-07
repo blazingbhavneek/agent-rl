@@ -8,6 +8,7 @@
 /local-sdk-test/node_modules/
 /local-sdk-test/history.json
 /tmp/
+/third_party/SPARK/
 .DS_Store
 cline/
 __pycache__

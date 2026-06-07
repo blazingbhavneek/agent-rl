@@ -108,6 +108,12 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
     repo_root = cfg.source_dir.parent.parent.resolve()
     entry_sym = f"{process_name}_entry_main"
 
+    # Strategy:
+    # 1. Try the current test as-is first — avoid touching it if it already works.
+    # 2. If it fails: ask the agent to add minimal startup stubs/tests.
+    # 3. If the binary hangs (timeout): specifically ask for blocking-stub fixes.
+    # 4. If compile/link/runtime error: run generic compile-fix agent.
+    # Loop until the binary compiles, runs, terminates, and passes.
     print(
         f"[pipeline] minimal test phase: checking existing test binary first",
         file=sys.stderr,

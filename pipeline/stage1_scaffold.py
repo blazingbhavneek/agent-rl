@@ -94,12 +94,11 @@ int main(void)
     text = read_text(test_file)
     changed = False
 
-    # Ensure includes marker exists.
+    # Ensure the includes section marker exists (may be missing in very old scaffolds).
     if TEST_FILE_MARKERS[0] not in text:
         text = TEST_FILE_MARKERS[0] + "\n" + text
         changed = True
 
-    # Add any missing actual production includes.
     missing_includes = [
         line for line in production_include_lines
         if line not in text
@@ -107,6 +106,8 @@ int main(void)
     if missing_includes:
         has_define = define_main in text
         if has_define:
+            # Case A: #define main already present — insert new #includes right after it
+            # so they stay inside the define/undef rename block.
             new_inc_block = "\n".join(missing_includes) + "\n"
             text = text.replace(
                 define_main + "\n",
@@ -114,6 +115,7 @@ int main(void)
                 1,
             )
         else:
+            # Case B: no #define main yet — wrap the new includes in a full define/undef block.
             insertion = (
                 f"\n/* Production sources — main renamed so CUnit owns int main(void). */\n"
                 f"{define_main}\n"
@@ -123,6 +125,8 @@ int main(void)
             text = text.replace(TEST_FILE_MARKERS[0], TEST_FILE_MARKERS[0] + insertion, 1)
         changed = True
     elif define_main not in text and any(ln in text for ln in production_include_lines):
+        # Case C: includes are present but the #define main wrapper is missing.
+        # This can happen if the file was hand-edited. Re-wrap them.
         present = [ln for ln in production_include_lines if ln in text]
         if present:
             text = text.replace(present[0], f"{define_main}\n{present[0]}", 1)
@@ -133,7 +137,7 @@ int main(void)
                 text = text[:end] + "\n#undef main" + text[end:]
             changed = True
 
-    # Ensure all markers exist.
+    # Ensure all section markers exist (append any that are missing at end of file).
     for marker in TEST_FILE_MARKERS:
         if marker not in text:
             text += f"\n\n{marker}\n"

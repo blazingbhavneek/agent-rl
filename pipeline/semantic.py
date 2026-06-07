@@ -547,6 +547,9 @@ def backup_good_cunit_if_best(
     best_meta = _load_best_backup_meta(unit_dir, func)
     old_best = int(best_meta.get("score") or -1)
 
+    # Only keep a backup when the new score beats the previous best.
+    # This ensures agent_history/good_cunit_backups/latest_best always
+    # points to the highest-scoring test we have seen so far.
     if score < old_best:
         return
     ts = int(time.time())
@@ -611,6 +614,15 @@ def judge_and_backup_if_covered(
     coverage_pct: Optional[float],
     make_result: dict,
 ) -> dict:
+    """
+    Run the semantic judge and back up the test if it passes.
+
+    Returns a dict with keys:
+      covered  – True if coverage_pct >= threshold
+      accepted – True if the judge also passed
+      judge_verdict – raw verdict dict (or None)
+      reason   – short human-readable explanation
+    """
     if coverage_pct is None:
         return {
             "covered": False,

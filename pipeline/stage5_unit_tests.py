@@ -692,13 +692,16 @@ Dont exit until you have written the test code in target test file and made sure
             pass
 
     last_make_ok = True
-    cov: Optional[dict] = None
-    pct: Optional[float] = None
+    # coverage_result: raw gcov dict returned by check_function_coverage().
+    # coverage_pct:   line-coverage % for the target function's line range.
+    coverage_result: Optional[dict] = None
+    coverage_pct: Optional[float] = None
     last_build_diag: Optional[str] = None
 
     max_attempts = int(getattr(cfg, "max_unit_test_attempts", 4) or 4)
 
-    # Fast path: if existing test already gives valid coverage, start from judge.
+    # === Fast path: if an existing test already has sufficient coverage, skip
+    # straight to the semantic judge instead of re-generating from scratch.
     if unit_test_file.exists() and unit_makefile.exists() and _has_real_cu_add_test(unit_test_file):
         try:
             _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
@@ -707,11 +710,11 @@ Dont exit until you have written the test code in target test file and made sure
             existing_make_res = run_make_test(unit_dir)
             last_make_ok = bool(existing_make_res.get("ok"))
 
-            cov, pct = _run_current_coverage()
+            coverage_result, coverage_pct = _run_current_coverage()
 
-            if pct is not None and pct >= float(cfg.coverage_threshold):
+            if coverage_pct is not None and coverage_pct >= float(cfg.coverage_threshold):
                 print(
-                    f"[pipeline] existing test has coverage={pct}%, starting from semantic judge: {func_id}",
+                    f"[pipeline] existing test has coverage={coverage_pct}%, starting from semantic judge: {func_id}",
                     file=sys.stderr,
                 )
 
@@ -725,7 +728,7 @@ Dont exit until you have written the test code in target test file and made sure
                     process_name=process_name,
                     test_file=unit_test_file,
                     func=func_for_prompt,
-                    coverage=cov or {},
+                    coverage=coverage_result or {},
                     make_result=existing_make_res or {},
                 )
 
@@ -734,14 +737,14 @@ Dont exit until you have written the test code in target test file and made sure
                     unit_test_file=unit_test_file,
                     unit_makefile=unit_makefile,
                     func=func_for_prompt,
-                    coverage_pct=pct,
-                    coverage=cov or {},
+                    coverage_pct=coverage_pct,
+                    coverage=coverage_result or {},
                     make_result=existing_make_res or {},
                     judge_verdict=judge,
                     cfg=cfg,
                 )
 
-                write_json(coverage_file, cov or {})
+                write_json(coverage_file, coverage_result or {})
                 write_json(judge_verdict_file, judge)
                 last_judge = judge
 
@@ -752,7 +755,7 @@ Dont exit until you have written the test code in target test file and made sure
                     )
                     return func_id, {
                         "passed": True,
-                        "coverage_pct": pct,
+                        "coverage_pct": coverage_pct,
                         "semantic_score": judge.get("score"),
                         "verdict": judge,
                         "unit_dir": str(unit_dir),
@@ -778,6 +781,11 @@ Dont exit until you have written the test code in target test file and made sure
 
     attempt = 1
 
+    # === Main generation loop ===
+    # Each attempt: run agent → verify CU_add_test exists → build → check coverage → judge.
+    # If coverage meets threshold: run semantic judge; pass on score >= min_score.
+    # If build fails: run compile-fix agent, then re-check coverage.
+    # If coverage stays below threshold: feed diagnostics into next attempt.
     while attempt <= max_attempts:
         source_file_abs = _resolve_source_file(cfg, func["source_file"])
         func_for_prompt = {**func, "source_file": str(source_file_abs)}
@@ -793,14 +801,14 @@ Dont exit until you have written the test code in target test file and made sure
                 process_name=process_name,
                 test_file=str(unit_test_file),
                 func=func_for_prompt,
-                coverage=cov or {},
+                coverage=coverage_result or {},
                 judge_verdict=last_judge,
                 semantic_context=semantic_context,
             )
         else:
             prompt = prompt_for_function_test_with_semantic_context(
                 func=func_for_prompt,
-                coverage=cov or {},
+                coverage=coverage_result or {},
                 test_file=str(unit_test_file),
                 process_name=process_name,
                 attempt=attempt,
@@ -1012,9 +1020,9 @@ PREVIOUS FAILURE CONTEXT:
         make_res = run_make_test(unit_dir)
         last_make_ok = bool(make_res.get("ok"))
 
-        cov, pct = _run_current_coverage()
+        coverage_result, coverage_pct = _run_current_coverage()
 
-        if pct is not None and pct >= float(cfg.coverage_threshold):
+        if coverage_pct is not None and coverage_pct >= float(cfg.coverage_threshold):
             judge = run_semantic_test_judge(
                 cfg,
                 test_dir=unit_dir,
@@ -1022,7 +1030,7 @@ PREVIOUS FAILURE CONTEXT:
                 process_name=process_name,
                 test_file=unit_test_file,
                 func=func_for_prompt,
-                coverage=cov or {},
+                coverage=coverage_result or {},
                 make_result=make_res or {},
             )
 
@@ -1031,14 +1039,14 @@ PREVIOUS FAILURE CONTEXT:
                 unit_test_file=unit_test_file,
                 unit_makefile=unit_makefile,
                 func=func_for_prompt,
-                coverage_pct=pct,
-                coverage=cov or {},
+                coverage_pct=coverage_pct,
+                coverage=coverage_result or {},
                 make_result=make_res or {},
                 judge_verdict=judge,
                 cfg=cfg,
             )
 
-            write_json(coverage_file, cov or {})
+            write_json(coverage_file, coverage_result or {})
             write_json(judge_verdict_file, judge)
             last_judge = judge
 
@@ -1049,7 +1057,7 @@ PREVIOUS FAILURE CONTEXT:
                 )
                 return func_id, {
                     "passed": True,
-                    "coverage_pct": pct,
+                    "coverage_pct": coverage_pct,
                     "semantic_score": judge.get("score"),
                     "verdict": judge,
                     "unit_dir": str(unit_dir),
@@ -1156,9 +1164,9 @@ STRICT COMPILE-FIX RULES:
             make_res = run_make_test(unit_dir)
             last_make_ok = bool(make_res.get("ok"))
 
-            cov, pct = _run_current_coverage()
+            coverage_result, coverage_pct = _run_current_coverage()
 
-            if pct is not None and pct >= float(cfg.coverage_threshold):
+            if coverage_pct is not None and coverage_pct >= float(cfg.coverage_threshold):
                 judge = run_semantic_test_judge(
                     cfg,
                     test_dir=unit_dir,
@@ -1166,7 +1174,7 @@ STRICT COMPILE-FIX RULES:
                     process_name=process_name,
                     test_file=unit_test_file,
                     func=func_for_prompt,
-                    coverage=cov or {},
+                    coverage=coverage_result or {},
                     make_result=make_res or {},
                 )
 
@@ -1175,14 +1183,14 @@ STRICT COMPILE-FIX RULES:
                     unit_test_file=unit_test_file,
                     unit_makefile=unit_makefile,
                     func=func_for_prompt,
-                    coverage_pct=pct,
-                    coverage=cov or {},
+                    coverage_pct=coverage_pct,
+                    coverage=coverage_result or {},
                     make_result=make_res or {},
                     judge_verdict=judge,
                     cfg=cfg,
                 )
 
-                write_json(coverage_file, cov or {})
+                write_json(coverage_file, coverage_result or {})
                 write_json(judge_verdict_file, judge)
                 last_judge = judge
 
@@ -1193,7 +1201,7 @@ STRICT COMPILE-FIX RULES:
                     )
                     return func_id, {
                         "passed": True,
-                        "coverage_pct": pct,
+                        "coverage_pct": coverage_pct,
                         "semantic_score": judge.get("score"),
                         "verdict": judge,
                         "unit_dir": str(unit_dir),
@@ -1213,9 +1221,9 @@ STRICT COMPILE-FIX RULES:
                     last_build_diag = _safe_build_diag(make_res)
                 else:
                     try:
-                        cov_text = json.dumps(cov or {}, ensure_ascii=False, indent=2, default=str)
+                        cov_text = json.dumps(coverage_result or {}, ensure_ascii=False, indent=2, default=str)
                     except Exception:
-                        cov_text = repr(cov)
+                        cov_text = repr(coverage_result)
 
                     last_build_diag = f"""
 Build succeeded after compile_fix, but target coverage did not meet threshold.
@@ -1227,7 +1235,7 @@ Required threshold:
  {cfg.coverage_threshold}
 
 Observed coverage:
- {pct}
+ {coverage_pct}
 
 Coverage object:
 {cov_text}
@@ -1241,14 +1249,14 @@ in:
             continue
 
         print(
-            f"[pipeline] {func_id} attempt {attempt} coverage={pct}% make_ok={make_res['ok']}",
+            f"[pipeline] {func_id} attempt {attempt} coverage={coverage_pct}% make_ok={make_res['ok']}",
             file=sys.stderr,
         )
 
         try:
-            cov_text = json.dumps(cov or {}, ensure_ascii=False, indent=2, default=str)
+            cov_text = json.dumps(coverage_result or {}, ensure_ascii=False, indent=2, default=str)
         except Exception:
-            cov_text = repr(cov)
+            cov_text = repr(coverage_result)
 
         last_build_diag = f"""
 Build succeeded, but target coverage did not meet threshold.
@@ -1260,7 +1268,7 @@ Required threshold:
  {cfg.coverage_threshold}
 
 Observed coverage:
- {pct}
+ {coverage_pct}
 
 Coverage object:
 {cov_text}
@@ -1279,7 +1287,7 @@ in:
                 "passed": False,
                 "func_id": func_id,
                 "attempts": max_attempts,
-                "coverage_pct": pct,
+                "coverage_pct": coverage_pct,
                 "make_ok": last_make_ok,
                 "last_judge": last_judge,
                 "last_build_diag": last_build_diag,
@@ -1291,13 +1299,13 @@ in:
 
     print(
         f"[pipeline] unit test FAILED after {max_attempts} attempts: "
-        f"{func_id} coverage={pct}% make_ok={last_make_ok}",
+        f"{func_id} coverage={coverage_pct}% make_ok={last_make_ok}",
         file=sys.stderr,
     )
 
     return func_id, {
         "passed": False,
-        "coverage_pct": pct,
+        "coverage_pct": coverage_pct,
         "semantic_score": None if not last_judge else last_judge.get("score"),
         "verdict": last_judge,
         "unit_dir": str(unit_dir),

@@ -68,12 +68,14 @@ def _read_json_loose(path: Path) -> dict:
     if not raw:
         return {}
 
+    # Strategy 1: clean JSON — the fast path.
     try:
         return json.loads(raw)
     except Exception:
         pass
 
     raw2 = raw.strip()
+    # Strategy 2: strip markdown code fences the agent may have added, then retry.
     raw2 = re.sub(r"^\s*```(?:json)?", "", raw2, flags=re.I).strip()
     raw2 = re.sub(r"```\s*$", "", raw2).strip()
 
@@ -82,6 +84,7 @@ def _read_json_loose(path: Path) -> dict:
     except Exception:
         pass
 
+    # Strategy 3: extract the first {...} block from surrounding prose.
     start = raw2.find("{")
     end = raw2.rfind("}")
     if start >= 0 and end > start:
@@ -127,11 +130,14 @@ def _project_source_files(cfg: PipelineConfig) -> list[Path]:
 def _resolve_source_file(cfg: PipelineConfig, source_file: str | Path) -> Path:
     source_dir = cfg.source_dir.resolve()
     src = Path(source_file)
+    # Already absolute — resolve symlinks and return.
     if src.is_absolute():
         return src.resolve()
+    # Relative — try joining directly under source_dir first.
     direct = (source_dir / src).resolve()
     if direct.exists():
         return direct
+    # Fall back to recursive filename search under source_dir.
     matches = sorted(
         p.resolve()
         for p in source_dir.rglob(src.name)
@@ -139,6 +145,8 @@ def _resolve_source_file(cfg: PipelineConfig, source_file: str | Path) -> Path:
     )
     if len(matches) == 1:
         return matches[0]
+    # Multiple hits: prefer the candidate whose path ends with the requested suffix
+    # (handles subdirectory disambiguation like "subdir/foo.c").
     if len(matches) > 1:
         wanted_suffix = src.as_posix()
         for m in matches:
@@ -267,6 +275,8 @@ def run_agent(
         print(f"[pipeline][dry-run] would run: {' '.join(cmd)}", file=sys.stderr)
         return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
 
+    # Snapshot the source tree so we can restore any files the agent accidentally
+    # modifies. Agents should only write inside test_dir; this is a safety net.
     _protect_dir = cfg.source_dir.parent.resolve() if protect_source else None
     _snap = _snapshot_dir(_protect_dir) if _protect_dir is not None else {}
 
@@ -348,9 +358,13 @@ def check_function_coverage(
     if source_root is not None:
         source_root = Path(source_root).resolve()
 
+    # Step 1: find the .gcov file that corresponds to the production source.
+    # gcov embeds the original source path in the header as "Source: <path>".
+    # We read that header, skip test harness gcov files, and match by resolved path.
     gcov_files = sorted(test_dir.glob("*.gcov"))
 
     def _gcov_source(gcov_file: Path) -> Optional[Path]:
+        """Read the 'Source:' header line from a .gcov file and return the resolved path."""
         try:
             lines = read_text(gcov_file).splitlines()
         except Exception:
@@ -375,13 +389,16 @@ def check_function_coverage(
         )
         if src is None:
             continue
+        # Skip gcov files whose source lives inside test_dir (the test harness itself).
         try:
             src.relative_to(test_dir)
             continue
         except ValueError:
             pass
+        # Skip explicitly named test files.
         if src.name.startswith("test_"):
             continue
+        # If a source root is given, skip files outside it (other libraries etc.).
         if source_root is not None:
             try:
                 src.relative_to(source_root)
@@ -402,6 +419,11 @@ def check_function_coverage(
         )
         return None
 
+    # Step 2: count covered vs executable lines inside the requested line range.
+    # gcov format: "<count>: <lineno>: <source>".
+    # count="-"     means the line is not executable (comments, blank lines).
+    # count="#####" or "=====" means the line was never executed.
+    # count is a positive integer or ends with "*" (partial coverage).
     covered_lines = 0
     executable_lines = 0
     for line in read_text(matched_gcov).splitlines():
@@ -412,10 +434,10 @@ def check_function_coverage(
         line_no = int(m.group(2))
         if line_no < start_line or line_no > end_line:
             continue
-        if count_text == "-":
+        if count_text == "-":          # non-executable line
             continue
         executable_lines += 1
-        if count_text in ("#####", "====="):
+        if count_text in ("#####", "====="):  # never executed
             continue
         try:
             count = int(count_text.rstrip("*"))
