@@ -164,14 +164,10 @@ def _source_files_json_for_prompt(cfg: PipelineConfig) -> str:
 
 
 def _source_includes_for_test_file(cfg: PipelineConfig, test_file: Path) -> list[str]:
-    """
-    Build production #include lines using actual discovered source files.
-    Example: #include "../../src/dio100d/dio100d.c"
-    """
+    """Build production #include lines using absolute paths — no depth guessing."""
     lines: list[str] = []
     for src in _project_source_files(cfg):
-        rel = Path(os.path.relpath(src, start=test_file.parent)).as_posix()
-        lines.append(f'#include "{rel}"')
+        lines.append(f'#include "{src.resolve()}"')
     return lines
 
 # endregion Source file helpers
@@ -692,6 +688,19 @@ FILES YOU MAY EDIT
   `{makefile}`
 - Test C file:
   `{test_file}`
+
+CRITICAL — production source inclusion:
+Production .c files are #included directly in the test file using this pattern:
+
+  #define main <process>_entry_main
+  #include "/absolute/path/to/production.c"
+  #undef main
+
+Do NOT add production .c files to the Makefile as separate compiled objects.
+Do NOT remove or modify the #define/#include/#undef block in the test file.
+Adding a production .c as a separate object while it is also #included causes
+duplicate symbol linker errors. If symbols are unresolved, fix with linker
+wrapper stubs (--wrap) or by fixing include paths — not by re-compiling the source.
 
 TEST HARNESS FIXING RULES
 You are expected to fix the test harness, not production code.

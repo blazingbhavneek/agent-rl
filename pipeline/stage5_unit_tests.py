@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import time
@@ -39,11 +38,8 @@ from .semantic import (
 
 # region Stub sync helpers (used only by this stage)
 
-def _stub_srcs_relative(test_dir: Path, unit_dir: Path) -> list[tuple[str, str]]:
-    """
-    Return [(relative_stub_path, func_name)] for all validated stubs.
-    Relative path is from unit_dir (the cwd when building the unit test).
-    """
+def _stub_srcs_absolute(test_dir: Path) -> list[tuple[str, str]]:
+    """Return [(abs_stub_path, func_name)] for all validated stubs."""
     stubs_dir = test_dir / "_stub_gen"
     result: list[tuple[str, str]] = []
     if not stubs_dir.exists():
@@ -56,14 +52,13 @@ def _stub_srcs_relative(test_dir: Path, unit_dir: Path) -> list[tuple[str, str]]
             func_name = data.get("func_name", result_file.parent.name)
             stub_c = result_file.parent / "stub.c"
             if stub_c.exists():
-                rel = Path(os.path.relpath(stub_c.resolve(), start=unit_dir)).as_posix()
-                result.append((rel, func_name))
+                result.append((str(stub_c.resolve()), func_name))
         except Exception:
             pass
     return result
 
 
-def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path, unit_dir: Path) -> None:
+def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path) -> None:
     """
     Update STUB_SRCS in unit Makefile to exclude stubs whose __wrap_ function
     is locally DEFINED (not just called) in the unit test file.
@@ -71,8 +66,11 @@ def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path, u
     """
     text = read_text(unit_test_file)
     local_overrides = set(re.findall(r'__wrap_(\w+)\s*\([^)]*\)\s*\{', text))
-    all_stubs = _stub_srcs_relative(test_dir, unit_dir)
-    filtered = [path for path, fname in all_stubs if fname not in local_overrides]
+    filtered = [
+        abs_path
+        for abs_path, fname in _stub_srcs_absolute(test_dir)
+        if fname not in local_overrides
+    ]
     stub_srcs_line = "STUB_SRCS = " + " ".join(filtered)
     mk_text = read_text(unit_makefile)
     new_mk = re.sub(r'^STUB_SRCS\s*=.*$', stub_srcs_line, mk_text, flags=re.MULTILINE)
@@ -131,15 +129,15 @@ def _generate_unit_test_makefile(
     unit_dir: Path,
     unit_test_file: Path,
 ) -> None:
-    """Generate Makefile for a unit test dir, inheriting the master test Makefile.
+    """Generate Makefile for a per-function unit test directory.
 
-    Important behavior:
-    - If the unit test includes the production .c file directly, the production
-      code is compiled as part of TEST_SRCS. In that mode, do not build/link
-      prod_under_test.o, otherwise gcov may report coverage from an unexecuted
-      duplicate object.
-    - If the unit test does not include the production .c file, compile and link
-      PROD_OBJ normally.
+    The production source is always #included directly in the test .c file.
+    The Makefile never compiles a separate prod_under_test.o — doing so while
+    also #including the same .c would duplicate every symbol and cause linker
+    errors.
+
+    All paths written into the Makefile are absolute so the file works
+    regardless of how deep the unit test directory is in the tree.
     """
     context_file = paths["test_dir"] / "_pipeline_context.json"
     flags: dict = {}
@@ -150,95 +148,26 @@ def _generate_unit_test_makefile(
             pass
 
     func_id = func["id"]
-    process_name: str = paths["process_name"]
-    entry_sym = f"{process_name}_entry_main"
 
-    master_makefile_rel = Path(
-        os.path.relpath(paths["makefile"].resolve(), start=unit_dir)
-    ).as_posix()
-
+    # Absolute paths — no relative-depth ambiguity regardless of directory depth.
+    master_makefile_abs = str(paths["makefile"].resolve())
     source_file_abs = _resolve_source_file(cfg, func["source_file"])
-    prod_src_rel = Path(
-        os.path.relpath(source_file_abs.resolve(), start=unit_dir)
-    ).as_posix()
+    prod_src_abs = str(source_file_abs.resolve())
 
     test_program = f"test_{safe_id}"
     test_src = unit_test_file.name
 
-    stub_srcs_list = [
-        path for path, _ in _stub_srcs_relative(paths["test_dir"], unit_dir)
-    ]
-    stub_srcs_str = " ".join(stub_srcs_list)
+    stub_srcs_str = " ".join(abs_path for abs_path, _ in _stub_srcs_absolute(paths["test_dir"]))
 
-    # -------------------------------------------------------------------------
-    # Detect whether TEST_SRCS includes the production .c file directly.
-    # -------------------------------------------------------------------------
-    try:
-        test_text = unit_test_file.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        test_text = ""
-
-    test_text_norm = test_text.replace("\\", "/")
-    source_file_abs_norm = source_file_abs.resolve().as_posix()
-    prod_src_rel_norm = prod_src_rel.replace("\\", "/")
-    prod_src_basename = source_file_abs.name
-
-    include_paths = re.findall(
-        r'^\s*#\s*include\s*[<"]([^">]+)[">]',
-        test_text_norm,
-        flags=re.MULTILINE,
-    )
-    include_paths_norm = [p.replace("\\", "/") for p in include_paths]
-
-    production_included_in_test = False
-    for inc in include_paths_norm:
-        if inc == prod_src_rel_norm:
-            production_included_in_test = True
-            break
-        if inc == prod_src_basename:
-            production_included_in_test = True
-            break
-        if inc.endswith("/" + prod_src_basename):
-            try:
-                resolved_inc = (unit_dir / inc).resolve().as_posix()
-                if resolved_inc == source_file_abs_norm:
-                    production_included_in_test = True
-                    break
-            except Exception:
-                production_included_in_test = True
-                break
-
-    if not production_included_in_test:
-        production_included_in_test = (
-            prod_src_rel_norm in test_text_norm
-            or source_file_abs_norm in test_text_norm
-            or f"/{prod_src_basename}" in test_text_norm
-            or f'"{prod_src_basename}"' in test_text_norm
-            or f"<{prod_src_basename}>" in test_text_norm
-        )
-
-    if production_included_in_test:
-        prod_obj_value = ""
-        prod_obj_rule = ""
-        test_program_deps = "$(TEST_SRCS) $(STUB_SRCS)"
-        test_program_inputs = "$(TEST_SRCS) $(STUB_SRCS)"
-    else:
-        prod_obj_value = "prod_under_test.o"
-        prod_obj_rule = f"""
-$(PROD_OBJ): $(PROD_SRC)
-\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) -Dmain={entry_sym} -c $(PROD_SRC) -o $(PROD_OBJ)
-"""
-        test_program_deps = "$(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS)"
-        test_program_inputs = "$(TEST_SRCS) $(PROD_OBJ) $(STUB_SRCS)"
+    # Production source always #included in test .c — never compile separate PROD_OBJ.
 
     content = f"""# Unit test Makefile for {func_id}
 
 # Pull in the same include paths, libraries, architecture flags, and wrap flags
 # as the master test Makefile. Unit-specific rules below override only what
 # must differ for this per-function test.
-MASTER_MAKEFILE = {master_makefile_rel}
+MASTER_MAKEFILE = {master_makefile_abs}
 include $(MASTER_MAKEFILE)
-HOME = ../../../../.
 
 .DEFAULT_GOAL := test
 
@@ -254,19 +183,20 @@ LDFLAGS ?= {flags.get('LDFLAGS', '')}
 LDLIBS ?= {flags.get('LDLIBS', '')}
 LIBS ?= {flags.get('LIBS', '')}
 
-# Unit-specific files
+# Unit-specific files. Absolute paths — no depth guessing needed.
 TEST_PROGRAM = {test_program}
 TEST_SRCS = {test_src}
-PROD_SRC = {prod_src_rel}
-PROD_OBJ = {prod_obj_value}
+# PROD_SRC is #included in TEST_SRCS — do NOT add it to the link command.
+# Compiling it separately while #including it causes duplicate symbol errors.
+PROD_SRC = {prod_src_abs}
 
 # Keep only the production gcov output.
 TARGET_GCOV = $(notdir $(PROD_SRC)).gcov
 
-# Test object gcno.
+# Test object gcno — only TEST_SRCS produce gcno because PROD_SRC is #included.
 TEST_GCNO = $(TEST_SRCS:.c=.gcno)
 
-# Validated stub bodies.
+# Validated stub bodies (absolute paths).
 STUB_SRCS = {stub_srcs_str}
 
 TEST_LIBS += -lcunit
@@ -279,18 +209,17 @@ WRAP_FLAGS = $(WRAP_FUNCS)
 .PHONY: test clean-test coverage-test
 
 test: clean-test $(TEST_PROGRAM)
-\t@set +e; \\
-\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE); \\
-\tstatus=$$?; \\
-\t$(MAKE) coverage-test; \\
+\t@set +e; \
+\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE); \
+\tstatus=$$?; \
+\t$(MAKE) coverage-test; \
 \texit $$status
 
-{prod_obj_rule}
-$(TEST_PROGRAM): {test_program_deps}
-\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) {test_program_inputs} \\
-\t-o $(TEST_PROGRAM) \\
-\t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
-\t-Wl,--gc-sections \\
+$(TEST_PROGRAM): $(TEST_SRCS) $(STUB_SRCS)
+\t$(CC) $(CPPFLAGS) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) $(STUB_SRCS) \
+\t-o $(TEST_PROGRAM) \
+\t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \
+\t-Wl,--gc-sections \
 \t$(WRAP_FLAGS)
 
 coverage-test:
@@ -300,23 +229,25 @@ coverage-test:
 \t@echo "Test gcno file: $(TEST_GCNO)" >> $(TEST_REPORT_FILE)
 \t@echo "Files before gcov:" >> $(TEST_REPORT_FILE)
 \t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
-\t@found=0; \\
-\tfor f in $(TEST_GCNO) $(PROD_OBJ:.o=.gcno); do \\
-\t\t[ -e "$$f" ] || continue; \\
-\t\tfound=1; \\
-\t\techo "Running gcov -b -c $$f" >> $(TEST_REPORT_FILE); \\
-\t\tgcov -b -c "$$f" >> $(TEST_REPORT_FILE) 2>&1 || true; \\
-\tdone; \\
-\tif [ "$$found" -eq 0 ]; then \\
-\t\techo "No .gcno files found; coverage cannot be generated." >> $(TEST_REPORT_FILE); \\
+\t@found=0; \
+\tfor f in $(TEST_GCNO); do \
+\t\t[ -e "$$f" ] || continue; \
+\t\tfound=1; \
+\t\techo "Running gcov -b -c $$f" >> $(TEST_REPORT_FILE); \
+\t\tgcov -b -c "$$f" >> $(TEST_REPORT_FILE) 2>&1 || true; \
+\tdone; \
+\tif [ "$$found" -eq 0 ]; then \
+\t\techo "No .gcno files found; coverage cannot be generated." >> $(TEST_REPORT_FILE); \
 \tfi
 \t@echo "Filtering .gcov files. Keeping only: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
 \t@find . -maxdepth 1 -name '*.gcov' ! -name '$(TARGET_GCOV)' -delete
-\t@if [ ! -f "$(TARGET_GCOV)" ]; then \\
-\t\techo "WARNING: target production gcov file was not generated: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE); \\
+\t@if [ ! -f "$(TARGET_GCOV)" ]; then \
+\t\techo "WARNING: target production gcov file was not generated: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE); \
 \tfi
-\t@echo "Files after gcov filtering:" >> $(TEST_REPORT_FILE)
-\t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
+	@echo "Files after gcov filtering:" >> $(TEST_REPORT_FILE)
+	@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
+	@echo "=== COVERAGE REPORT ==="
+	@cat $(TEST_REPORT_FILE)
 
 clean-test:
 \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
@@ -474,13 +405,10 @@ def _generate_unit_test_for_func(
 
     def _validated_stub_text() -> str:
         try:
-            validated_stub_srcs = _stub_srcs_relative(test_dir, unit_dir)
-            lines = []
-            for rel_stub, stub_func_name in validated_stub_srcs:
-                abs_stub = (unit_dir / rel_stub).resolve()
-                lines.append(
-                    f" - func={stub_func_name} rel_from_unit={rel_stub} abs={abs_stub}"
-                )
+            lines = [
+                f" - func={fname} abs={abs_path}"
+                for abs_path, fname in _stub_srcs_absolute(test_dir)
+            ]
             return "\n".join(lines) if lines else " - none"
         except Exception as e:
             return f" - could not list validated stubs: {type(e).__name__}: {e}"
@@ -590,9 +518,9 @@ FILES TO READ
 Production source:
  {source_file_abs}
 
-Make sure to include this in the test like this:
+MUST include the production source in the test like this:
 
-#define main dio100d_entry_main
+#define main {process_name}_entry_main
 #include "{source_file_abs}"
 #undef main
 
@@ -698,13 +626,13 @@ Dont exit until you have written the test code in target test file and made sure
     coverage_pct: Optional[float] = None
     last_build_diag: Optional[str] = None
 
-    max_attempts = int(getattr(cfg, "max_unit_test_attempts", 4) or 4)
+    max_attempts = int(cfg.max_test_attempts or 4)
 
     # === Fast path: if an existing test already has sufficient coverage, skip
     # straight to the semantic judge instead of re-generating from scratch.
     if unit_test_file.exists() and unit_makefile.exists() and _has_real_cu_add_test(unit_test_file):
         try:
-            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
             sync_wrap_flags(unit_test_file, unit_makefile)
 
             existing_make_res = run_make_test(unit_dir)
@@ -800,6 +728,7 @@ Dont exit until you have written the test code in target test file and made sure
             prompt = prompt_for_semantic_test_repair(
                 process_name=process_name,
                 test_file=str(unit_test_file),
+                source_file_abs=str(source_file_abs.resolve()),
                 func=func_for_prompt,
                 coverage=coverage_result or {},
                 judge_verdict=last_judge,
@@ -810,6 +739,7 @@ Dont exit until you have written the test code in target test file and made sure
                 func=func_for_prompt,
                 coverage=coverage_result or {},
                 test_file=str(unit_test_file),
+                source_file_abs=str(source_file_abs.resolve()),
                 process_name=process_name,
                 attempt=attempt,
                 max_attempts=max_attempts,
@@ -915,8 +845,45 @@ You must ensure all of the following:
    - A test that initializes CUnit incorrectly and exits before running tests is invalid.
    - A test that only verifies stub counters without reaching the target source is invalid.
 
+CUNIT API REFERENCE (use only these — do not invent variants)
+------------------------------------------------------------------
+Every macro below has a _FATAL version (stops test on failure) EXCEPT CU_PASS:
+  CU_ASSERT(expr)              CU_ASSERT_FATAL(expr)
+  CU_TEST(expr)                CU_TEST_FATAL(expr)
+  CU_ASSERT_TRUE(v)            CU_ASSERT_TRUE_FATAL(v)
+  CU_ASSERT_FALSE(v)           CU_ASSERT_FALSE_FATAL(v)
+  CU_ASSERT_EQUAL(a, e)        CU_ASSERT_EQUAL_FATAL(a, e)
+  CU_ASSERT_NOT_EQUAL(a, e)    CU_ASSERT_NOT_EQUAL_FATAL(a, e)
+  CU_ASSERT_PTR_EQUAL(a, b)    CU_ASSERT_PTR_EQUAL_FATAL(a, b)
+  CU_ASSERT_PTR_NOT_EQUAL(a,b) CU_ASSERT_PTR_NOT_EQUAL_FATAL(a,b)
+  CU_ASSERT_PTR_NULL(p)        CU_ASSERT_PTR_NULL_FATAL(p)
+  CU_ASSERT_PTR_NOT_NULL(p)    CU_ASSERT_PTR_NOT_NULL_FATAL(p)
+  CU_ASSERT_STRING_EQUAL(a,b)  CU_ASSERT_STRING_EQUAL_FATAL(a,b)
+  CU_ASSERT_STRING_NOT_EQUAL(a,b)  CU_ASSERT_STRING_NOT_EQUAL_FATAL(a,b)
+  CU_ASSERT_NSTRING_EQUAL(a,b,n)   CU_ASSERT_NSTRING_EQUAL_FATAL(a,b,n)
+  CU_ASSERT_NSTRING_NOT_EQUAL(a,b,n) CU_ASSERT_NSTRING_NOT_EQUAL_FATAL(a,b,n)
+  CU_ASSERT_DOUBLE_EQUAL(a,e,g)    CU_ASSERT_DOUBLE_EQUAL_FATAL(a,e,g)
+  CU_ASSERT_DOUBLE_NOT_EQUAL(a,e,g) CU_ASSERT_DOUBLE_NOT_EQUAL_FATAL(a,e,g)
+  CU_PASS(msg)   [no fatal variant]
+  CU_FAIL(msg)                 CU_FAIL_FATAL(msg)
+
+Do NOT use: CU_ASSERT_INT, CU_ASSERT_INT_EQUAL, CU_ASSERT_NULL,
+            CU_ASSERT_NOT_NULL, CU_ASSERT_ZERO, CU_PASS_FATAL,
+            or any other variant not listed above — they do not exist.
+
+Setup boilerplate:
+  CU_initialize_registry();
+  CU_pSuite s = CU_add_suite("name", NULL, NULL);
+  CU_add_test(s, "test_name", test_func);
+  CU_basic_set_mode(CU_BRM_VERBOSE);
+  CU_basic_run_tests();
+  unsigned failures = CU_get_number_of_failures();
+  CU_cleanup_registry();
+  return failures == 0 ? 0 : 1;
+------------------------------------------------------------------
+
 Before finishing, run:
-  make clean-test test
+  make test
 
 Then verify:
  - test binary executed
@@ -937,84 +904,19 @@ Then verify:
         )
 
         if not _has_real_cu_add_test(unit_test_file):
-            no_test_prompt = f"""
-The previous edit is invalid because the unit test still has no real CU_add_test().
-
-Rewrite the unit test file from scratch. Do not preserve placeholder content.
-
-UNIT TEST FILE TO REWRITE:
- {unit_test_file}
-
-TARGET SOURCE TO READ:
- {source_file_abs}
-
-TARGET LINE RANGE:
- {func.get("start_line")} - {func.get("end_line")}
-
-MASTER INTEGRATED TEST TO READ FOR WORKING WRAPPERS/STUBS/HELPERS:
- {master_test_file}
-
-MASTER MAKEFILE:
- {master_makefile}
-
-UNIT MAKEFILE:
- {unit_makefile}
-
-GENERATED STUB DIRECTORY:
- {stub_gen_dir}
-
-VALIDATED GENERATED STUBS:
-{_validated_stub_text()}
-
-BUILD COMMAND:
- cd {unit_dir}
- make test
-
-Requirements:
-- Create a complete CUnit file.
-- Include CUnit headers.
-- Add at least one test function.
-- Register it with CU_add_test().
-- Execute the target line range directly or through a real caller.
-- Use/copy only needed wrappers/helpers from the master integrated test.
-- Do not blindly include the master integrated test.
-- Do not leave an empty CUnit suite.
-- Do not create fake project headers or spoof project types/macros/functions.
-- If headers/types/macros are missing, inspect the real production headers and
-  original Makefile, then fix INCLUDE/CPPFLAGS/LDFLAGS in the unit Makefile.
-- Use real project definitions whenever available.
-"""
-
-            if last_build_diag:
-                no_test_prompt = f"""{no_test_prompt}
-
-PREVIOUS FAILURE CONTEXT:
-{last_build_diag}
-"""
-
-            run_agent(
-                cfg,
-                unit_dir,
-                no_test_prompt,
-                f"{safe_id}_empty_test_fix_{int(time.time())}.json",
-                folder=repo_root,
-                history_dir=unit_dir / "agent_history",
-            )
-
-        if not _has_real_cu_add_test(unit_test_file):
+            write_text(unit_test_file, f"/* PLACEHOLDER — agent wrote no CU_add_test, rewriting. Target: {func_id} */\n")
             last_build_diag = (
-                "The previous agent attempt still produced no real CU_add_test(). "
-                "The unit test file is still empty or placeholder-only. "
-                f"File: {unit_test_file}"
+                "Main agent produced no real CU_add_test(). "
+                "File reset to placeholder — rewrite from scratch on next attempt."
             )
             print(
-                f"[pipeline] {func_id} attempt {attempt}: still no CU_add_test after repair",
+                f"[pipeline] {func_id} attempt {attempt}: no CU_add_test, reset to placeholder",
                 file=sys.stderr,
             )
             attempt += 1
             continue
 
-        _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+        _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
         sync_wrap_flags(unit_test_file, unit_makefile)
 
         make_res = run_make_test(unit_dir)
@@ -1147,18 +1049,19 @@ STRICT COMPILE-FIX RULES:
             )
 
             if not _has_real_cu_add_test(unit_test_file):
+                write_text(unit_test_file, f"/* PLACEHOLDER — compile-fix removed CU_add_test, rewriting. Target: {func_id} */\n")
                 last_build_diag = (
-                    "The compile-fix attempt removed or failed to add real CU_add_test(). "
-                    f"File: {unit_test_file}"
+                    "Compile-fix agent removed all CU_add_test() registrations. "
+                    "File reset to placeholder — rewrite from scratch."
                 )
                 print(
-                    f"[pipeline] {func_id} attempt {attempt}: no CU_add_test after compile_fix",
+                    f"[pipeline] {func_id} attempt {attempt}: compile_fix ate CU_add_test, reset to placeholder",
                     file=sys.stderr,
                 )
                 attempt += 1
                 continue
 
-            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir, unit_dir)
+            _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
             sync_wrap_flags(unit_test_file, unit_makefile)
 
             make_res = run_make_test(unit_dir)

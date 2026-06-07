@@ -6,6 +6,7 @@ from pathlib import Path
 from .config import PipelineConfig
 from .common import (
     _project_source_files,
+    _source_files_json_for_prompt,
     build_output_with_runtime_diagnostics,
     prompt_for_compile_fix,
     run_agent,
@@ -14,7 +15,8 @@ from .common import (
 )
 
 
-def prompt_for_minimal_test(process_name: str, test_file: str, entry_sym: str) -> str:
+def prompt_for_minimal_test(process_name: str, test_file: str, entry_sym: str,
+                            actual_source_files: str) -> str:
     return f"""
 You are editing an existing CUnit test file.
 
@@ -27,6 +29,9 @@ Process:
 Entry function:
 {entry_sym}
 
+Actual production source files:
+{actual_source_files}
+
 Goal:
 Make a minimal startup test that compiles, links, runs, and exits quickly.
 
@@ -34,6 +39,18 @@ Do not over-engineer this stage.
 Do not deeply rewrite the test framework.
 Do not create many scenario tests here.
 Do not run real blocking loops, hardware calls, IPC, timers, daemon loops, or real sleeps.
+
+CRITICAL — production source inclusion:
+The test file already #includes the production source directly using this pattern:
+
+  #define main {entry_sym}
+  #include "/absolute/path/to/production.c"
+  #undef main
+
+Do NOT add production .c files to the Makefile as separate compiled objects.
+Do NOT remove or modify this #define/#include/#undef block.
+Adding production source as a separate object while it is also #included causes
+duplicate symbol linker errors.
 
 Required:
 1. Add or fix wrappers/stubs for external dependencies needed by {entry_sym}.
@@ -76,6 +93,11 @@ A function called (directly or indirectly) by `{entry_sym}` is blocking:
 - Infinite event/main loop (pmf_mainloop, select loop, while(1))
 - Blocking system call (read/accept/recv with no data ready)
 - A function that calls exit()/_exit() which terminates the process before CUnit can finish
+
+CRITICAL — production source inclusion:
+The test file already #includes production source directly. Do NOT add production .c
+files to the Makefile as separate compiled objects — that causes duplicate symbol errors.
+Do NOT remove or modify the #define main / #include / #undef main block in the test file.
 
 FIX:
 1. Read the test file — find which `__wrap_*` stubs exist.
@@ -145,7 +167,10 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
         run_agent(
             cfg,
             test_dir,
-            prompt_for_minimal_test(process_name, str(test_file), entry_sym),
+            prompt_for_minimal_test(
+                process_name, str(test_file), entry_sym,
+                actual_source_files=_source_files_json_for_prompt(cfg),
+            ),
             f"_minimal_test_{attempt:02d}.json",
             folder=repo_root,
         )

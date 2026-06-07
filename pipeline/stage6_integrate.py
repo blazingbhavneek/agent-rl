@@ -21,19 +21,58 @@ from .common import (
 )
 
 
+def _extract_func_body(text: str, func_name: str) -> str:
+    """Extract a complete void function definition by brace counting."""
+    m = re.search(rf'(?:static\s+)?void\s+{re.escape(func_name)}\s*\([^)]*\)\s*\{{', text)
+    if not m:
+        return ""
+    start = m.start()
+    depth = 1
+    i = m.end()
+    while i < len(text) and depth > 0:
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+        i += 1
+    return text[start:i]
+
+
 def extract_test_additions(unit_test_file: Path) -> tuple[str, list[str]]:
-    """Extract test case functions and CU_add_test calls from a unit test file."""
+    """Extract test functions and CU_add_test calls from a standalone unit test file.
+
+    Unit test files are complete CUnit files (not marker-based fragments).
+    We identify test functions from CU_add_test() calls, extract their bodies
+    by brace counting, and strip the production-source #include block (already
+    present in the master test).
+    """
     text = read_text(unit_test_file)
 
-    cases_start = text.find("/* === Test Cases === */")
-    reg_start = text.find("/* === Test Registration === */")
-    if cases_start == -1:
+    raw_reg_calls = re.findall(r'CU_add_test\s*\([^;]+\)\s*;', text)
+    if not raw_reg_calls:
         return "", []
 
-    end = reg_start if reg_start != -1 else len(text)
-    test_cases = text[cases_start + len("/* === Test Cases === */"):end].strip()
+    # Collect test function names from CU_add_test(suite, "label", func_name)
+    func_names: list[str] = []
+    for call in raw_reg_calls:
+        m = re.search(r'CU_add_test\s*\(\s*\w+\s*,\s*"[^"]*"\s*,\s*(\w+)\s*\)', call)
+        if m:
+            func_names.append(m.group(1))
 
-    reg_calls = re.findall(r'CU_add_test\s*\([^;]+\)\s*;', text)
+    # Normalize suite variable to 'suite' so calls work in the master test scope.
+    reg_calls = [
+        re.sub(r'(CU_add_test\s*\()\s*\w+\s*,', r'\1suite,', call, count=1)
+        for call in raw_reg_calls
+    ]
+
+    # Extract each test function body.
+    bodies: list[str] = []
+    for name in func_names:
+        body = _extract_func_body(text, name)
+        if body:
+            bodies.append(body)
+
+    test_cases = "\n\n".join(bodies)
     return test_cases, reg_calls
 
 
@@ -80,7 +119,7 @@ def integrate_all_unit_tests_sequential(
             print(f"[pipeline] no additions to integrate for {func_id}", file=sys.stderr)
             continue
 
-        print(f"[pipeline] Stage 5: integrating {func_id}", file=sys.stderr)
+        print(f"[pipeline] Stage 6: integrating {func_id}", file=sys.stderr)
         current = read_text(test_file)
 
         cases_marker = "/* === Test Cases === */"
@@ -127,7 +166,7 @@ def integrate_all_unit_tests_sequential(
             )
             attempt += 1
 
-    print("[pipeline] Stage 5: running final make test on master suite", file=sys.stderr)
+    print("[pipeline] Stage 6: running final make test on master suite", file=sys.stderr)
     final = run_make_test(test_dir)
     if not final["ok"]:
         print("[pipeline] WARN: final master make test failed after unit test integration", file=sys.stderr)

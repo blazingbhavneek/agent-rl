@@ -124,18 +124,6 @@ int main(void)
             )
             text = text.replace(TEST_FILE_MARKERS[0], TEST_FILE_MARKERS[0] + insertion, 1)
         changed = True
-    elif define_main not in text and any(ln in text for ln in production_include_lines):
-        # Case C: includes are present but the #define main wrapper is missing.
-        # This can happen if the file was hand-edited. Re-wrap them.
-        present = [ln for ln in production_include_lines if ln in text]
-        if present:
-            text = text.replace(present[0], f"{define_main}\n{present[0]}", 1)
-            last_inc = present[-1]
-            idx = text.find(last_inc)
-            if idx >= 0:
-                end = idx + len(last_inc)
-                text = text[:end] + "\n#undef main" + text[end:]
-            changed = True
 
     # Ensure all section markers exist (append any that are missing at end of file).
     for marker in TEST_FILE_MARKERS:

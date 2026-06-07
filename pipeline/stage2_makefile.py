@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -10,7 +9,6 @@ from typing import Optional
 from .config import PipelineConfig
 from .common import (
     _project_source_files,
-    append_text,
     load_json,
     read_text,
     sync_wrap_flags,
@@ -129,12 +127,10 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
                 file=sys.stderr,
             )
 
-    # Step 2: build the list of production .c files relative to test_dir.
-    # These are used in the Makefile PRODUCTION_SRCS var for gcov filtering.
-    production_srcs: list[str] = []
-    for src in _project_source_files(cfg):
-        rel = Path(os.path.relpath(src.resolve(), start=test_dir)).as_posix()
-        production_srcs.append(rel)
+    # Step 2: build absolute paths for all production .c files.
+    # Absolute paths avoid depth-relative mistakes when the Makefile is invoked
+    # from any directory (e.g. gcov needs to find the right .gcno).
+    production_srcs: list[str] = [str(src.resolve()) for src in _project_source_files(cfg)]
     production_srcs_text = " ".join(production_srcs)
 
     print(f"[pipeline] source folder: {source_dir}", file=sys.stderr)
@@ -196,11 +192,10 @@ clean-test:
 {block_end}
 """.strip() + "\n"
 
-    import re as _re
     text = read_text(makefile)
-    pattern = _re.compile(
-        rf"{_re.escape(block_start)}.*?{_re.escape(block_end)}",
-        _re.DOTALL,
+    pattern = re.compile(
+        rf"{re.escape(block_start)}.*?{re.escape(block_end)}",
+        re.DOTALL,
     )
     if pattern.search(text):
         new_text = pattern.sub(test_block.strip(), text)

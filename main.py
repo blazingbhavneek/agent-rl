@@ -1754,6 +1754,7 @@ def _normalize_simple_judge_verdict(
 
     score = max(0, min(100, score))
     reason = str(verdict.get("reason") or "").strip()
+    missing_cases = list(verdict.get("missing_cases") or [])
 
     return {
         "parse_ok": True,
@@ -1761,6 +1762,7 @@ def _normalize_simple_judge_verdict(
         "reason": reason,
         "summary": reason,
         "passed": score >= min_score,
+        "missing_cases": missing_cases,
     }
 
 
@@ -1840,10 +1842,11 @@ Evaluate:
 You MUST write ONLY valid JSON to:
 {verdict_file}
 
-Required JSON format, exactly two fields:
+Required JSON format, exactly three fields:
 {{
  "score": 0,
- "reason": "short reason explaining semantic strength or weakness"
+ "reason": "short reason explaining semantic strength or weakness",
+ "missing_cases": ["list of important behaviors not tested"]
 }}
 
 Rules:
@@ -1853,6 +1856,7 @@ Rules:
 - No extra fields.
 - score must be integer 0 to 100.
 - reason must be a string.
+- missing_cases must be a list of strings.
 """
 
 
@@ -1949,12 +1953,11 @@ No extra fields.
             file=sys.stderr,
         )
 
-    raise RuntimeError(
-        "Semantic judge failed to produce parseable JSON after "
-        f"{max_parse_retries} attempts for {fid}. "
-        "Not regenerating tests because this is judge infrastructure failure.\n"
-        f"Last judge output:\n{last_raw}"
+    print(
+        f"[pipeline] judge failed to produce parseable JSON after {max_parse_retries} attempts for {fid}, returning default",
+        file=sys.stderr,
     )
+    return {"passed": False, "score": 0, "reason": "judge failed", "missing_cases": [], "judge_attempts": max_parse_retries}
 
 
 def _backup_root_for_func(unit_dir: Path, func: dict) -> Path:
@@ -2267,6 +2270,8 @@ def prompt_for_function_test_with_semantic_context(
     return f"""
 You are writing or repairing a real CUnit unit test file for production C code.
 
+Attempt: {attempt}/{max_attempts}
+
 Process:
 {process_name}
 
@@ -2278,6 +2283,9 @@ Target metadata:
 
 Test file:
 {test_file}
+
+Last judge verdict:
+{json.dumps(last_judge_verdict or {}, indent=2, default=str)}
 
 You must explore the source yourself before editing.
 Inspect:
@@ -2739,26 +2747,62 @@ def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Pat
     unit_makefile = unit_dir / "Makefile"
 
     if not unit_test_file.exists():
-        skeleton = f"""/*
-     * PLACEHOLDER ONLY.
-     *
-     * Target:
-     *   {func_id}
-     *
-     * This file must be completely rewritten by the unit-test agent.
-     *
-     * Required final file:
-     *   - complete CUnit test file
-     *   - at least one CU_add_test()
-     *   - real test function(s)
-     *   - calls target function directly or through a real caller
-     *   - uses wrappers/stubs from the master test or _stub_gen as needed
-     */
-     """
+        source_file_abs = _resolve_source_file(cfg, func["source_file"])
+        define_main = f"#define main {process_name}_entry_main"
+        include_line = f'#include "{source_file_abs.resolve().as_posix()}"'
+        skeleton = f"""{TEST_FILE_MARKERS[0]}
+#include <CUnit/CUnit.h>
+#include <CUnit/Basic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+{define_main}
+{include_line}
+#undef main
+{TEST_FILE_MARKERS[1]}
+/* Compatibility definitions go here if needed. */
+
+{TEST_FILE_MARKERS[2]}
+/* Static globals shared by stubs/tests go here. */
+
+{TEST_FILE_MARKERS[3]}
+/* Reusable helper functions go here. */
+
+{TEST_FILE_MARKERS[4]}
+/* Linker wrapper stubs go here. */
+
+{TEST_FILE_MARKERS[5]}
+/* Test cases go here. */
+
+{TEST_FILE_MARKERS[6]}
+int main(void)
+{{
+    CU_pSuite suite = NULL;
+    if (CU_initialize_registry() != CUE_SUCCESS) {{
+        return CU_get_error();
+    }}
+    suite = CU_add_suite("{func_id}_suite", NULL, NULL);
+    if (suite == NULL) {{
+        CU_cleanup_registry();
+        return CU_get_error();
+    }}
+    CU_basic_set_mode(CU_BRM_VERBOSE);
+    CU_basic_run_tests();
+    {{
+        unsigned int failures = CU_get_number_of_failures();
+        CU_cleanup_registry();
+        return failures == 0 ? 0 : 1;
+    }}
+}}
+"""
         write_text(unit_test_file, skeleton)
 
     if not unit_makefile.exists():
         _generate_unit_test_makefile(cfg, paths, func, safe_id, unit_dir, unit_test_file)
+        # Copy wrap flags from master Makefile so they are explicit in unit Makefile.
+        master_mk_text = read_text(paths["makefile"])
+        for name in re.findall(r'-Wl,--wrap=(\w+)', master_mk_text):
+            ensure_wrap_flag(unit_makefile, name)
 
     return unit_dir
 

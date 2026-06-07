@@ -209,6 +209,7 @@ def prompt_for_semantic_test_repair(
     *,
     process_name: str,
     test_file: str,
+    source_file_abs: str,
     func: dict,
     coverage: dict,
     judge_verdict: dict,
@@ -248,6 +249,12 @@ Existing leaf-to-root semantic context:
 
 Test file to modify:
 {test_file}
+
+The production source MUST be included in the test like this (do not remove it):
+
+#define main {process_name}_entry_main
+#include "{source_file_abs}"
+#undef main
 
 You must inspect the real source before editing:
 - target function implementation,
@@ -293,6 +300,7 @@ def prompt_for_function_test_with_semantic_context(
     func: dict,
     coverage: dict,
     test_file: str,
+    source_file_abs: str,
     process_name: str,
     attempt: int,
     max_attempts: int,
@@ -316,6 +324,12 @@ Target metadata:
 
 Test file:
 {test_file}
+
+The production source MUST be included at the top of the test file like this:
+
+#define main {process_name}_entry_main
+#include "{source_file_abs}"
+#undef main
 
 You must explore the source yourself before editing.
 Inspect:
