@@ -72,13 +72,16 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
 
     test_dir.mkdir(parents=True, exist_ok=True)
 
+    test_program = test_file.stem
+    test_src = test_file.name
+
     def _run_do_mkmf() -> None:
         print(
-            f"[pipeline] generating Makefile with: cd {test_dir} && do_mkmf {source_dir}",
+            f"[pipeline] generating Makefile with: cd {test_dir} && do_mkmf {test_program}",
             file=sys.stderr,
         )
         res = subprocess.run(
-            ["do_mkmf", str(source_dir)],
+            ["do_mkmf", test_program],
             cwd=str(test_dir),
             text=True,
             stdout=subprocess.PIPE,
@@ -88,7 +91,7 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
         if res.returncode != 0:
             raise RuntimeError(
                 "do_mkmf failed\n"
-                f"command: cd {test_dir} && do_mkmf {source_dir}\n"
+                f"command: cd {test_dir} && do_mkmf {test_program}\n"
                 f"exit={res.returncode}\n"
                 f"stdout:\n{res.stdout}\n"
                 f"stderr:\n{res.stderr}\n"
@@ -130,17 +133,17 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
     # Step 2: build absolute paths for all production .c files.
     # Absolute paths avoid depth-relative mistakes when the Makefile is invoked
     # from any directory (e.g. gcov needs to find the right .gcno).
-    production_srcs: list[str] = [str(src.resolve()) for src in _project_source_files(cfg)]
-    production_srcs_text = " ".join(production_srcs)
+    # production_srcs: list[str] = [str(src.resolve()) for src in _project_source_files(cfg)]
+    # production_srcs_text = " ".join(production_srcs)
 
-    print(f"[pipeline] source folder: {source_dir}", file=sys.stderr)
-    print(f"[pipeline] source Makefile: {source_makefile}", file=sys.stderr)
-    print("[pipeline] production source files for gcov:", file=sys.stderr)
-    if production_srcs:
-        for src in production_srcs:
-            print(f" - {src}", file=sys.stderr)
-    else:
-        print(" (none found)", file=sys.stderr)
+    # print(f"[pipeline] source folder: {source_dir}", file=sys.stderr)
+    # print(f"[pipeline] source Makefile: {source_makefile}", file=sys.stderr)
+    # print("[pipeline] production source files for gcov:", file=sys.stderr)
+    # if production_srcs:
+    #     for src in production_srcs:
+    #         print(f" - {src}", file=sys.stderr)
+    # else:
+    #     print(" (none found)", file=sys.stderr)
 
     flags = parse_source_makefile_flags(source_makefile) if source_makefile.exists() else {}
     merged_flag_keys = ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]
@@ -153,33 +156,43 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
 
     # Step 3: append/replace the test target block inside the Makefile.
     # The block is delimited by sentinel comments so it can be updated on re-runs.
-    test_program = test_file.stem
-    test_src = test_file.name
-
     block_start = f"# === TEST TARGET FOR {process_name} ==="
     block_end = f"# === END TEST TARGET FOR {process_name} ==="
+
+    src_build_dir = source_dir / "linux"
+    unit_test_program = f"unit_{test_program}"
 
     test_block = f"""
 {block_start}
 # TODO: review merged source Makefile flags below and keep the unit build aligned with production.
 {merged_flag_block}
-TEST_PROGRAM = {test_program}
+
+TEST_PROGRAM = {unit_test_program}
 TEST_SRCS = {test_src}
-PRODUCTION_SRCS = {production_srcs_text}
+
+# Existing compiled production objects. Do NOT build or run source here.
+SOURCE_DIR = {source_dir}
+SRC_BUILD_DIR = {src_build_dir}
+SRC_OBJS_ALL = $(wildcard $(SRC_BUILD_DIR)/*.o)
+
+# Exclude likely production main/program object to avoid duplicate main().
+SRC_OBJS = $(filter-out $(SRC_BUILD_DIR)/{process_name}.o $(SRC_BUILD_DIR)/main.o,$(SRC_OBJS_ALL))
+
 TEST_LIBS += -lcunit
-TEST_REPORT_FILE = {test_program}_report.txt
-TEST_LOG_FILE = {test_program}_log.txt
+TEST_REPORT_FILE = $(TEST_PROGRAM)_report.txt
+TEST_LOG_FILE = $(TEST_PROGRAM)_log.txt
 COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
 WRAP_FLAGS = $(WRAP_FUNCS)
 
-.PHONY: test clean-test coverage-test
+.PHONY: test clean-test coverage-test check-src-objs
 
 test: clean-test $(TEST_PROGRAM)
 \t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>$(TEST_LOG_FILE)
 \t$(MAKE) coverage-test
 
 $(TEST_PROGRAM): $(TEST_SRCS)
-\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) -o $(TEST_PROGRAM) \\
+\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) \\
+\t$(TEST_SRCS) $(SRC_OBJS) -o $(TEST_PROGRAM) \\
 \t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
 \t-Wl,--gc-sections \\
 \t$(WRAP_FLAGS)

@@ -1,0 +1,1739 @@
+```diff
+Binary files /home/seigyo/rl/pipeline/__pycache/__init__.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache/__init__.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//analysis.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//analysis.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//common.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//common.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//config.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//config.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//semantic.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//semantic.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//stage1_scaffold.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//stage1_scaffold.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//stage2_makefile.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//stage2_makefile.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//stage3_stubs.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//stage3_stubs.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//stage4_minimal.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//stage4_minimal.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//stage5_unit_tests.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//stage5_unit_tests.cpython-312.pyc differ
+Binary files /home/seigyo/rl/pipeline/__pycache//stage6_integrate.cpython-312.pyc and
+/home/seigyo/agent-rl/pipeline/__pycache//stage6_integrate.cpython-312.pyc differ
+diff -ruN /home/seigyo/rl/pipeline/common.py /home/seigyo/agent-rl/pipeline/common.py
+--- /home/seigyo/rl/pipeline/common.py  2026-06-08 10:26:49.135405415 +0900
++++ /home/seigyo/agent-rl/pipeline/common.py    2026-06-08 17:12:22.193704940 +0900
+@@ -315,14 +315,8 @@
+# region Build & coverage
+
+-import re
+-import subprocess
+-from pathlib import Path
+-
+-
+def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
+    cmd = ["make", "test"]
+-
+    try:
+        proc = subprocess.run(
+            cmd,
+@@ -331,54 +325,17 @@
+            text=True,
+            timeout=timeout,
+        )
+- except subprocess.TimeoutExpired:
+```
+
+return {
+    "ok": False,
+    "returncode": -1,
+    "stdout": "",
+    "stderr": f"make test timed out after {timeout}s",
+    "timed_out": True,
+    "errors": [f"make test timed out after {timeout}s"],
+    "ok": proc.returncode == 0,
+    "returncode": proc.returncode,
+    "stdout": proc.stdout,
+    "stderr": proc.stderr,
+    "timed_out": False,
+}
+except subprocess.TimeoutExpired:
+    return {"ok": False, "returncode": -1, "stdout": "",
+        "stderr": f"make test timed out after {timeout}s", "timed_out": True}
+
+stdout = proc.stdout or ""
+stderr = proc.stderr or ""
+combined = stdout + "\n" + stderr
+
+blocking_error_patterns = [
+    # GNU make hard failures
+    r"make(?:[\d+\])?: *\*\*.* Error \d++,
+    r"make(?:[\d+\])?: .* Error \d+ \(ignored\) ",
+
+    # compiler/linker hard failures
+    r"\berror:",
+    r"undefined reference",
+    r"collect2:\s+error",
+    r"ld returned \d+ exit status",
+    r"cannot open output file",
+    r"cannot find -l",
+    r"No such file or directory",
+    r"No rule to make target",
+    r"recipe for target .* failed",
+    r"\bStop\.",
+]
+
+errors = []
+for line in combined.splitlines():
+    s = line.strip()
+    if any(re.search(p, s, re.IGNORECASE) for p in blocking_error_patterns):
+        errors.append(s)
+
+ok = proc.returncode == 0 and not errors
+
+return {
+    "ok": ok,
+    "returncode": proc.returncode,
+    "stdout": stdout,
+    "stderr": stderr,
+    "timed_out": False,
+    "errors": errors,
+
+```diff
+def check_function_coverage(
+    test_dir: Path,
+@@ -757,7 +714,6 @@
+- local prototypes used only by the test,
+- linker wrap flags in the test Makefile,
+- include/compiler/linker settings in the test Makefile if needed.
+-- Some LIBS/INCLUDE that are included might not be present in the environment,
+based on error try to remove them and try so you know what's wrong.
+
+You MUST NOT change:
+- production source files,
+diff -ruN /home/seigyo/rl/pipeline/semantic.py /home/seigyo/agent-
+rl/pipeline/semantic.py
+--- /home/seigyo/rl/pipeline/semantic.py 2026-06-08 12:12:29.281744015 +0900
++++ /home/seigyo/agent-rl/pipeline/semantic.py 2026-06-08 17:12:22.193704940
++0900
+@@ -417,35 +417,91 @@
+    make_result: dict,
+) -> dict:
+    """
+-   Simple deterministic judge.
++   Retry semantic judge until readable simple JSON is produced.
+
+-   No LLM.
+-   No JSON file writing.
+-   No parse retries.
+-   If coverage reached this stage, accept it.
++   JSON parse failure is judge infrastructure failure - does NOT become score=0
++   and does NOT trigger unit-test regeneration.
+    """
++   min_score = int(getattr(cfg, "semantic_judge_min_score", 75))
++   max_parse_retries = int(getattr(cfg, "semantic_judge_parse_retries", 10))
+
+-   score = 100
++   fid = func.get("id") or func.get("name") or "unknown_function"
++   safe_fid = _safe_filename(fid)
+
+-   make_ok = bool((make_result or {}).get("ok"))
++   verdict_file = test_dir / f"_semantic_judge_{safe_fid}.json"
++   semantic_context = _load_semantic_context(test_dir)
+
+-   reason_parts = [
+-       "Semantic LLM judge disabled.",
+-       "Accepted by deterministic rule.",
+-       "The test reached the configured coverage threshold before this judge was
+called.",
+-     ]
+- if not make_ok:
+-       reason_parts.append(
+-           "make_result.ok was false, but coverage was generated; accepting
+because pipeline reached judge stage."
+```
+
+```python
++     last_raw = ""
++
++     for i in range(1, max_parse_retries + 1):
++       try:
++               verdict_fileunlink()
++       except FileNotFoundError:
++               pass
++
++       retry_note = ""
++       if i > 1:
++               retry_note = f"""
++
++PREVIOUS ATTEMPT FAILED TO PRODUCE PARSEABLE JSON.
++
++Retry:
+{i}/{max_parse_retries}
++
++You must write exactly this shape:
++
++{{"score": 75, "reason": "your reason"}}
++
++No markdown.
++No prose.
++No code fence.
++No extra fields.
++""""
++
++       prompt = prompt_for_semantic_test_judge(
++             process_name=process_name,
++             test_file=str(test_file),
++             func=func,
++             coverage=coverage or {},
++             make_result=make_result or {},
++             semantic_context=semantic_context,
++             verdict_file=str(verdict_file),
++             min_score=min_score,
++       ) + retry_note
++
++       run_agent(
++             cfg,
++             test_dir,
++             prompt,
++             f"{safe_fid}_semantic_judge_try_{i}.json",
++             folder=repo_root,
+)
+-    return {
+-       "passed": True,
+-       "score": score,
+-       "reason": " ".join(reason_parts),
+-       "judge_attempts": 0,
+-   }
++       verdict_raw = {}
++       if verdict_file.exists():
+```
+
+```python
+last_raw = verdict_file.read_text(errors="ignore")[-4000:]
+        verdict_raw = _read_json_loose(verdict_file)
+
+    verdict = _normalize_simple_judge_verdict(
+        verdict_raw,
+        min_score=min_score,
+    )
+
+    if verdict is not None:
+        verdict["judge_attempts"] = i
+        return verdict
+
+        print(
+            f"[pipeline] judge JSON parse failed for {fid}, retry
+{i}/{max_parse_retries}",
+            file=sys.stderr,
+        )
+
+    raise RuntimeError(
+        "Semantic judge failed to produce parseable JSON after "
+        f"{max_parse_retries} attempts for {fid}. "
+        "Not regenerating tests because this is judge infrastructure failure.\n"
+        f"Last judge output:\n{last_raw}"
+    )
+```
+
+# endregion Semantic judge runner  
+```diff
+diff -ruN /home/seigyo/rl/pipeline/stage2_makefile.py /home/seigyo/agent-rl/pipeline/stage2_makefile.py
+--- /home/seigyo/rl/pipeline/stage2_makefile.py 2026-06-08 10:43:26.339458671 +0900
++++ /home/seigyo/agent-rl/pipeline/stage2_makefile.py 2026-06-08 17:12:22.193704940 +0900
+@@ -72,33 +72,27 @@
+```
+
+```txt
+test_dir.mkdir(parents=True, exist_ok=True)
+
+-   test_program = test_file.stem
+-   test_src = test_file.name
+
+-   def _run_do_mkmf() -> None:
+      print(
+-       f"[pipeline] generating Makefile with: cd {test_dir} && do_mkmf{test_program}",
++       f"[pipeline] generating Makefile with: cd {test_dir} && do_mkmf{source_dir}",
+      file=sys.stderr,
+      )
+-
+      res = subprocess.run(
+-       ["do_mkmf", test_program],
++       ["do_mkmf", str(source_dir)],
+      cwd=str(test_dir),
+      text=True,
+```
+
+```diff
+stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=300,
+)
+- if res.returncode != 0:
+    raise RuntimeError(
+        "do_mkmf failed\n"
+        f"command: cd {test_dir} && do_mkmf {test_program}\n"
++     f"command: cd {test_dir} && do_mkmf {source_dir}\n"
+        f"exit={res.returncode}\n"
+        f"stdout:\n{res.stdout}\n"
+        f"stderr:\n{res.stderr}\n"
+    )
+- if not makefile.exists():
+    raise RuntimeError(
+        "do_mkmf completed but Makefile was not created\n"
+@@ -136,17 +130,17 @@
+    # Step 2: build absolute paths for all production .c files.
+    # Absolute paths avoid depth-relative mistakes when the Makefile is invoked
+    # from any directory (e.g. gcov needs to find the right .gcno).
+-   # production_srcs: list[str] = [str(src.resolve()) for src in _project_source_files(cfg)]
+-   # production_srcs_text = " ".join(production_srcs)
++   production_srcs: list[str] = [str(src.resolve()) for src in _project_source_files(cfg)]
++   production_srcs_text = " ".join(production_srcs)
+
+-   # print(f"[pipeline] source folder: {source_dir}", file=sys.stderr)
+-   # print(f"[pipeline] source Makefile: {source_makefile}", file=sys.stderr)
+-   # print("[pipeline] production source files for gcov:", file=sys.stderr)
+-   # if production_srcs:
+-   #     for src in production_srcs:
+-   #         print(f" - {src}", file=sys.stderr)
+-   # else:
+-   #     print(" (none found)", file=sys.stderr)
++   print(f"[pipeline] source folder: {source_dir}", file=sys.stderr)
++   print(f"[pipeline] source Makefile: {source_makefile}", file=sys.stderr)
++   print("[pipeline] production source files for gcov:", file=sys.stderr)
++   if production_srcs:
++       for src in production_srcs:
++       print(f" - {src}", file=sys.stderr)
++   else:
++       print(" (none found)", file=sys.stderr)
+
+flags = parse_source_makefile_flags(source_makefile) if source_makefile.exists() else {}
+    merged_flag_keys = ["CFLAGS", "CFLAGS_LINUX", "CPPFLAGS", "INCLUDE", "LDFLAGS", "LDLIBS", "LIBS"]
+@@ -165,40 +159,27 @@
+    block_start = f"# === TEST TARGET FOR {process_name} ==="
+    block_end = f"# === END TEST TARGET FOR {process_name} ==="
+```
+
+```diff
+-     src_build_dir = source_dir / "linux"
+-     unit_test_program = f"unit_{test_program}"
+-
+-     test_block = f"""
+{block_start}
+# TODO: review merged source Makefile flags below and keep the unit build aligned with production.
+{merged_flag_block}
+-
+-TEST_PROGRAM = {unit_test_program}
++TEST_PROGRAM = {test_program}
+TEST_SRCS = {test_src}
+-
+-# Existing compiled production objects. Do NOT build or run source here.
+-SOURCE_DIR = {source_dir}
+-SRC_BUILD_DIR = {src_build_dir}
+-SRC_OBJS_ALL = $(wildcard $(SRC_BUILD_DIR)/*.o)
+-
+-# Exclude likely production main/program object to avoid duplicate main().
+-SRC_OBJS = $(filter-out $(SRC_BUILD_DIR)/{process_name}.o
+$(SRC_BUILD_DIR)/main.o,$(SRC_OBJS_ALL))
+-
++PRODUCTION_SRCS = {production_srcs_text}
+TEST_LIBS += -lcunit
+-TEST_REPORT_FILE = $(TEST_PROGRAM)_report.txt
+-TEST_LOG_FILE = $(TEST_PROGRAM)_log.txt
++TEST_REPORT_FILE = {test_program}_report.txt
++TEST_LOG_FILE = {test_program}_log.txt
+COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
+WRAP_FLAGS = $(WRAP_FUNCS)
+
+-.PHONY: test clean-test coverage-test check-src-objs
++.PHONY: test clean-test coverage-test
+
+test: clean-test $(TEST_PROGRAM)
+\t./$(TEST_PROGRAM) > $(TEST_REPORT_FILE) 2>\$(TEST_LOG_FILE)
+\t$(MAKE) coverage-test
+
+$(TEST_PROGRAM): $(TEST_SRCS)
+-\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) \\
+-\t$(TEST_SRCS) $(SRC_OBJS) -o $(TEST_PROGRAM) \\
++\t$(CC) $(CFLAGS_LINUX) $(CFLAGS) $(INCLUDE) $(COVERAGE_FLAGS) $(TEST_SRCS) -o
+$(TEST_PROGRAM) \\
+\t$(TEST_LIBS) $(LDFLAGS) $(LDLIBS) $(LIBS) \\
+\t-W1,--gc-sections \\
+\t$(WRAP_FLAGS)
+diff -ruN /home/seigyo/r1/pipeline/stage3_stubs.py /home/seigyo/agent-r1/pipeline/stage3_stubs.py
+--- /home/seigyo/r1/pipeline/stage3_stubs.py      2026-06-08 10:23:53.490396035
++0900
++++ /home/seigyo/agent-r1/pipeline/stage3_stubs.py  2026-06-08 17:12:22.193704940
++0900
+@@ -585,4 +585,4 @@
+    validated = {n: bodies[n] for n in candidates if n in bodies}
+```
+
+```diff
+integrate_all_stubs_sequential(cfg, paths, validated, flags)
+
+-# endregion Main stub handler
+\ No newline at end of file
++# endregion Main stub handler
+diff -ruN /home/seigyo/rl/pipeline/stage4_minimal.py /home/seigyo/agent-rl/pipeline/stage4_minimal.py
+--- /home/seigyo/rl/pipeline/stage4_minimal.py 2026-06-08 16:58:25.807660273 +0900
++++ /home/seigyo/agent-rl/pipeline/stage4_minimal.py 2026-06-08 17:12:22.193704940 +0900
+@@ -14,6 +14,7 @@
+    sync_wrap_flags,
+)
+
++
+def prompt_for_minimal_test(process_name: str, test_file: str, entry_sym: str, actual_source_files: str) -> str:
+    return f"""
+@@ -32,68 +33,13 @@
+{actual_source_files}
+
+Goal:
+-Make a minimal startup test that compiles, links, runs, exits quickly, and produces
+-non-zero coverage for the real production source file under src/.
++Make a minimal startup test that compiles, links, runs, and exits quickly.
+
+Do not over-engineer this stage.
+Do not deeply rewrite the test framework.
+Do not create many scenario tests here.
+Do not run real blocking loops, hardware calls, IPC, timers, daemon loops, or real sleeps.
+
+-CRITICAL:
+-A successful `make test` exit code is NOT enough.
+-
+-You must personally verify the generated CUnit/gcov report before calling
+-submit_and_exit.
+-
+-After every edit, run:
+-
+- make test
+-
+-Then read the generated report file in this directory.
+-
+-The report file will usually have a name similar to one of these:
+-
+- {process_name}_report.txt
+- test_{process_name}_report.txt
+- unit_test_{process_name}_report.txt
+- *_report.txt
+-
+-Use commands such as:
+```
+
+```diff
+- ls -lt *_report.txt
+- cat *_report.txt
+
+-You must inspect the report.
+
+-The test is INVALID if the report shows zero CUnit tests, for example:
+-
+- tests      0     0
+- asserts    0     0
+
+-The test is also INVALID if the production source file under src/ still has zero coverage, for example:
+-
+- File '/path/to/src/{process_name}/{process_name}.c'
+- Lines executed:0.00%
+
+-If either of those happens:
+-- do NOT call submit_and_exit
+-- fix the test
+-- run `make test` again
+-- read the report again
+-- repeat until the report is valid
+-
+-The report is valid only when:
+-1. CUnit shows at least one test registered and ran.
+-   The tests row must have Total > 0 and Ran > 0.
+-
+-2. The production source file under src/ has non-zero line coverage.
+-   It must NOT say Lines executed:0.00% for the source file this test includes.
+-
+-3. The test actually calls `{entry_sym}` or a real startup path that reaches the included production source.
+-
+  CRITICAL - production source inclusion:
+  The test file already #includes the production source directly using this pattern:
+
+@@ -119,49 +65,17 @@
+   - exit
+  5. Add/reset those counters in reset_mocks() if reset_mocks exists.
+  6. Add one minimal CUnit test that calls {entry_sym}.
+-7. Register the test with CU_add_test().
+-8. Ensure CU_basic_run_tests() is called.
+-9. Ensure CUnit main returns non-zero on test failure using CU_get_number_of_failures().
+-10. Run `make test`.
+-11. Read the generated *_report.txt file.
+-12. If tests ran = 0 or production src coverage = 0.00%, fix and retry.
+-
+-Expected CUnit main structure:
+-
+- int main(void) {
+    if (CU_initialize_registry() != CUE_SUCCESS) {{
+```
+
+```c
+return 1;
+}}
+CU_pSuite suite = CU_add_suite("minimal_startup", NULL, NULL);
+if (suite == NULL) {{{
+    CU_cleanup_registry();
+    return 1;
+}}
+if (CU_add_test(suite, "startup_runs", test_startup_runs) == NULL) {{{
+    CU_cleanup_registry();
+    return 1;
+}}
+CU_basic_set_mode(CU_BRM_VERBOSE);
+CU_basic_run_tests();
+
+unsigned failures = CU_get_number_of_failures();
+CU_cleanup_registry();
+
+return failures == 0 ? 0 : 1;
+}}
++7. Assert only basic startup behavior that is obvious from existing code.
++8. Ensure CUnit main returns non-zero on test failure using
+CU_get_number_of_failures().
+```
+
+Important:  
+```txt
+-- Do not submit only because compilation succeeded.
+-- Do not submit only because `make test` returned 0.
+-- Do not submit if the report says `tests 0 0`.
+-- Do not submit if the production source under src/ says `Lines executed:0.00%`.
+-- Keep editing/running/checking until the report proves real source execution.
++- This is only the bootstrap compile/run stage.
++- Do not attempt full semantic coverage here.
++- Keep changes small.
++- Preserve existing tests.
++- If a symbol/signature is unknown, inspect only the relevant header/source needed to fix it.
+```
+
+```python
+-When the report proves at least one CUnit test ran and the production source has
+-non-zero coverage, call submit_and_exit.
++When done, call submit_and_exit.
+"""
+```
+
+@@ -232,13 +146,11 @@  
+```python
+if existing_res["ok"]:
+    print(
+-       f"[pipeline] existing make test returned OK, but LLM must still
+inspect "
+-       f"*_report.txt and verify non-zero tests plus non-zero src coverage",
++       f"[pipeline] existing test already compiles, runs, terminates, and
+passes; "
+```
+
+```diff
++             f"skipping minimal-test generation",
+            file=sys.stderr,
+        )
+-           # # TODO: Fix this later
+-       # return True
++       return True
+
+    print(
+        f"[pipeline] existing test did not pass; running minimal validation for {entry_sym}"),
+diff -ruN /home/seigyo/rl/pipeline/stage5_unit_tests.py /home/seigyo/agent-rl/pipeline/stage5_unit_tests.py  2026-06-08 16:14:05.948518221 +0900
++++ /home/seigyo/agent-rl/pipeline/stage5_unit_tests.py 2026-06-08 17:12:22.194704941 +0900
+@@ -88,8 +88,6 @@
+    process_name: str = paths["process_name"]
+    func_id = func["id"]
+    safe_id = _safe_filename(func_id)
+-   test_program = f"test_{safe_id}"
+-   test_src = f"{test_program}.c"
+
+    unit_dir = test_dir / "_unit_tests" / safe_id
+    unit_dir.mkdir(parents=True, exist_ok=True)
+@@ -117,29 +115,12 @@
+    """
+    write_text(unit_test_file, skeleton)
+
+-   if not unit_makefile.exists() or not _unit_makefile_matches_contract(unit_makefile, test_program, test_src):
++   if not unit_makefile.exists():
+        _generate_unit_test_makefile(cfg, paths, func, safe_id, unit_dir, unit_test_file)
+
+    return unit_dir
+
+-def _unit_makefile_matches_contract(unit_makefile: Path, test_program: str, test_src: str) -> bool:
+-   """Keep stale per-function Makefiles from drifting off the current file-name contract."""
+-   text = read_text(unit_makefile)
+-   if not text:
+-       return False
+-
+-   program_ok = re.search(
+-       rf"(?m)^TEST_PROGRAM\s*=\s{*re.escape(test_program)}\s*\$", 
+-       text,
+- ) is not None
+-   src_ok = re.search(
+-       rf"(?m)^TEST_SRCS\s*=\s{*re.escape(test_src)}\s*\$", 
+-       text,
+```
+
+```diff
+- ) is not None
+- return program_ok and src_ok
+-
+-
+def _generate_unit_test_makefile(
+    cfg: PipelineConfig,
+    paths: dict,
+@@ -167,7 +148,6 @@
+        pass
+
+    func_id = func["id"]
+- process_name: str = paths["process_name"]
+
+    # Absolute paths - no relative-depth ambiguity regardless of directory depth.
+    master_makefile_abs = str(paths["makefile"].resolve())
+@@ -177,7 +157,7 @@
+    test_program = f"test_{safe_id}"
+    test_src = unit_test_file.name
+
+- stub_srcs_str = ""
++ stub_srcs_str = " ".join(abs_path for abs_path, _ in _stub_srcs_absolute(paths["test_dir"]))
+
+    # Production source always #included in test .c - never compile separate PROD_OBJ.
+
+@@ -223,11 +203,6 @@
+TEST_REPORT_FILE = {test_program}_report.txt
+TEST_LOG_FILE = {test_program}_log.txt
+
+-# Legacy parent Makefile compatibility. Keep the real suffixed unit test file,
+-# but let older targets resolve without needing a shim source file.
+-LEGACY_TEST_SRCS = test_{process_name}.c
+-LEGACY_TEST_PROGRAM = unit_test_{process_name}
+-
+COVERAGE_FLAGS += --coverage -ffunction-sections -fdata-sections
+WRAP_FLAGS = $(WRAP_FUNCS)
+
+@@ -276,11 +251,6 @@
+
+clean-test:
+\trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
+-$(LEGACY_TEST_SRCS): $(TEST_SRCS)
+-\t@:
+-
+-$(LEGACY_TEST_PROGRAM): $(TEST_PROGRAM)
+-\t@:
+""""
+    write_text(unit_dir / "Makefile", content)
+
+@@ -312,17 +282,19 @@
+    process_name: str = paths["process_name"]
+```
+
+```python
+repo_root = cfg.source_dir.parent.parent.resolve()
+unit_dir = test_dir / "_unit_tests" / safe_id
++
++ unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
+unit_test_file = unit_dir / f"test_{safe_id}.c"
+unit_makefile = unit_dir / "Makefile"
+judge_verdict_file = unit_dir / "judge_verdict.json"
+coverage_file = unit_dir / "coverage.json"
+source_file_abs = _resolve_source_file(cfg, func["source_file"])
+master_test_file = test_dir / f"test_{process_name}.c"
+master_makefile = paths["makefile"]
+stub_gen_dir = test_dir / "_stub_gen"
++ source_file_abs = _resolve_source_file(cfg, func["source_file"])
++
+source_makefile_candidates: list[Path] = []
+try:
+    resolved_source_dir = cfg.source_dir.resolve()
+@@ -361,121 +333,6 @@
+    cleaned = _strip_c_comments_and_strings_for_test_check(txt)
+    return re.search(r"\bCU_add_test\s*\"(", cleaned) is not None
+- def _coverage_pct(cov_obj: Optional[dict]) -> Optional[float]:
+-     if not isinstance(cov_obj, dict):
+-         return None
+-     pct_val = (cov_obj.get("summary", {} or {}).get("coverage_percent")
+-     if pct_val is None:
+-         pct_val = cov_obj.get("coverage_percent")
+-     if pct_val is None:
+-         pct_val = cov_obj.get("percent")
+-     if pct_val is None:
+-         pct_val = cov_obj.get("coverage")
+-     if pct_val is None:
+-         pct_val = cov_obj.get("pct")
+-     if pct_val is None:
+-         return None
+-     try:
+-         return float(pct_val)
+-     except Exception:
+-         return None
+- last_make_ok = True
+# coverage_result: raw gcov dict returned by check_function_coverage().
+# coverage_pct:   line-coverage % for the target function's line range.
+coverage_result: Optional[dict] = None
+coverage_pct: Optional[float] = None
+last_build_diag: Optional[str] = None
+last_judge: Optional[dict] = None
+-
+# If the per-function test already exists and coverage is already good
+```
+
+```python
+# enough, validate it first and skip any scaffold generation.
+if unit_test_file.exists() and unit_makefile.exists() and
+_has_real_cu_add_test(unit_test_file):
+    try:
+        _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
+        sync_wrap_flags(unit_test_file, unit_makefile)
+
+        existing_make_res = run_make_test(unit_dir)
+        last_make_ok = bool(existing_make_res.get("ok"))
+
+        coverage_result = check_function_coverage(
+            unit_dir,
+            source_file_abs,
+            func["start_line"],
+            func["end_line"],
+            source_root=cfg.source_dir.resolve(),
+        )
+        coverage_pct = _coverage_pct(coverage_result)
+
+        if coverage_pct is not None and coverage_pct >= float(cfg.coverage_threshold):
+            print(
+                f"[pipeline] existing test has coverage={coverage_pct}%, starting from semantic judge: {func_id}",
+                    file=sys.stderr,
+                )
+
+                func_for_prompt = {*func, "source_file": str(source_file_abs)}
+
+                judge = run_semantic_test_judge(
+                    cfg,
+                    test_dir=unit_dir,
+                    repo_root=repo_root,
+                    process_name=process_name,
+                    test_file=unit_test_file,
+                    func=func_for_prompt,
+                    coverage=coverage_result or {},
+                    make_result=existing_make_res or {},
+                )
+
+                backup_good_cunit_if_best(
+                    unit_dir=unit_dir,
+                    unit_test_file=unit_test_file,
+                    unit_makefile=unit_makefile,
+                    func=func_for_prompt,
+                    coverage_pct=coverage_pct,
+                    coverage=coverage_result or {},
+                    make_result=existing_make_res or {},
+                    judge_verdict=judge,
+                    cfg=cfg,
+                )
+
+                write_json(coverage_file, coverage_result or {})
+                write_json(judge_verdict_file, judge)
+```
+
+```diff
+- last_judge = judge
+-
+- if judge.get("passed"):
+-     print(
+-       f"[pipeline] unit test PASSED from existing gcov:
+{func_id} score={judge.get('score')}",
+-       file=sys.stderr,
+-       )
+-       return func_id, {
+-       "passed": True,
+-       "coverage_pct": coverage_pct,
+-       "semantic_score": judge.get("score"),
+-       "verdict": judge,
+-       "unit_dir": str(unit_dir),
+-       }
+- - last_build_diag = (
+-      "Existing test reached coverage threshold, but semantic judge
+failed.\n"
+-       + json.dumps(judge, ensure_ascii=False, indent=2,
+default=str)
+-       )
+-       else:
+-       print(
+-       f"[pipeline] existing test judge FAILED: {func_id} score=
+{last_judge.get('score') if last_judge else 'n/a'}",
+-       file=sys.stderr,
+-       )
+- - except RuntimeError:
+-       raise
+-       except Exception as e:
+-       print(
+-       f"[pipeline] existing-test judge fast path skipped for {func_id}:
+{type(e).__name__}: {e}",
+-       file=sys.stderr,
+-       )
+- def _safe_build_diag(make_res: dict) -> str:
+    parts: list[str] = []
+
+@@ -544,40 +401,7 @@
+"make_res contained no readable output and no log files were
+found."
+)
+- diag = "\n".join(parts)
+- failure_hint = _repetitive_failure_hint(diag)
+- if failure_hint:
+-       diag += "\n\n==== repetitive-failure hint ======\n" + failure_hint
+-       return diag
+- def _repetitive_failure_hint(text: str) -> str:
+-       lowered = text.lower()
+```
+
+```diff
+- if "no rule to make target" in lowered:
+- return (
+- "The Makefile/test-file contract is likely stale."
+- "Re-check TEST_PROGRAM and TEST_SRCS first. If the old build graph still asks for the unsuffixed names, use compatibility targets in the unit Makefile instead of patching wrappers."
+- )
+- if "overriding recipe for target" in lowered:
+- return (
+- "The generated Makefile is being overridden instead of extended cleanly."
+- "Regenerate the unit Makefile rather than layering more conflicting targets."
+- )
+- if "multiple definition" in lowered or "duplicate symbol" in lowered:
+- return (
+- "A wrapper/stub ownership conflict is present."
+- "Keep exactly one owner per symbol and remove the duplicate from STUB_SRCS or local __wrap_*."
+- )
+- if "undefined reference to '__wrap_" in lowered or "undefined reference to \"__wrap_" in lowered:
+- return (
+- "The wrap flag probably does not match the real link-time symbol."
+- "Verify the exact symbol name before adding more wrappers."
+- )
+- if "heap out of memory" in lowered or "invalid table size" in lowered:
+- return (
+- "This looks like an agent/runtime failure rather than a C test failure."
+- "Simplify the workflow or retry the agent, do not keep changing wrappers blindly."
+- )
+- return ""
++ return "\n".join(parts)
+
+def _validated_stub_text() -> str:
+    try:
+@@ -596,6 +420,28 @@
+    else " - none found"
+)
+
++ def _coverage_pct(cov_obj: Optional[dict]) -> Optional[float]:
++     if not isinstance(cov_obj, dict):
++       return None
++
++     pct_val = (cov_obj.get("summary", {} or {}).get("coverage_percent")
++     if pct_val is None:
++       pct_val = cov_obj.get("coverage_percent")
++     if pct_val is None:
++       pct_val = cov_obj.get("percent")
++     if pct_val is None:
++       pct_val = cov_obj.get("coverage")
+```
+
+```diff
++ if pct_val is None:
++ pct_val = cov_obj.get("pct")
+
++ if pct_val is None:
++ return None
++
++ try:
++ return float(pct_val)
++ except Exception:
++ return None
++
+def _run_current_coverage() -> tuple[Optional[dict], Optional[float]]:
+current_source = _resolve_source_file(cfg, func["source_file"])
+cov_obj = check_function_coverage(
+@@ -714,7 +560,6 @@
+the Makefile does not also compile/link that same production .c separately.
+Generate gcov from the object that contains the included production source.
+11. If the target calls a terminating function such as pmf_exit(), exit(), or abort(), add linker wrappers and safe __wrap_* functions so the test process continues long enough to write coverage data.
+-12. If the build graph still mentions the legacy unsuffixed names `test_{process_name}.c` or `unit_test_{process_name}`, do not create a temporary shim source file. Keep the real suffixed unit test file and satisfy the old names with compatibility targets in the unit Makefile.
+
+{previous_diag_block}
+
+@@ -767,13 +612,100 @@
+except Exception:
+pass
+
++ last_judge: Optional[dict] = None
++ if judge_verdict_file.exists():
++ try:
++ last_judge = load_json(judge_verdict_file)
++ except Exception:
++ pass
++
+last_make_ok = True
+# coverage_result: raw gcov dict returned by check_function_coverage().
+# coverage_pct: line-coverage % for the target function's line range.
+coverage_result: Optional[dict] = None
+coverage_pct: Optional[float] = None
+last_build_diag: Optional[str] = None
+
+max_attempts = int(cfg.max_test_attempts or 4)
+
+- unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
+- unit_test_file = unit_dir / f"test_{safe_id}.c"
+- unit_makefile = unit_dir / "Makefile"
+- judge_verdict_file = unit_dir / "judge_verdict.json"
+- coverage_file = unit_dir / "coverage.json"
++ # === Fast path: if an existing test already has sufficient coverage, skip
++ # straight to the semantic judge instead of re-generating from scratch.
+```
+
+```python
++     if unit_test_file.exists() and unit_makefile.exists() and
+_has_real_cu_add_test(unit_test_file):
++       try:
++             _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
++             sync_wrap_flags(unit_test_file, unit_makefile)
++
++             existing_make_res = run_make_test(unit_dir)
++             last_make_ok = bool(existing_make_res.get("ok"))
++
++             coverage_result, coverage_pct = _run_current_coverage()
++
++             if coverage_pct is not None and coverage_pct >=
+float(cfg.coverage_threshold):
++               print(
++                   f"[pipeline] existing test has coverage={coverage_pct}%, 
+starting from semantic judge: {func_id}",
++                 file=sys.stderr,
++                   )
++
++             source_file_abs = _resolve_source_file(cfg, func["source_file"])
++             func_for_prompt = {* * func, "source_file": str(source_file_abs)}
++
++             judge = run_semantic_test_judge(
++                 cfg,
++                 test_dir=unit_dir,
++                 repo_root=repo_root,
++                 process_name=process_name,
++                 test_file=unit_test_file,
++                 func=func_for_prompt,
++                 coverage=coverage_result or {},
++                 make_result=existing_make_res or {},
++                   )
++
++             backup_good_cunit_if_best(
++                 unit_dir=unit_dir,
++                 unit_test_file=unit_test_file,
++                 unit_makefile=unit_makefile,
++                 func=func_for_prompt,
++                 coverage_pct=coverage_pct,
++                 coverage=coverage_result or {},
++                 make_result=existing_make_res or {},
++                 judge verdict=judge,
++                 cfg=cfg,
++                   )
++
++             write_json(coverage_file, coverage_result or {})
++             write_json(judge_verdict_file, judge)
++             last_judge = judge
++
++             if judge.get("passed"):
++                 print(
++                       f"[pipeline] unit test PASSED from existing gcov:
+{func_id} score={judge.get('score')}",
++                     file=sys.stderr,
+```
+
+```diff
+)
+        return func_id, {
+            "passed": True,
+            "coverage_pct": coverage_pct,
+            "semantic_score": judge.get("score"),
+            "verdict": judge,
+            "unit_dir": str(unit_dir),
+        }
+    last_build_diag = (
+        "Existing test reached coverage threshold, but semantic judge
+failed.\n"
+        + json.dumps(judge, ensure_ascii=False, indent=2,
+default=str)
+    )
+    else:
+        print(
+            f"[pipeline] existing test judge FAILED: {func_id} score=
+{last_judge.get('score') if last_judge else 'n/a'}",
+            file=sys.stderr,
+        )
+
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(
+            f"[pipeline] existing-test judge fast path skipped for {func_id}:
+{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+
+    attempt = 1
+
+@@ -820,65 +752,6 @@
+
+{unit_agent_location_context}
+
+-IMPORTANT BASELINE TEMPLATE RULE
+-----------------------------------------------------------------------
+-There is already a working parent minimal CUnit test for this process:
+-
+- {master_test_file}
+-This parent test is known to:
+-- compile
+-- link
+-- run CUnit correctly
+-- include the real production source correctly
+-- provide working wrappers/stubs/helpers
+-- generate non-zero coverage for the real src/ production file
+-
+-Before writing this per-function unit test, read the parent minimal test file.
+-
+-Use the parent minimal test as the base template.
+```
+
+```txt
+-Do NOT #include the parent test .c file directly.
+-
+-Instead:
+-1. Copy/reuse its #include list.
+-2. Copy/reuse its production source include block:
+-     #define main {process_name}_entry_main
+-     #include "{source_file_abs}"
+-     #undef main
+-3. Copy/reuse its working wrapper functions.
+-4. Copy/reuse its mock globals and reset_mocks() helper if present.
+-5. Copy/reuse its CUnit main structure.
+-6. Replace or extend only the CUnit test cases for this target function.
+-
+-Do not remove wrappers from the parent template just because they do not look
+-directly related to the target function. Since the production .c file is included
+-directly, those wrappers may still be needed for linking.
+-
+-Prefer local wrappers copied from the parent minimal test over linking broad
+-generated _stub_gen/stub.c files.
+-
+-If a generated _stub_gen/stub.c causes duplicate symbols such as:
+-
+-   multiple definition of `err_code'
+-
+-then do NOT use that stub.c. Remove it from STUB_SRCS or leave STUB_SRCS empty
+-and implement only the required __wrap_* function locally in this unit test file.
+-
+-If the link error says:
+-
+-   undefined reference to `__wrap_xxx'
+-
+-then add/copy a local wrapper:
+-
+-   __wrap_xxx(...)
+-
+-with the real signature if known, or the smallest compatible signature inferred
+-from the production/header files.
+-
+-Do not add global variables to stubs unless they are declared extern and already
+-owned by production. Avoid defining project globals in generated stubs.
+```
+
+# FINAL TASK:
+
+```diff
+- Rewrite or repair this file with real CUnit tests:
+    {unit_test_file}
+@@ -900,41 +773,6 @@
+ Makefile include paths/flags using the real source Makefile and real headers.
+- Prefer real project definitions from production headers over local test declarations.
+```
+
+## -CRITICAL WRAP FLAG RULE
+
+-If you define any local wrapper function in the test file, such as:
+
+```diff
+- __wrap_clg_logout
+- __wrap_pmf_exit
+- __wrap_NcmConnect
+
+-then the unit Makefile must contain the matching linker wrap flag:
+-
+- -Wl,--wrap=clg_logout
+- -Wl,--wrap=pmf_exit
+- -Wl,--wrap=NcmConnect
+
+-A local __wrap_xxx function is not enough by itself.
+-
+-Before running make test:
+-1. Inspect the unit test file for every __wrap_xxx function you defined.
+-2. Inspect the unit Makefile.
+-3. Ensure WRAP_FLAGS or WRAP_FUNCS contains matching:
+-   -Wl,--wrap=xxx
+-4. If the flag is missing, edit the unit Makefile and add it.
+-
+-Example:
+-
+-   WRAP_FUNCS += -Wl,--wrap=clg_logout
+-   WRAP_FUNCS += -Wl,--wrap=pmf_exit
+-   WRAP_FUNCS += -Wl,--wrap=NcmConnect
+-
+-or:
+-
+-   WRAP_FLAGS += -Wl,--wrap=clg_logout
+-
+-Do not finish until every __wrap_xxx has a matching -Wl,--wrap=xxx flag.
+-
+CRITICAL EXECUTION / COVERAGE REQUIREMENTS
+-------------------
+A unit test is valid only if it compiles, runs, and executes the real production
+@@ -1442,25 +1280,6 @@
+       src_abs = _resolve_source_file(cfg, func["source_file"])
+       _append_semantic_context(test_dir, {**func, "source_file":
+str(src_abs)}, result["verdict"])
+
+-   # Mark unit tests as completed in context if all targeted functions passed
+-   all_passed = True
+-   if not all_results:
+-      all_passed = False
+-   else:
+-      for fid, res in all_results.items():
+-          if not res.get("passed"):
+-            all_passed = False
+-            break
+-   if all_passed:
+-      context_file = test_dir / "_pipeline_context.json"
+-      if context_file.exists():
+-        ctx = load_json(context_file)
+-        ctx["unit_tests_completed"] = True
+```
+
+```diff
+-        ctx["unit_test_results"] = all_results
+-        write_json(context_file, ctx)
+-        print(f"[pipeline] All unit tests passed. Marked context as completed.", file=sys.stderr)
+-
+    return all_results
+
+# endregion Parallel driver
+diff -ruN /home/seigyo/rl/pipeline/stage6_integrate.py /home/seigyo/agent-rl/pipeline/stage6_integrate.py      2026-06-08 16:48:45.748629294 +0900
++++ /home/seigyo/agent-rl/pipeline/stage6_integrate.py  2026-06-08 17:12:22.194704941 +0900
+@@ -1,6 +1,5 @@
+from __future__ import annotations
+
+-import json
+ import re
+ import subprocess
+ import sys
+@@ -10,11 +9,10 @@
+ from .config import PipelineConfig
+ from .analysis import functions_leaf_first
+ from .common import (
++     _project_source_files,
+       _safe_filename,
+-     _resolve_source_file,
+-     _source_files_json_for_prompt,
+       build_output_with_runtime_diagnostics,
+-     check_function_coverage,
++     prompt_for_compile_fix,
+       read_text,
+       run_agent,
+       run_make_test,
+@@ -78,206 +76,6 @@
+       return test_cases, reg_calls
+
+-def _existing_wrap_symbols(test_file: Path) -> str:
+-     text = read_text(test_file)
+-     names = sorted(set(re.findall(r"__wrap_(\w+)\b", text)))
+-     return "\n".join(f" - {name}" for name in names) if names else " - none"
+- def _source_makefile_text(existing_source_makefiles: list[Path]) -> str:
+-     return (
+-         "\n".join(f" - {p}" for p in existing_source_makefiles)
+-         if existing_source_makefiles
+-         else " - none found"
+-    )
+
+-def _coverage_pct(cov_obj: dict | None) -> float | None:
+```
+
+```python
+if not isinstance(cov_obj, dict):
+    return None
+
+pct_val = (cov_obj.get("summary", {} or {}).get("coverage_percent")
+if pct_val is None:
+    pct_val = cov_obj.get("coverage_percent")
+if pct_val is None:
+    pct_val = cov_obj.get("percent")
+if pct_val is None:
+    pct_val = cov_obj.get("coverage")
+if pct_val is None:
+    pct_val = cov_obj.get("pct")
+
+if pct_val is None:
+    return None
+
+try:
+    return float(pct_val)
+except Exception:
+    return None
+
+def _coverage_matches_target(
+    master_pct: float | None,
+    unit_pct: float | None,
+    threshold: float,
+    tolerance: float = 5.0,
+) -> bool:
+    if master_pct is None:
+        return False
+    if unit_pct is None:
+        return master_pct >= threshold
+    return master_pct >= max(threshold, unit_pct - tolerance)
+
+def _current_function_coverage(
+    cfg: PipelineConfig,
+    test_dir: Path,
+    source_file_abs: Path,
+    func: dict,
+) -> tuple[dict | None, float | None]:
+    cov_obj = check_function_coverage(
+        test_dir,
+        source_file_abs,
+        func["start_line"],
+        func["end_line"],
+        source_root=cfg.source_dir.resolve(),
+    )
+    return cov_obj, _coverage_pct(cov_obj)
+
+def prompt_for_master_test_fix(
+    *,
+    process_name: str,
+```
+
+```txt
+- master_test_file: str,
+- master_makefile: str,
+- unit_test_file: str,
+- unit_makefile: str,
+- source_file_abs: str,
+- func: dict,
+- unit_coverage_pct: str,
+- master_coverage_pct: str,
+- actual_source_files: str,
+- source_makefiles: str,
+- existing_wraps: str,
+- build_output: str,
+-) -> str:
+- fid = func.get("id") or func.get("name") or "unknown_function"
+-
+- return f"""
+-You are fixing an integrated master CUnit test file after merging one standalone
+-unit test back into the master suite.
+-
+-Process:
+-{process_name}
+-
+-Target function:
+-{fid}
+-
+-Target function metadata:
+-{json.dumps(func, indent=2, default=str)}
+-
+-Master integrated test file:
+-{master_test_file}
+-
+-Master test Makefile:
+-{master_makefile}
+-
+-Standalone unit test file being merged:
+-{unit_test_file}
+-
+-Standalone unit Makefile:
+-{unit_makefile}
+-
+-Production source file:
+-{source_file_abs}
+-
+-Standalone unit coverage target:
+-{unit_coverage_pct}
+-
+-Current master coverage for this function:
+-{master_coverage_pct}
+-
+-Actual project .c source files discovered:
+-{actual_source_files}
+-
+-Source Makefile candidates:
+-{source_makefiles}
+```
+
+```txt
+-Wrapper symbols already present in the master file:
+-{existing_wraps}
+```  
+-FILES YOU MAY EDIT
+
+```txt
+-- Master integrated test file:
+- `{master_test_file}`
+-- Master test Makefile:
+- `{master_makefile}`
+```  
+-FILES YOU MUST READ
+
+```txt
+-- Master integrated test file:
+- `{master_test_file}`
+-- Standalone unit test file:
+- `{unit_test_file}`
+-- Standalone unit Makefile:
+- `{unit_makefile}`
+-- Production source:
+- `{source_file_abs}`
+-- Actual source files:
+-{actual_source_files}
+-- Source Makefile candidates:
+-{source_makefiles}
+```  
+-BUILD / CONTENT RULES
+
+-1. Read the master test file first. A lot of wrapper stubs/helpers are already present, so do not duplicate them.  
+-2. Read the standalone unit test file before editing the master file.  
+-3. Normalize the master file before adding new content:  
+- - remove repeated \`#include\` lines if the same header already exists  
+- - remove duplicate wrapper/helper definitions  
+- - keep wrappers in the wrapper section, helpers in the helper section, and
+- tests in the test section  
+- - keep registration lines together and aligned
+
+-4. Keep the merged master file organized, compact, and easy to read.
+
+-5. Preserve existing section markers and grouping.
+
+-6. If a wrapper/helper already exists in the master file, reuse it instead of copying another copy.
+
+-7. If the unit test introduces a genuinely new helper or wrapper, add only the missing piece and keep it in the right section.
+
+-8. Do not copy the unit-test \`main()\` into the master file.
+
+-9. Do not add the production .c as a separate compiled object.
+
+-10. Do not redefine existing Makefile variables; preserve existing \`WRAP\_FUNCS\`
+/ \`WRAP\_FLAGS\` entries and append only the missing wrap flags.
+
+-11. If the master file already contains this function's merged block, do not paste it again. Repair the existing block so the master coverage matches the standalone unit-test coverage instead.
+
+-12. If the master file is messy, rewrite the affected sections so the final file stays clean and readable rather than layering more clutter on top.
+
+-13. If compilation fails, fix include paths, macros, or wrap flags first rather than deleting the merged tests.
+
+-14. After any edit, run:
+
+```txt
+`make test`
+Then inspect the generated report and coverage output:
+`ls -lt *_report.txt`
+`cat *_report.txt`
+`gcov -b -c *.gcno`
+-15. Keep the merged file readable: group tests, helpers, wrappers, and
+registrations cleanly instead of scattering additions around the file.
+```
+
+```sql
+-FAILING BUILD / TEST OUTPUT
+-{build_output}
+```  
+-STRRICT RULES
+
+```lua
+-- You may only edit the master integrated test file and its Makefile.
+-- You must not edit production source files or headers.
+-- Do not remove existing working wrappers just because they look unrelated.
+-- Do not weaken assertions just to make the build pass.
+-- If the master file already has the needed wrappers, leave them alone.
+```
+
+```python
+-When done, call submit_and_exit.
+"""
+```
+
+```diff
+def integrate_all_unit_tests_sequential(
+    cfg: PipelineConfig,
+    paths: dict,
+@@ -286,13 +84,13 @@
+    flags: dict,
+) -> bool:
+    """
+-   Stage 6: integrate passed unit tests one-by-one into master test file.
++   Stage 5: integrate passed unit tests one-by-one into master test file.
+    After each: gcc -fsyntax-only check. Loop compile-fix on failure.
+    """
+    test_file: Path = paths["test_file"]
+    makefile: Path = paths["makefile"]
+    test_dir: Path = paths["test_dir"]
+-   process_name: str = paths["process_name"]
++   source_dir = cfg.source_dir.resolve()
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    cflags_str = " ".join(filter(None, [
+@@ -300,50 +98,6 @@
+        flags.get("CPPFLAGS", ""), flags.get("INCLUDE", ""),
+        ]))
+```
+
+```python
+last_merge_context: dict | None = None
+fix_limit = max(1, int(getattr(cfg, "max_fix_attempts", 5)))
+coverage_threshold = float(getattr(cfg, "coverage_threshold", 100.0))
+all_ok = True
+
+pre_source_makefiles = _source_makefile_text([
+    cfg.source_dir.resolve() / "Makefile",
+    cfg.source_dir.parent.parent.resolve() / "Makefile",
+```
+
+```python
+])
+    pre = run_make_test(test_dir)
+    if not pre.get("ok"):
+        print("[pipeline] WARN: master test suite does not compile before integration; attempting repairs", file=sys.stderr)
+        for attempt in range(1, fix_limit + 1):
+            diag = build_output_with_runtime_diagnostics(test_dir, test_file, pre)
+            prompt = prompt_for_master_test_fix(
+                process_name=process_name,
+                master_test_file=str(test_file),
+                master_makefile=str(makefile),
+                unit_test_file="",
+                unit_makefile="",
+                source_file_abs="",
+                func={"id": "pre_integration_check", "name": "pre_integration_check"},
+                unit_coverage_pct="unknown",
+                master_coverage_pct="unknown",
+                actual_source_files=_source_files_json_for_prompt(cfg),
+                source_makefiles=pre_source_makefiles,
+                existing_wraps=_existing_wrap_symbols(test_file),
+                build_output=diag,
+            )
+            run_agent(
+                cfg,
+                test_dir,
+                prompt,
+                f"_pre_integration_fix_{int(time.time())}.json",
+                folder=repo_root,
+            )
+            sync_wrap_flags(test_file, makefile)
+            pre = run_make_test(test_dir)
+            if pre.get("ok"):
+                print(f"[pipeline] pre-integration master build passed on attempt {attempt}", file=sys.stderr)
+                break
+                if attempt >= fix_limit:
+                    print("[pipeline] ERROR: pre-integration build still failing; continuing with integration anyway", file=sys.stderr)
+for func in functions_leaf_first(analysis):
+    func_id = func["id"]
+    safe_id = _safe_filename(func_id)
+@@ -357,7 +111,6 @@
+unit_dir = Path(result.get("unit_dir", ""))
+unit_test_file = unit_dir / f"test_{safe_id}.c"
+unit_makefile = unit_dir / "Makefile"
+if not unit_test_file.exists():
+    continue
+@@ -366,217 +119,69 @@
+print(f"[pipeline] no additions to integrate for {func_id}",
+```
+
+```diff
+file=sys.stderr)
+        continue
+
+-     source_file_abs = _resolve_source_file(cfg, func["source_file"])
+-     unit_cov_raw = result.get("coverage_pct")
+-     unit_cov_pct = float(unit_cov_raw) if isinstance(unit_cov_raw, (int,
+float)) else None
+-     current_cov_obj, current_cov_pct = _current_function_coverage(
+-         cfg, test_dir, source_file_abs, func
+-       )
+-     current_has_block = f"/* --- unit: {func_id} --- */" in
+read_text(test_file)
+- - - if current_has_block and _coverage_matches_target(
+-         current_cov_pct,
+-         unit_cov_pct,
+-         coverage_threshold,
+-       ):
+-         print(f"[pipeline] already integrated: {func_id}", file=sys.stderr)
+-         continue
+- print(f"[pipeline] Stage 6: integrating {func_id}", file=sys.stderr)
+-     current = read_text(test_file)
+
+-     cases_marker = "/* === Test Cases === */"
+-     reg_marker = "CU_basic_set_mode"
+
+-     if not current_has_block and cases_marker in current and
+test_cases.strip():
++     if cases_marker in current and test_cases.strip():
+      insertion = f"\n\n/* --- unit: {func_id} --- */\n{test_cases}\n"
+      current = current.replace(cases_marker, cases_marker + insertion, 1)
+
+-     if not current_has_block and reg_calls and reg_marker in current:
++     if reg_calls and reg_marker in current:
+      reg_insertion = "      " + "\n   ".join(reg_calls) + "\n    "
+      current = current.replace(reg_marker, reg_insertion + reg_marker, 1)
+
+      write_text(test_file, current)
+      sync_wrap_flags(test_file, makefile)
+
+-     source_makefile_candidates: list[Path] = []
+-     try:
+-         resolved_source_dir = cfg.source_dir.resolve()
+-         if resolved_source_dir.is_dir():
+-             source_makefile_candidates.append(resolved_source_dir /
+"Makefile")
+-     source_makefile_candidates.append(source_file_abs.parent /
+"Makefile")
+-     source_makefile_candidates.append(source_file_abs.parent.parent /
+"Makefile")
+-     source_makefile_candidates.append(repo_root / "Makefile")
+-     except Exception:
+-         pass
+```
+
+```txt
+source_makefile_candidates =
+list(dict.fromkeys(source_makefile_candidates))
+existing_source_makefiles = [p for p in source_makefile_candidates if
+p.exists()]
+ prompt = prompt_for_master_test_fix(
+    process_name=process_name,
+    master_test_file=str(test_file),
+    master_makefile=str(makefile),
+    unit_test_file=str(unit_test_file),
+    unit_makefile=str(unit_makefile),
+    source_file_abs=str(source_file_abs),
+    func={**func, "source_file": str(source_file_abs)},
+    unit_coverage_pct=str(unit_cov_pct if unit_cov_pct is not None else
+"unknown"),
+    master_coverage_pct=str(current_cov_pct if current_cov_pct is not
+None else "unknown"),
+    actual_source_files=_source_files_json_for_prompt(cfg),
+    source_makefiles=_source_makefile_text(existing_source_makefiles),
+    existing_wraps=_existing_wrap_symbols(test_file),
+    build_output=(
+        "Merged or repaired unit test additions in the master test
+file.\n"
+        f"Unit test file: {unit_test_file}\n"
+        f"Extracted CU_add_test registrations: {len(reg_calls)}\n"
+        f"Extracted test bodies: {len(test_cases.splitlines()) if
+test_cases else 0} lines"
+    ),
+)
+run_agent(
+    cfg,
+    test_dir,
+    prompt,
+    f"_unit_integrate_cleanup_{safe_id}_{{int(time.time()))}.json",
+    folder=repo_root,
+)
+sync_wrap_flags(test_file, makefile)
+# Syntax-check the master test file after each merge.
+# gcc -fsyntax-only is much faster than a full build + link and is
+# enough to catch declaration conflicts or missing types introduced
+# by the newly pasted test code.
+attempt = 1
+final = None
+final_cov_pct = current_cov_pct
+while attempt <= fix_limit:
+while True:
+chk = subprocess.run(
+    f"gcc -fsyntax-only {cflags_str} {test_file}",
+    shell=True, cwd=str(test_dir),
+    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    timeout=60,
+)
+```
+
+```python
+if chk.returncode != 0:
+    err = (chk.stderr + chk.stdout)[:6000]
+    print(f"[pipeline] syntax error after {func_id} attempt
+{attempt}, fixing", file=sys.stderr)
+    run_agent(
+        cfg,
+        test_dir,
+        prompt_for_master_test_fix(
+            process_name=process_name,
+            master_test_file=str(test_file),
+            master_makefile=str(makefile),
+            unit_test_file=str(unit_test_file),
+            unit_makefile=str(unit_makefile),
+            source_file_abs=str(source_file_abs),
+            func={**func, "source_file": str(source_file_abs)},
+            unit_coverage_pct=str(unit_cov_pct if unit_cov_pct is not
+None else "unknown"),
+            master_coverage_pct=str(final_cov_pct if final_cov_pct is
+not None else "unknown"),
+            actual_source_files=_source_files_json_for_prompt(cfg),
+source_makefiles=_source_makefile_text(existing_source_makefiles),
+            existing_wraps=_existing_wrap_symbols(test_file),
+            build_output=err,
+        ),
+        f"_unit_integrate_fix_{safe_id}_{int(time.time())}.json",
+        folder=repo_root,
+    )
+    sync_wrap_flags(test_file, makefile)
+    attempt += 1
+    continue
+
+    final = run_make_test(test_dir)
+    current_cov_obj, final_cov_pct = _current_function_coverage(
+        cfg, test_dir, source_file_abs, func
+    )
+    if final["ok"] and _coverage_matches_target(
+        final_cov_pct,
+        unit_cov_pct,
+        coverage_threshold,
+    ):
+        print(
+            f"[pipeline] master OK after {func_id} coverage=
+{final_cov_pct}%", 
+            file=sys.stderr,
+        )
+    if chk.returncode == 0:
+        print(f"[pipeline] master syntax OK after {func_id}",
+file=sys.stderr)
+        break
+
+    diag = build_output_with_runtime_diagnostics(test_dir, test_file,
+final)
+    diag += (
+```
+
+```diff
+"\n\n========== FUNCTION COVERAGE CHECK
+==========\n"
+    f"Target function: {func_id}\n"
+    f"Unit coverage: {unit_cov_pct}\n"
+    f"Master coverage: {final_cov_pct}\n"
+    f"Coverage threshold: {coverage_threshold}\n"
+    "The master file is not considered fully integrated until the "
+    "function's coverage is close to the standalone unit-test
+coverage.\n"
+    "Fix the merged test so it preserves the unit behavior and "
+    "coverage, not just compilation.\n"
+)
+print(
+    f"[pipeline] coverage mismatch after {func_id} attempt {attempt},
+fixing",
+    file=sys.stderr,
+)
++   err = (chk.stderr + chk.stdout)[:6000]
++   print(f"[pipeline] syntax error after {func_id} attempt {attempt},
+fixing", file=sys.stderr)
+run_agent(
+-   cfg,
+-   test_dir,
+-   prompt_for_master_test_fix(
+-       process_name=process_name,
+-       master_test_file=str(test_file),
+-       master_makefile=str(makefile),
+-       unit_test_file=str(unit_test_file),
+-       unit_makefile=str(unit_makefile),
+-       source_file_abs=str(source_file_abs),
+-       func={**func, "source_file": str(source_file_abs)},
+-       unit_coverage_pct=str(unit_cov_pct if unit_cov_pct is not
+None else "unknown"),
+-       master_coverage_pct=str(final_cov_pct if final_cov_pct is not
+None else "unknown"),
+-       actual_source_files=_source_files_json_for_prompt(cfg),
+source_makefiles=_source_makefile_text(existing_source_makefiles),
+-       existing_wraps=_existing_wrap_symbols(test_file),
+-       build_output=diag,
++   cfg, test_dir,
++   prompt_for_compile_fix(
++       str(makefile), str(test_file), err,
++       source_dir=str(source_dir),
++       source_makefile=str(source_dir / "Makefile"),
++       actual_source_files=[str(p) for p in
+_project_source_files(cfg)],
+),
+    f"_unit_integrate_fix_{safe_id}_{{int(time.time())}.json",
+    folder=repo_root,
+)
+- sync_wrap_flags(test_file, makefile)
+attempt += 1
+```
+
+```txt
+- last_merge_context = {
+- "func": {*func, "source_file": str(source_file_abs)},
+- "unit_test_file": str(unit_test_file),
+- "unit_makefile": str(unit_makefile),
+- "source_file_abs": str(source_file_abs),
+- "source_makefiles": _source_makefile_text(existing_source_makefiles),
+- "existing_wraps": _existing_wrap_symbols(test_file),
+- "unit_coverage_pct": str(unit_cov_pct if unit_cov_pct is not None
+else "unknown"),
+- "master_coverage_pct": str(final_cov_pct if final_cov_pct is not None
+else "unknown"),
+- }
+- if final is None or not final.get("ok") or not _coverage_matches_target(
+- final_cov_pct,
+- unit_cov_pct,
+- coverage_threshold,
+- ):
+- all_ok = False
+- print("[pipeline] Stage 6: running final make test on master suite",
+file=sys.stderr)
+final = run_make_test(test_dir)
+if not final["ok"]:
+print("[pipeline] WARN: final master make test failed after unit test
+integration", file=sys.stderr)
++ source_dir_f = cfg.source_dir.resolve()
+repo_root_f = cfg.source_dir.parent.parent.resolve()
+diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
+attempt = 1
+- while attempt <= fix_limit:
+- ctx = last_merge_context or {}
++ while True:
+run_agent(
+cfg, test_dir,
+prompt_for_master_test_fix(
+process_name=process_name,
+master_test_file=str(test_file),
+master_makefile=str(makefile),
+unit_test_file=str(ctx.get("unit_test_file", "")),
+unit_makefile=str(ctx.get("unit_makefile", "")),
+source_file_abs=str(ctx.get("source_file_abs", "")),
+func=ctx.get("func", {"id": "unknown_function"},
+unit_coverage_pct=str(ctx.get("unit_coverage_pct",
+"unknown")),
+master_coverage_pct=str(ctx.get("master_coverage_pct",
+"unknown")),
+actual_source_files=_source_files_json_for_prompt(cfg),
+source_makefiles=str(ctx.get("source_makefiles", " - none
+found")),
+existing_wraps=str(ctx.get("existing_wraps", " - none"),
+build_output=diag,
+prompt_for_compile_fix(
+str(makefile), str(test_file), diag,
+source_dir=str(source_dir_f),
+```
+
+```diff
++                 source_makefile=str(source_dir_f / "Makefile"),
++                 actual_source_files=[str(p) for p in
+_project_source_files(cfg)],
+        ),
+        f"_final_master_fix_{int(time.time())}.json",
+        folder=repo_root_f,
+@@ -588,4 +193,4 @@
+        break
+        diag = build_output_with_runtime_diagnostics(test_dir, test_file,
+final)
+        attempt += 1
+-     return bool(final["ok"] and all_ok)
++     return final["ok"]
+```

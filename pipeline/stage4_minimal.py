@@ -14,7 +14,6 @@ from .common import (
     sync_wrap_flags,
 )
 
-
 def prompt_for_minimal_test(process_name: str, test_file: str, entry_sym: str,
                             actual_source_files: str) -> str:
     return f"""
@@ -33,12 +32,67 @@ Actual production source files:
 {actual_source_files}
 
 Goal:
-Make a minimal startup test that compiles, links, runs, and exits quickly.
+Make a minimal startup test that compiles, links, runs, exits quickly, and produces
+non-zero coverage for the real production source file under src/.
 
 Do not over-engineer this stage.
 Do not deeply rewrite the test framework.
 Do not create many scenario tests here.
 Do not run real blocking loops, hardware calls, IPC, timers, daemon loops, or real sleeps.
+
+CRITICAL:
+A successful `make test` exit code is NOT enough.
+
+You must personally verify the generated CUnit/gcov report before calling
+submit_and_exit.
+
+After every edit, run:
+
+  make test
+
+Then read the generated report file in this directory.
+
+The report file will usually have a name similar to one of these:
+
+  {process_name}_report.txt
+  test_{process_name}_report.txt
+  unit_test_{process_name}_report.txt
+  *_report.txt
+
+Use commands such as:
+
+  ls -lt *_report.txt
+  cat *_report.txt
+
+You must inspect the report.
+
+The test is INVALID if the report shows zero CUnit tests, for example:
+
+  tests      0      0
+  asserts    0      0
+
+The test is also INVALID if the production source file under src/ still has zero
+coverage, for example:
+
+  File '/path/to/src/{process_name}/{process_name}.c'
+  Lines executed:0.00%
+
+If either of those happens:
+- do NOT call submit_and_exit
+- fix the test
+- run `make test` again
+- read the report again
+- repeat until the report is valid
+
+The report is valid only when:
+1. CUnit shows at least one test registered and ran.
+   The tests row must have Total > 0 and Ran > 0.
+
+2. The production source file under src/ has non-zero line coverage.
+   It must NOT say Lines executed:0.00% for the source file this test includes.
+
+3. The test actually calls `{entry_sym}` or a real startup path that reaches the
+   included production source.
 
 CRITICAL — production source inclusion:
 The test file already #includes the production source directly using this pattern:
@@ -65,17 +119,46 @@ Required:
    - exit
 5. Add/reset those counters in reset_mocks() if reset_mocks exists.
 6. Add one minimal CUnit test that calls {entry_sym}.
-7. Assert only basic startup behavior that is obvious from existing code.
-8. Ensure CUnit main returns non-zero on test failure using CU_get_number_of_failures().
+7. Register the test with CU_add_test().
+8. Ensure CU_basic_run_tests() is called.
+9. Ensure CUnit main returns non-zero on test failure using CU_get_number_of_failures().
+10. Run `make test`.
+11. Read the generated *_report.txt file.
+12. If tests ran = 0 or production src coverage = 0.00%, fix and retry.
+
+Expected CUnit main structure:
+
+  int main(void) {{
+      if (CU_initialize_registry() != CUE_SUCCESS) {{
+          return 1;
+      }}
+      CU_pSuite suite = CU_add_suite("minimal_startup", NULL, NULL);
+      if (suite == NULL) {{
+          CU_cleanup_registry();
+          return 1;
+      }}
+      if (CU_add_test(suite, "startup_runs", test_startup_runs) == NULL) {{
+          CU_cleanup_registry();
+          return 1;
+      }}
+      CU_basic_set_mode(CU_BRM_VERBOSE);
+      CU_basic_run_tests();
+
+      unsigned failures = CU_get_number_of_failures();
+      CU_cleanup_registry();
+
+      return failures == 0 ? 0 : 1;
+  }}
 
 Important:
-- This is only the bootstrap compile/run stage.
-- Do not attempt full semantic coverage here.
-- Keep changes small.
-- Preserve existing tests.
-- If a symbol/signature is unknown, inspect only the relevant header/source needed to fix it.
+- Do not submit only because compilation succeeded.
+- Do not submit only because `make test` returned 0.
+- Do not submit if the report says `tests 0 0`.
+- Do not submit if the production source under src/ says `Lines executed:0.00%`.
+- Keep editing/running/checking until the report proves real source execution.
 
-When done, call submit_and_exit.
+When the report proves at least one CUnit test ran and the production source has
+non-zero coverage, call submit_and_exit.
 """
 
 
@@ -146,11 +229,13 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
 
     if existing_res["ok"]:
         print(
-            f"[pipeline] existing test already compiles, runs, terminates, and passes; "
-            f"skipping minimal-test generation",
+            f"[pipeline] existing make test returned OK, but LLM must still inspect "
+            f"*_report.txt and verify non-zero tests plus non-zero src coverage",
             file=sys.stderr,
         )
-        return True
+
+        # # TODO: Fix this later
+        # return True
 
     print(
         f"[pipeline] existing test did not pass; running minimal validation for {entry_sym}()",

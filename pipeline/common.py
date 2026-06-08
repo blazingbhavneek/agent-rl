@@ -315,8 +315,14 @@ def run_agent(
 
 # region Build & coverage
 
+import re
+import subprocess
+from pathlib import Path
+
+
 def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
     cmd = ["make", "test"]
+
     try:
         proc = subprocess.run(
             cmd,
@@ -325,16 +331,53 @@ def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
             text=True,
             timeout=timeout,
         )
-        return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "timed_out": False,
-        }
     except subprocess.TimeoutExpired:
-        return {"ok": False, "returncode": -1, "stdout": "",
-            "stderr": f"make test timed out after {timeout}s", "timed_out": True}
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"make test timed out after {timeout}s",
+            "timed_out": True,
+            "errors": [f"make test timed out after {timeout}s"],
+        }
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    combined = stdout + "\n" + stderr
+
+    blocking_error_patterns = [
+        # GNU make hard failures
+        r"make(?:\[\d+\])?: \*\*\* .* Error \d+",
+        r"make(?:\[\d+\])?: .* Error \d+ \(ignored\)",
+        # compiler/linker hard failures
+        r"\berror:",
+        r"undefined reference",
+        r"collect2:\s+error",
+        r"ld returned \d+ exit status",
+        r"cannot open output file",
+        r"cannot find -l",
+        r"No such file or directory",
+        r"No rule to make target",
+        r"recipe for target .* failed",
+        r"\bStop\.",
+    ]
+
+    errors = []
+    for line in combined.splitlines():
+        s = line.strip()
+        if any(re.search(p, s, re.IGNORECASE) for p in blocking_error_patterns):
+            errors.append(s)
+
+    ok = proc.returncode == 0 and not errors
+
+    return {
+        "ok": ok,
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": False,
+        "errors": errors,
+    }
 
 
 def check_function_coverage(
@@ -714,6 +757,7 @@ You MAY change:
 - local prototypes used only by the test,
 - linker wrap flags in the test Makefile,
 - include/compiler/linker settings in the test Makefile if needed.
+- Some LIBS/INCLUDE that are included might not be present in the environment, based on error try to remove them and try so you know whats wrong.
 
 You MUST NOT change:
 - production source files,
