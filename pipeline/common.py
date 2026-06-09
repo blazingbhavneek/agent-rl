@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import PipelineConfig
+from .execution import assert_no_forbidden_host_paths, run_command
 
 
 # region IO helpers
@@ -246,9 +246,15 @@ def run_agent(
     agent_folder = folder or work_dir
     hist_dir = history_dir or (work_dir / "agent_history")
     history_path = hist_dir / history_name
+    prompt_file = history_path.with_suffix(".prompt.txt")
+    assert_no_forbidden_host_paths(
+        cfg,
+        "\n".join(str(p) for p in [work_dir, agent_folder, history_path, prompt_file]),
+        f"agent paths {history_name}",
+    )
     history_path.parent.mkdir(parents=True, exist_ok=True)
 
-    prompt_file = history_path.with_suffix(".prompt.txt")
+    assert_no_forbidden_host_paths(cfg, prompt, f"prompt {prompt_file}")
     write_text(prompt_file, prompt)
 
     # TODO: The raw HTTP trace didnt work recently, check this out
@@ -259,12 +265,18 @@ def run_agent(
         "--history", str(history_path),
         "--capture-raw-http-trace",
     ]
-
-    env = os.environ.copy()
-    env["MAX_ITERATIONS"] = str(
-        max_iterations if max_iterations is not None else cfg.max_agent_iterations
+    assert_no_forbidden_host_paths(
+        cfg,
+        "\n".join(str(part) for part in cmd),
+        f"agent command {history_name}",
     )
-    env["PYTHON_BIN"] = cfg.python_bin
+
+    env = {
+        "MAX_ITERATIONS": str(
+            max_iterations if max_iterations is not None else cfg.max_agent_iterations
+        ),
+        "PYTHON_BIN": cfg.python_bin,
+    }
 
     actual_timeout = timeout_sec if timeout_sec is not None else cfg.agent_timeout_sec
 
@@ -274,19 +286,18 @@ def run_agent(
 
     # Snapshot the source tree so we can restore any files the agent accidentally
     # modifies. Agents should only write inside test_dir; this is a safety net.
-    # TODO: Check this for docker images
-    _protect_dir = cfg.source_dir.parent.resolve() if protect_source else None
+    use_snapshot = protect_source and getattr(cfg, "execution_mode", "local") != "docker"
+    _protect_dir = cfg.source_dir.parent.resolve() if use_snapshot else None
     _snap = _snapshot_dir(_protect_dir) if _protect_dir is not None else {}
 
     print(f"[pipeline] agent -> {history_name}", file=sys.stderr)
     t0 = time.time()
     try:
-        proc = subprocess.run(
+        proc = run_command(
+            cfg,
             cmd,
-            cwd=str(work_dir),
+            cwd=work_dir,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=actual_timeout,
         )
         timed_out = False
@@ -317,20 +328,14 @@ def run_agent(
 
 # region Build & coverage
 
-import re
-import subprocess
-from pathlib import Path
-
-# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
-def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
+def run_make_test(cfg: PipelineConfig, test_dir: Path, timeout: int = 300) -> dict:
     cmd = ["make", "test"]
 
     try:
-        proc = subprocess.run(
+        proc = run_command(
+            cfg,
             cmd,
-            cwd=str(test_dir),
-            capture_output=True,
-            text=True,
+            cwd=test_dir,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -514,8 +519,12 @@ def check_function_coverage(
 
 # region Diagnostics
 
-# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
-def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
+def collect_failure_diagnostics(
+    cfg: PipelineConfig,
+    test_dir: Path,
+    test_file: Path,
+    res: dict,
+) -> str:
     chunks: list[str] = []
 
     test_binary_name = Path(test_file).stem
@@ -550,12 +559,10 @@ def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> s
         return "\n".join(chunks)
 
     try:
-        direct = subprocess.run(
+        direct = run_command(
+            cfg,
             [str(test_bin)],
-            cwd=str(test_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            cwd=test_dir,
             timeout=20,
         )
         chunks.append(
@@ -573,7 +580,8 @@ def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> s
         chunks.append(f"\n--- direct binary run failed ---\n{e}")
 
     try:
-        gdb = subprocess.run(
+        gdb = run_command(
+            cfg,
             [
                 "gdb", "-q", "-batch",
                 "-ex", "set pagination off",
@@ -582,10 +590,7 @@ def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> s
                 "-ex", "bt full",
                 "--args", str(test_bin),
             ],
-            cwd=str(test_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            cwd=test_dir,
             timeout=40,
         )
         chunks.append(
@@ -603,8 +608,11 @@ def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> s
 
     return "\n".join(chunks)
 
-# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
-def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> str:
+def collect_runtime_crash_diagnostics(
+    cfg: PipelineConfig,
+    test_dir: Path,
+    test_binary_name: str,
+) -> str:
     chunks: list[str] = []
     test_bin = test_dir / test_binary_name
 
@@ -632,12 +640,10 @@ def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> 
         return "\n".join(chunks)
 
     try:
-        direct = subprocess.run(
+        direct = run_command(
+            cfg,
             [str(test_bin)],
-            cwd=str(test_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            cwd=test_dir,
             timeout=20,
         )
         chunks.append(
@@ -655,7 +661,8 @@ def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> 
         chunks.append(f"\n--- direct binary run failed ---\n{e}")
 
     try:
-        gdb = subprocess.run(
+        gdb = run_command(
+            cfg,
             [
                 "gdb", "-q", "-batch",
                 "-ex", "set pagination off",
@@ -664,10 +671,7 @@ def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> 
                 "-ex", "bt full",
                 "--args", str(test_bin),
             ],
-            cwd=str(test_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            cwd=test_dir,
             timeout=40,
         )
         chunks.append(
@@ -686,10 +690,15 @@ def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> 
     return "\n".join(chunks)
 
 
-def build_output_with_runtime_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
-    base_output = collect_failure_diagnostics(test_dir, test_file, res)
+def build_output_with_runtime_diagnostics(
+    cfg: PipelineConfig,
+    test_dir: Path,
+    test_file: Path,
+    res: dict,
+) -> str:
+    base_output = collect_failure_diagnostics(cfg, test_dir, test_file, res)
     test_binary_name = Path(test_file).stem
-    diagnostics = collect_runtime_crash_diagnostics(test_dir, test_binary_name)
+    diagnostics = collect_runtime_crash_diagnostics(cfg, test_dir, test_binary_name)
 
     return (
         base_output

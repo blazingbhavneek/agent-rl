@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -21,6 +20,7 @@ from .common import (
     sync_wrap_flags,
     write_text,
 )
+from .execution import run_command
 
 
 def _extract_func_body(text: str, func_name: str) -> str:
@@ -308,11 +308,11 @@ def integrate_all_unit_tests_sequential(
         cfg.source_dir.resolve() / "Makefile",
         cfg.source_dir.parent.parent.resolve() / "Makefile",
     ])
-    pre = run_make_test(test_dir)
+    pre = run_make_test(cfg, test_dir)
     if not pre.get("ok"):
         print("[pipeline] WARN: master test suite does not compile before integration; attempting repairs", file=sys.stderr)
         for attempt in range(1, fix_limit + 1):
-            diag = build_output_with_runtime_diagnostics(test_dir, test_file, pre)
+            diag = build_output_with_runtime_diagnostics(cfg, test_dir, test_file, pre)
             prompt = prompt_for_master_test_fix(
                 process_name=process_name,
                 master_test_file=str(test_file),
@@ -336,7 +336,7 @@ def integrate_all_unit_tests_sequential(
                 folder=repo_root,
             )
             sync_wrap_flags(test_file, makefile)
-            pre = run_make_test(test_dir)
+            pre = run_make_test(cfg, test_dir)
             if pre.get("ok"):
                 print(f"[pipeline] pre-integration master build passed on attempt {attempt}", file=sys.stderr)
                 break
@@ -445,10 +445,11 @@ def integrate_all_unit_tests_sequential(
         final = None
         final_cov_pct = current_cov_pct
         while attempt <= fix_limit:
-            chk = subprocess.run(
+            chk = run_command(
+                cfg,
                 f"gcc -fsyntax-only {cflags_str} {test_file}",
-                shell=True, cwd=str(test_dir),
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                shell=True,
+                cwd=test_dir,
                 timeout=60,
             )
             if chk.returncode != 0:
@@ -479,7 +480,7 @@ def integrate_all_unit_tests_sequential(
                 attempt += 1
                 continue
 
-            final = run_make_test(test_dir)
+            final = run_make_test(cfg, test_dir)
             current_cov_obj, final_cov_pct = _current_function_coverage(
                 cfg, test_dir, source_file_abs, func
             )
@@ -494,7 +495,7 @@ def integrate_all_unit_tests_sequential(
                 )
                 break
 
-            diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
+            diag = build_output_with_runtime_diagnostics(cfg, test_dir, test_file, final)
             diag += (
                 "\n\n==================== FUNCTION COVERAGE CHECK ====================\n"
                 f"Target function: {func_id}\n"
@@ -552,11 +553,11 @@ def integrate_all_unit_tests_sequential(
             all_ok = False
 
     print("[pipeline] Stage 6: running final make test on master suite", file=sys.stderr)
-    final = run_make_test(test_dir)
+    final = run_make_test(cfg, test_dir)
     if not final["ok"]:
         print("[pipeline] WARN: final master make test failed after unit test integration", file=sys.stderr)
         repo_root_f = cfg.source_dir.parent.parent.resolve()
-        diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
+        diag = build_output_with_runtime_diagnostics(cfg, test_dir, test_file, final)
         attempt = 1
         while attempt <= fix_limit:
             ctx = last_merge_context or {}
@@ -581,10 +582,10 @@ def integrate_all_unit_tests_sequential(
                 folder=repo_root_f,
             )
             sync_wrap_flags(test_file, makefile)
-            final = run_make_test(test_dir)
+            final = run_make_test(cfg, test_dir)
             if final["ok"]:
                 print(f"[pipeline] final master make test passed on attempt {attempt}", file=sys.stderr)
                 break
-            diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
+            diag = build_output_with_runtime_diagnostics(cfg, test_dir, test_file, final)
             attempt += 1
     return bool(final["ok"] and all_ok)

@@ -225,7 +225,7 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
     )
 
     sync_wrap_flags(test_file, makefile)
-    existing_res = run_make_test(test_dir, timeout=90)
+    existing_res = run_make_test(cfg, test_dir, timeout=90)
 
     if existing_res["ok"]:
         print(
@@ -261,7 +261,7 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
         )
 
         sync_wrap_flags(test_file, makefile)
-        res = run_make_test(test_dir, timeout=90)
+        res = run_make_test(cfg, test_dir, timeout=90)
 
         if res["ok"]:
             print(
@@ -298,6 +298,7 @@ def ensure_minimal_test_runs(cfg: PipelineConfig, paths: dict) -> bool:
             )
             _src = cfg.source_dir.resolve()
             diagnostic_build_output = build_output_with_runtime_diagnostics(
+                cfg,
                 test_dir,
                 test_file,
                 res,

@@ -7,7 +7,13 @@ from pathlib import Path
 
 from pipeline.config import PipelineConfig, derive_paths
 from pipeline.analysis import run_or_load_analysis
-from pipeline.common import build_output_with_runtime_diagnostics, load_json, run_agent, run_make_test
+from pipeline.common import (
+    build_output_with_runtime_diagnostics,
+    load_json,
+    run_agent,
+    run_make_test,
+    sync_wrap_flags,
+)
 from pipeline.stage1_scaffold import ensure_test_file
 from pipeline.stage2_makefile import build_annotated_makefile, parse_source_makefile_flags
 from pipeline.stage3_stubs import handle_stubs
@@ -18,7 +24,6 @@ from pipeline.stage6_integrate import (
     _source_files_json_for_prompt,
     integrate_all_unit_tests_sequential,
     prompt_for_master_test_fix,
-    sync_wrap_flags, # Wrong import, this is supposed to be imported from common
 )
 
 
@@ -38,6 +43,26 @@ def parse_args() -> PipelineConfig:
 
     # max parallel workers for handling unit tests (since each unit test function has its own workspace)
     p.add_argument("--max-unit-test-workers", type=int, default=4)
+
+    p.add_argument("--execution-mode", choices=["local", "docker"], default="local")
+    p.add_argument("--container-name", default=None)
+    p.add_argument("--container-profile", type=Path, default=Path("/home/seigyo/.bash_profile"))
+    p.add_argument("--forbid-host-prefix", action="append", default=[])
+    p.add_argument("--stage", default="end-to-end", choices=[
+        "end-to-end",
+        "prepare",
+        "collect-stubs",
+        "select-stubs",
+        "materialize-stubs",
+        "integrate-stubs",
+        "minimal-master",
+        "collect-unit-tests",
+        "select-unit-tests",
+        "materialize-unit-tests",
+        "integrate",
+    ])
+    p.add_argument("--episodes-per-item", type=int, default=1)
+    p.add_argument("--trace-dataset-dirname", default="_trace_dataset")
 
     # to target specific function/level to process
     p.add_argument("--only-function", default=None)
@@ -62,6 +87,13 @@ def parse_args() -> PipelineConfig:
         max_functions=a.max_functions,
         max_test_attempts=a.max_test_attempts,
         max_unit_test_workers=a.max_unit_test_workers,
+        execution_mode=a.execution_mode,
+        container_name=a.container_name,
+        container_profile=a.container_profile,
+        forbidden_host_prefixes=tuple(a.forbid_host_prefix or ()),
+        stage=a.stage,
+        episodes_per_item=max(1, a.episodes_per_item),
+        trace_dataset_dirname=a.trace_dataset_dirname,
         only_function=a.only_function,
         only_level=a.only_level,
         agent_js=a.agent_js,
@@ -73,6 +105,12 @@ def parse_args() -> PipelineConfig:
 
 def run(cfg: PipelineConfig) -> None:
     paths = derive_paths(cfg)
+
+    if cfg.stage != "end-to-end":
+        from pipeline.data_collection import run_selected_stage
+
+        run_selected_stage(cfg, paths)
+        return
 
     # Paths we have:
     # test_dir
@@ -99,7 +137,7 @@ def run(cfg: PipelineConfig) -> None:
             analysis = run_or_load_analysis(cfg, paths["analysis_path"])
             
             # run the make tests command in the test directory and parse errors etc
-            pre = run_make_test(paths["test_dir"])
+            pre = run_make_test(cfg, paths["test_dir"])
             
             # TODO: remove this, this shouldnt exists? this is interfereing with integration process ig? other way to check integration and checkpoint for working versions
             if not pre.get("ok"):
@@ -107,7 +145,7 @@ def run(cfg: PipelineConfig) -> None:
                 test_file = Path(paths["test_file"])
                 makefile = Path(paths["makefile"])
                 for attempt in range(1, 6):
-                    diag = build_output_with_runtime_diagnostics(paths["test_dir"], test_file, pre)
+                    diag = build_output_with_runtime_diagnostics(cfg, paths["test_dir"], test_file, pre)
 
                     # this is the same prompt for compile fixer when integrating new tests
                     prompt = prompt_for_master_test_fix(
@@ -127,7 +165,7 @@ def run(cfg: PipelineConfig) -> None:
                     )
                     run_agent(cfg, paths["test_dir"], prompt, f"_pre_integration_fix_{int(time.time())}.json", folder=cfg.source_dir.parent.parent.resolve())
                     sync_wrap_flags(test_file, makefile)
-                    pre = run_make_test(paths["test_dir"])
+                    pre = run_make_test(cfg, paths["test_dir"])
                     if pre.get("ok"):
                         print(f"[pipeline] pre-integration master build passed on attempt {attempt}", file=sys.stderr)
                         break

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -15,6 +14,7 @@ from .common import (
     write_json,
     write_text,
 )
+from .execution import assert_no_forbidden_host_paths, run_command
 
 # Parses Makefile variable assignments (e.g. CFLAGS, CPPFLAGS), including line continuations using '\'
 def parse_source_makefile_flags(source_makefile: Path) -> dict:
@@ -86,13 +86,10 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
             file=sys.stderr,
         )
 
-        # TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
-        res = subprocess.run(
+        res = run_command(
+            cfg,
             ["do_mkmf", test_program],
-            cwd=str(test_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            cwd=test_dir,
             timeout=300,
         )
 
@@ -236,7 +233,7 @@ clean-test:
 
     # Step 4: persist parsed flags + source paths to _pipeline_context.json so
     # every downstream stage can load them without re-reading the Makefile.
-    write_json(context_file, {
+    context_data = {
         "process_name": process_name,
         "source_dir": str(source_dir),
         "source_makefile": str(source_makefile),
@@ -245,7 +242,13 @@ clean-test:
         "test_dir": str(paths["test_dir"]),
         "test_file": str(paths["test_file"]),
         "makefile": str(makefile),
-    })
+    }
+    assert_no_forbidden_host_paths(
+        cfg,
+        "\n".join(str(v) for v in context_data.values()),
+        str(context_file),
+    )
+    write_json(context_file, context_data)
 
     # Probably not needed here
     sync_wrap_flags(paths["test_file"], makefile)

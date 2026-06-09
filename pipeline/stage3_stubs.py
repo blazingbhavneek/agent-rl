@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,6 +24,7 @@ from .common import (
     write_json,
     write_text,
 )
+from .execution import run_command
 
 
 # region Doc matching
@@ -120,6 +120,9 @@ def generate_stub_code(
     cfg: PipelineConfig,
     test_dir: Path,
     func_name: str,
+    *,
+    stub_dir_override: Optional[Path] = None,
+    history_dir_override: Optional[Path] = None,
 ) -> Optional[str]:
     """
     Generate or reuse one wrapper stub.
@@ -134,8 +137,9 @@ def generate_stub_code(
     It only writes _stub_gen/<func>/stub.c.
     """
     safe_name = _safe_filename(func_name)
-    stub_dir = test_dir / "_stub_gen" / safe_name
+    stub_dir = stub_dir_override or (test_dir / "_stub_gen" / safe_name)
     stub_dir.mkdir(parents=True, exist_ok=True)
+    history_dir = history_dir_override or (test_dir / "agent_history")
     stub_out = stub_dir / "stub.c"
 
     # Remove surrounding Markdown code fences and trim whitespace from stub content
@@ -174,7 +178,13 @@ def generate_stub_code(
                 f"[pipeline] stub exists unvalidated for {func_name}, validating",
                 file=sys.stderr,
             )
-            if not _validate_stub_locally(cfg, test_dir, func_name, stub_dir):
+            if not _validate_stub_locally(
+                cfg,
+                test_dir,
+                func_name,
+                stub_dir,
+                history_dir=history_dir,
+            ):
                 print(
                     f"[pipeline] existing stub {func_name} failed validation, regenerating",
                     file=sys.stderr,
@@ -286,7 +296,7 @@ Dont end conversation until you are done.
         cfg,
         work_dir=repo_root,
         folder=repo_root,
-        history_dir=test_dir / "agent_history",
+        history_dir=history_dir,
         prompt=prompt,
         history_name=f"_gen_stub_{safe_name}.json",
         max_iterations=cfg.max_agent_iterations,
@@ -312,7 +322,13 @@ Dont end conversation until you are done.
         )
         return None
 
-    _validate_stub_locally(cfg, test_dir, func_name, stub_dir)
+    _validate_stub_locally(
+        cfg,
+        test_dir,
+        func_name,
+        stub_dir,
+        history_dir=history_dir,
+    )
     return body
 
 
@@ -321,6 +337,8 @@ def _validate_stub_locally(
     test_dir: Path,
     func_name: str,
     stub_dir: Path,
+    *,
+    history_dir: Optional[Path] = None,
 ) -> bool:
     """
     Compile-validate and runtime-validate a stub.
@@ -331,6 +349,7 @@ def _validate_stub_locally(
     validate_main = stub_dir / "stub_validate_main.c"
     validate_bin = stub_dir / "stub_validate"
     result_file = stub_dir / "result.json"
+    fix_history_dir = history_dir or (test_dir / "agent_history")
 
     if result_file.exists():
         try:
@@ -377,44 +396,46 @@ int main(void) {{
 
         # TODO: Take care of this when we switch to docker
         # Compile the generated stub into an object file.
-        compile_res = subprocess.run(
+        compile_res = run_command(
+            cfg,
             f"gcc -c {cflags} {stub_c} -o {stub_dir}/stub.o",
-            shell=True, cwd=str(stub_dir),
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            shell=True,
+            cwd=stub_dir,
             timeout=60,
         )
         if compile_res.returncode != 0:
             err = (compile_res.stderr + compile_res.stdout)
             print(f"[pipeline] stub compile error {func_name} attempt {attempt}: {err}", file=sys.stderr)
-            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
+            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, fix_history_dir)
             attempt += 1
             continue
 
         # Link the stub with a minimal validation harness using --wrap.
-        link_res = subprocess.run(
+        link_res = run_command(
+            cfg,
             f"gcc {cflags} {stub_c} {validate_main} -Wl,--wrap={func_name} -o {validate_bin}",
-            shell=True, cwd=str(stub_dir),
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            shell=True,
+            cwd=stub_dir,
             timeout=60,
         )
         if link_res.returncode != 0:
             err = (link_res.stderr + link_res.stdout)
             print(f"[pipeline] stub link error {func_name} attempt {attempt}: {err}", file=sys.stderr)
-            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
+            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, fix_history_dir)
             attempt += 1
             continue
 
         # Execute the validation binary to ensure the wrapped stub runs.
-        run_res = subprocess.run(
+        run_res = run_command(
+            cfg,
             [str(validate_bin)],
-            cwd=str(stub_dir),
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=stub_dir,
             timeout=15,
         )
         if run_res.returncode != 0:
             err = f"runtime exit={run_res.returncode}\n{run_res.stderr}\n{run_res.stdout}"
             print(f"[pipeline] stub runtime error {func_name} attempt {attempt}: {err}", file=sys.stderr)
-            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
+            _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, fix_history_dir)
             attempt += 1
             continue
 
@@ -455,7 +476,7 @@ Dont end conversation until the task is done.
         prompt=prompt,
         history_name=f"_stub_fix_{_safe_filename(func_name)}_{int(time.time())}.json",
         folder=repo_root,
-        history_dir=history_dir / "agent_history",
+        history_dir=history_dir,
         protect_source=True,
     )
 
@@ -495,12 +516,12 @@ def integrate_all_stubs_sequential(
         attempt = 1
         while True:
             sync_wrap_flags(test_file, makefile)
-            res = run_make_test(test_dir)
+            res = run_make_test(cfg, test_dir)
             if res["ok"]:
                 print(f"[pipeline] master OK after stub: {func_name}", file=sys.stderr)
                 break
             print(f"[pipeline] make test failed after stub {func_name} attempt {attempt}, fixing", file=sys.stderr)
-            diag = build_output_with_runtime_diagnostics(test_dir, test_file, res)
+            diag = build_output_with_runtime_diagnostics(cfg, test_dir, test_file, res)
             run_agent(
                 cfg,
                 test_dir,

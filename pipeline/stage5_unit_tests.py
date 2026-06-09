@@ -84,7 +84,13 @@ def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path) -
 
 # region Scaffold
 
-def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Path:
+def _scaffold_unit_test_dir(
+    cfg: PipelineConfig,
+    paths: dict,
+    func: dict,
+    *,
+    unit_dir_override: Optional[Path] = None,
+) -> Path:
     """Create _unit_tests/<func_id>/ with skeleton test file + generated Makefile."""
     test_dir: Path = paths["test_dir"]
     process_name: str = paths["process_name"]
@@ -93,7 +99,7 @@ def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Pat
     test_program = f"test_{safe_id}"
     test_src = f"{test_program}.c"
 
-    unit_dir = test_dir / "_unit_tests" / safe_id
+    unit_dir = unit_dir_override or (test_dir / "_unit_tests" / safe_id)
     unit_dir.mkdir(parents=True, exist_ok=True)
     (unit_dir / "agent_history").mkdir(exist_ok=True)
 
@@ -298,6 +304,8 @@ def _generate_unit_test_for_func(
     func: dict,
     flags: dict,
     semantic_context_snapshot: dict,
+    *,
+    unit_dir_override: Optional[Path] = None,
 ) -> tuple[str, dict]:
     """
     Generate, compile/run, coverage-check, semantic-judge, and repair one unit test.
@@ -315,7 +323,7 @@ def _generate_unit_test_for_func(
     process_name: str = paths["process_name"]
 
     repo_root = cfg.source_dir.parent.parent.resolve()
-    unit_dir = test_dir / "_unit_tests" / safe_id
+    unit_dir = unit_dir_override or (test_dir / "_unit_tests" / safe_id)
     unit_test_file = unit_dir / f"test_{safe_id}.c"
     unit_makefile = unit_dir / "Makefile"
     judge_verdict_file = unit_dir / "judge_verdict.json"
@@ -401,7 +409,7 @@ def _generate_unit_test_for_func(
             _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
             sync_wrap_flags(unit_test_file, unit_makefile)
 
-            existing_make_res = run_make_test(unit_dir)
+            existing_make_res = run_make_test(cfg, unit_dir)
             last_make_ok = bool(existing_make_res.get("ok"))
 
             coverage_result = check_function_coverage(
@@ -484,6 +492,7 @@ def _generate_unit_test_for_func(
 
         try:
             diag = build_output_with_runtime_diagnostics(
+                cfg,
                 unit_dir,
                 unit_test_file,
                 make_res,
@@ -772,7 +781,12 @@ Dont exit until you have written the test code in target test file and made sure
 
     max_attempts = int(cfg.max_test_attempts or 4)
 
-    unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
+    unit_dir = _scaffold_unit_test_dir(
+        cfg,
+        paths,
+        func,
+        unit_dir_override=unit_dir_override,
+    )
     unit_test_file = unit_dir / f"test_{safe_id}.c"
     unit_makefile = unit_dir / "Makefile"
     judge_verdict_file = unit_dir / "judge_verdict.json"
@@ -1084,7 +1098,7 @@ Then verify:
         _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
         sync_wrap_flags(unit_test_file, unit_makefile)
 
-        make_res = run_make_test(unit_dir)
+        make_res = run_make_test(cfg, unit_dir)
         last_make_ok = bool(make_res.get("ok"))
 
         coverage_result, coverage_pct = _run_current_coverage()
@@ -1229,7 +1243,7 @@ STRICT COMPILE-FIX RULES:
             _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
             sync_wrap_flags(unit_test_file, unit_makefile)
 
-            make_res = run_make_test(unit_dir)
+            make_res = run_make_test(cfg, unit_dir)
             last_make_ok = bool(make_res.get("ok"))
 
             coverage_result, coverage_pct = _run_current_coverage()

@@ -12,6 +12,13 @@ class PipelineConfig:
     agent_js: Path
     system_json: Optional[Path] = None
     func_docs_dir: Path = Path("/home/seigyo/rl/moove_docs/func")
+    execution_mode: str = "local"
+    container_name: Optional[str] = None
+    container_profile: Path = Path("/home/seigyo/.bash_profile")
+    forbidden_host_prefixes: tuple[str, ...] = ()
+    stage: str = "end-to-end"
+    episodes_per_item: int = 1
+    trace_dataset_dirname: str = "_trace_dataset"
     agent_timeout_sec: int = 1800
     max_agent_iterations: int = 25
     max_compile_fix_attempts: int = 5
