@@ -3,9 +3,13 @@ from __future__ import annotations
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
+from . import container as container_mod
 from .analysis import collect_stub_candidates, functions_leaf_first, run_or_load_analysis
 from .common import _safe_filename, load_json, read_text, write_json
 from .config import PipelineConfig
@@ -80,6 +84,96 @@ def _target_functions(cfg: PipelineConfig, analysis: dict) -> list[dict]:
     return funcs
 
 
+def _reset_dir(p: Path) -> None:
+    """Remove an active item dir so the next episode starts pristine."""
+    shutil.rmtree(p, ignore_errors=True)
+
+
+def _harvest(src_dir: Path, dst_dir: Path, names: list[str]) -> None:
+    """Copy each named file/dir from src_dir into dst_dir if it exists."""
+    for name in names:
+        src = src_dir / name
+        if not src.exists():
+            continue
+        dst = dst_dir / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def _harvest_glob(src_dir: Path, dst_dir: Path, pattern: str) -> None:
+    """Copy files matching glob (shared agent_history entries) into dst_dir."""
+    if not src_dir.exists():
+        return
+    matches = list(src_dir.glob(pattern))
+    if not matches:
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for src in matches:
+        if src.is_file():
+            shutil.copy2(src, dst_dir / src.name)
+
+
+def _prepare_episode_testdir(base: Path, dest: Path, *, include_stub_gen: bool) -> None:
+    """Copy the prepared canonical test dir into a per-episode host dir.
+
+    Excludes the dataset archive and the active per-function dirs so the agent
+    sees a pristine layout. Stub episodes start without _stub_gen; unit episodes
+    keep the selected/materialized stubs they depend on.
+    """
+    ignore_names = {"_trace_dataset", "_unit_tests"}
+    if not include_stub_gen:
+        ignore_names.add("_stub_gen")
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(base, dest, ignore=shutil.ignore_patterns(*ignore_names))
+
+
+def _run_jobs(cfg: PipelineConfig, jobs: list) -> None:
+    """Run episode jobs, in parallel only for per-episode-container mode."""
+    workers = max(1, int(cfg.episode_concurrency)) if cfg.per_episode_container else 1
+    if workers == 1:
+        for job in jobs:
+            job()
+        return
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(job) for job in jobs]
+        for fut in as_completed(futures):
+            fut.result()
+
+
+def _episode_container(cfg: PipelineConfig, paths: dict, episode_root: Path, *, include_stub_gen: bool):
+    """Set up one fresh container for an episode.
+
+    Returns (run_cfg, host_test_dir, container_name). The host test dir is bound
+    at the canonical path; run_cfg carries the docker target + the host->canonical
+    path_map so the agent only sees canonical paths.
+    """
+    canonical = Path(paths["test_dir"])
+    repo_root = cfg.source_dir.parent.parent.resolve()
+    host_test_dir = episode_root / "testdir"
+    _prepare_episode_testdir(canonical, host_test_dir, include_stub_gen=include_stub_gen)
+    name = container_mod.episode_container_name()
+    container_mod.create(
+        cfg,
+        name,
+        host_test_dir=host_test_dir,
+        canonical_test_dir=canonical,
+        repo_root=repo_root,
+    )
+    run_cfg = replace(
+        cfg,
+        execution_mode="docker",
+        container_name=name,
+        per_episode_container=False,
+        path_map=((str(host_test_dir), str(canonical)),),
+    )
+    return run_cfg, host_test_dir, name
+
+
 def _copy_if_exists(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
@@ -103,43 +197,72 @@ def _stage_prepare(cfg: PipelineConfig, paths: dict) -> None:
     _prepare(cfg, paths)
 
 
+def _collect_one_stub(cfg: PipelineConfig, paths: dict, func_name: str, safe: str) -> None:
+    test_dir = Path(paths["test_dir"])
+    root = dataset_root(cfg, paths)
+    eid = _episode_id()
+    episode_root = root / "episodes" / "stubs" / safe / eid
+    workspace = episode_root / "workspace"
+    ep_history = episode_root / "agent_history"
+    body: Optional[str]
+
+    if cfg.per_episode_container:
+        run_cfg, H, name = _episode_container(cfg, paths, episode_root, include_stub_gen=False)
+        try:
+            body = generate_stub_code(
+                run_cfg,
+                test_dir,  # canonical: keeps generated content canonical
+                func_name,
+                stub_dir_override=H / "_stub_gen" / safe,      # host write location
+                history_dir_override=H / "agent_history",
+            )
+        finally:
+            container_mod.teardown(name)
+        _harvest(H / "_stub_gen" / safe, workspace, ["stub.c", "result.json", "stub_validate_main.c"])
+        _harvest_glob(H / "agent_history", ep_history, f"_gen_stub_{safe}.*")
+        _harvest_glob(H / "agent_history", ep_history, f"_stub_fix_{safe}_*")
+    else:
+        active = test_dir / "_stub_gen" / safe
+        history_dir = test_dir / "agent_history"
+        # Pristine start: drop cached stub so the agent reruns and only ever sees
+        # the canonical _stub_gen path.
+        _reset_dir(active)
+        body = generate_stub_code(cfg, test_dir, func_name)
+        _harvest(active, workspace, ["stub.c", "result.json", "stub_validate_main.c"])
+        _harvest_glob(history_dir, ep_history, f"_gen_stub_{safe}.*")
+        _harvest_glob(history_dir, ep_history, f"_stub_fix_{safe}_*")
+        _reset_dir(active)  # leave pristine for the next episode/stage
+
+    result = {}
+    result_path = workspace / "result.json"
+    if result_path.exists():
+        try:
+            result = load_json(result_path)
+        except Exception:
+            result = {}
+    metadata = {
+        **_metadata_base(cfg, paths, "collect-stubs", eid),
+        "func_name": func_name,
+        "safe_name": safe,
+        "validated": bool(result.get("validated")),
+        "body_chars": len(body or ""),
+        "workspace": str(workspace),
+        "agent_history": str(ep_history),
+        "result": result,
+    }
+    write_json(episode_root / "metadata.json", metadata)
+
+
 def _stage_collect_stubs(cfg: PipelineConfig, paths: dict) -> None:
     _flags, analysis = _prepare(cfg, paths)
-    test_dir = Path(paths["test_dir"])
     candidates = collect_stub_candidates(analysis)
-    root = dataset_root(cfg, paths)
-    for func_name in candidates:
-        safe = _safe_filename(func_name)
-        for _ in range(max(1, int(cfg.episodes_per_item))):
-            eid = _episode_id()
-            episode_root = root / "episodes" / "stubs" / safe / eid
-            workspace = episode_root / "workspace"
-            history_dir = episode_root / "agent_history"
-            body = generate_stub_code(
-                cfg,
-                test_dir,
-                func_name,
-                stub_dir_override=workspace,
-                history_dir_override=history_dir,
-            )
-            result_path = workspace / "result.json"
-            result = {}
-            if result_path.exists():
-                try:
-                    result = load_json(result_path)
-                except Exception:
-                    result = {}
-            metadata = {
-                **_metadata_base(cfg, paths, "collect-stubs", eid),
-                "func_name": func_name,
-                "safe_name": safe,
-                "validated": bool(result.get("validated")),
-                "body_chars": len(body or ""),
-                "workspace": str(workspace),
-                "agent_history": str(history_dir),
-                "result": result,
-            }
-            write_json(episode_root / "metadata.json", metadata)
+    eps = max(1, int(cfg.episodes_per_item))
+    jobs = [
+        partial(_collect_one_stub, cfg, paths, func_name, _safe_filename(func_name))
+        for func_name in candidates
+        for _ in range(eps)
+    ]
+    _run_jobs(cfg, jobs)
 
 
 def _stage_select_stubs(cfg: PipelineConfig, paths: dict) -> None:
@@ -247,37 +370,75 @@ def _stage_minimal_master(cfg: PipelineConfig, paths: dict) -> None:
     })
 
 
-def _stage_collect_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
-    flags, analysis = _prepare(cfg, paths)
+def _collect_one_unit(
+    cfg: PipelineConfig,
+    paths: dict,
+    func: dict,
+    safe: str,
+    flags: dict,
+    semantic_context: dict,
+) -> None:
+    test_dir = Path(paths["test_dir"])
     root = dataset_root(cfg, paths)
-    semantic_context = _load_semantic_context(Path(paths["test_dir"]))
-    for func in _target_functions(cfg, analysis):
-        func_id = func["id"]
-        safe = _safe_filename(func_id)
-        for _ in range(max(1, int(cfg.episodes_per_item))):
-            eid = _episode_id()
-            episode_root = root / "episodes" / "unit_tests" / safe / eid
-            workspace = episode_root / "workspace"
+    eid = _episode_id()
+    episode_root = root / "episodes" / "unit_tests" / safe / eid
+    workspace = episode_root / "workspace"
+    harvest_names = [
+        f"test_{safe}.c",
+        "Makefile",
+        "coverage.json",
+        "judge_verdict.json",
+        "unit_test_failed.json",
+        "agent_history",  # includes good_cunit_backups/
+    ]
+
+    if cfg.per_episode_container:
+        run_cfg, H, name = _episode_container(cfg, paths, episode_root, include_stub_gen=True)
+        try:
             fid, result = _generate_unit_test_for_func(
-                cfg,
-                paths,
+                run_cfg,
+                paths,  # canonical: master refs + Makefile content stay canonical
                 func,
                 flags,
                 semantic_context,
-                unit_dir_override=workspace,
+                unit_dir_override=H / "_unit_tests" / safe,  # host write location
             )
-            metadata = {
-                **_metadata_base(cfg, paths, "collect-unit-tests", eid),
-                "func_id": fid,
-                "safe_id": safe,
-                "func": func,
-                "workspace": str(workspace),
-                "result": result,
-                "passed": bool(result.get("passed")),
-                "coverage_pct": result.get("coverage_pct"),
-                "semantic_score": result.get("semantic_score"),
-            }
-            write_json(episode_root / "metadata.json", metadata)
+        finally:
+            container_mod.teardown(name)
+        _harvest(H / "_unit_tests" / safe, workspace, harvest_names)
+    else:
+        active = test_dir / "_unit_tests" / safe
+        # Pristine start: clear only this function's active unit dir. Inputs
+        # (selected _stub_gen, minimal-master baseline, context) survive.
+        _reset_dir(active)
+        fid, result = _generate_unit_test_for_func(cfg, paths, func, flags, semantic_context)
+        _harvest(active, workspace, harvest_names)
+        _reset_dir(active)  # leave pristine for the next episode/stage
+
+    metadata = {
+        **_metadata_base(cfg, paths, "collect-unit-tests", eid),
+        "func_id": fid,
+        "safe_id": safe,
+        "func": func,
+        "workspace": str(workspace),
+        "result": result,
+        "passed": bool(result.get("passed")),
+        "coverage_pct": result.get("coverage_pct"),
+        "semantic_score": result.get("semantic_score"),
+    }
+    write_json(episode_root / "metadata.json", metadata)
+
+
+def _stage_collect_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
+    flags, analysis = _prepare(cfg, paths)
+    semantic_context = _load_semantic_context(Path(paths["test_dir"]))
+    eps = max(1, int(cfg.episodes_per_item))
+    jobs = [
+        partial(_collect_one_unit, cfg, paths, func, _safe_filename(func["id"]), flags, semantic_context)
+        for func in _target_functions(cfg, analysis)
+        for _ in range(eps)
+    ]
+    _run_jobs(cfg, jobs)
 
 
 def _unit_sort_key(metadata: dict) -> tuple[int, float, float, str]:

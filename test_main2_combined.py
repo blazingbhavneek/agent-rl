@@ -15,7 +15,7 @@ sys.modules["stub.stub"].ProjectAnalyzer = MagicMock()  # type: ignore[attr-defi
 import main2 as M
 from pipeline import data_collection as DC
 from pipeline.common import write_json
-from pipeline.execution import run_command
+from pipeline.execution import containerize_text, run_command
 
 
 def make_source(tmp_path: Path) -> Path:
@@ -108,6 +108,52 @@ def test_run_command_docker_requires_container(tmp_path: Path):
         run_command(cfg, ["make", "test"], cwd=tmp_path, timeout=5)
 
 
+def test_containerize_text_maps_host_to_canonical(tmp_path: Path):
+    cfg = make_cfg(
+        tmp_path,
+        execution_mode="docker",
+        path_map=(("/host/ep1/testdir", "/canon/tests/proc"),),
+    )
+    s = "OUTPUT FILE /host/ep1/testdir/_stub_gen/foo/stub.c"
+    assert containerize_text(cfg, s) == "OUTPUT FILE /canon/tests/proc/_stub_gen/foo/stub.c"
+    # local mode is a no-op even with a path_map set
+    cfg_local = M.PipelineConfig(**{**cfg.__dict__, "execution_mode": "local"})
+    assert containerize_text(cfg_local, "/host/x") == "/host/x"
+
+
+def test_per_episode_container_parallel_runs_all_episodes(tmp_path: Path):
+    cfg = make_cfg(
+        tmp_path,
+        stage="collect-stubs",
+        execution_mode="docker",
+        container_name="base",
+        per_episode_container=True,
+        container_image="img",
+        episodes_per_item=3,
+        episode_concurrency=2,
+    )
+    paths = M.derive_paths(cfg)
+    Path(paths["test_dir"]).mkdir(parents=True, exist_ok=True)
+    analysis = {"stub_candidates": {"a.c": ["foo"]}}
+
+    def fake_generate(run_cfg, test_dir, func_name, *, stub_dir_override, history_dir_override):
+        stub_dir_override.mkdir(parents=True, exist_ok=True)
+        (stub_dir_override / "stub.c").write_text("x", encoding="utf-8")
+        write_json(stub_dir_override / "result.json", {"validated": True})
+        return "x"
+
+    with patch.object(DC, "_prepare", return_value=({}, analysis)), \
+        patch.object(DC.container_mod, "create") as create, \
+        patch.object(DC.container_mod, "teardown") as teardown, \
+        patch.object(DC, "generate_stub_code", side_effect=fake_generate):
+        DC.run_selected_stage(cfg, paths)
+
+    assert create.call_count == 3
+    assert teardown.call_count == 3
+    episodes = list((Path(paths["test_dir"]) / "_trace_dataset" / "episodes" / "stubs" / "foo").iterdir())
+    assert len(episodes) == 3
+
+
 def test_main2_default_path_preserves_stage_order(tmp_path: Path):
     cfg = make_cfg(tmp_path)
     calls: list[str] = []
@@ -153,12 +199,13 @@ def test_collect_stubs_writes_episode_not_active_stub_dir(tmp_path: Path):
     paths = M.derive_paths(cfg)
     analysis = {"stub_candidates": {"a.c": ["foo"]}}
 
-    def fake_generate(_cfg, _test_dir, func_name, *, stub_dir_override, history_dir_override):
+    def fake_generate(_cfg, test_dir, func_name):
+        # Agent only ever sees the canonical pristine _stub_gen path.
         assert func_name == "foo"
-        stub_dir_override.mkdir(parents=True)
-        history_dir_override.mkdir(parents=True)
-        (stub_dir_override / "stub.c").write_text("void __wrap_foo(void) {}\n", encoding="utf-8")
-        write_json(stub_dir_override / "result.json", {"validated": True, "func_name": "foo"})
+        active = Path(test_dir) / "_stub_gen" / "foo"
+        active.mkdir(parents=True, exist_ok=True)
+        (active / "stub.c").write_text("void __wrap_foo(void) {}\n", encoding="utf-8")
+        write_json(active / "result.json", {"validated": True, "func_name": "foo"})
         return "void __wrap_foo(void) {}"
 
     with patch.object(DC, "_prepare", return_value=({}, analysis)), \
@@ -167,8 +214,84 @@ def test_collect_stubs_writes_episode_not_active_stub_dir(tmp_path: Path):
 
     episodes = list((Path(paths["test_dir"]) / "_trace_dataset" / "episodes" / "stubs" / "foo").iterdir())
     assert len(episodes) == 1
+    # Harvested into the host-only dataset episode.
     assert (episodes[0] / "workspace" / "stub.c").exists()
+    # Active item dir reset to pristine after harvest.
     assert not (Path(paths["test_dir"]) / "_stub_gen" / "foo").exists()
+
+
+def test_collect_unit_tests_writes_episode_and_resets_active(tmp_path: Path):
+    cfg = make_cfg(tmp_path, stage="collect-unit-tests")
+    paths = M.derive_paths(cfg)
+    analysis = {
+        "function_levels": {"1": ["leaf"]},
+        "functions": [{"id": "leaf", "depth": 1, "source_file": "a.c"}],
+    }
+
+    def fake_unit(_cfg, p, func, _flags, _ctx):
+        active = Path(p["test_dir"]) / "_unit_tests" / "leaf"
+        (active / "agent_history").mkdir(parents=True, exist_ok=True)
+        (active / "test_leaf.c").write_text("void test_leaf(void){}\n", encoding="utf-8")
+        write_json(active / "coverage.json", {"summary": {}})
+        return "leaf", {"passed": True, "coverage_pct": 90.0}
+
+    with patch.object(DC, "_prepare", return_value=({}, analysis)), \
+        patch.object(DC, "_load_semantic_context", return_value={}), \
+        patch.object(DC, "_generate_unit_test_for_func", side_effect=fake_unit):
+        DC.run_selected_stage(cfg, paths)
+
+    episodes = list((Path(paths["test_dir"]) / "_trace_dataset" / "episodes" / "unit_tests" / "leaf").iterdir())
+    assert len(episodes) == 1
+    assert (episodes[0] / "workspace" / "test_leaf.c").exists()
+    assert not (Path(paths["test_dir"]) / "_unit_tests" / "leaf").exists()
+
+
+def test_per_episode_container_lifecycle(tmp_path: Path):
+    cfg = make_cfg(
+        tmp_path,
+        stage="collect-stubs",
+        execution_mode="docker",
+        container_name="base",
+        per_episode_container=True,
+        container_image="img",
+    )
+    paths = M.derive_paths(cfg)
+    Path(paths["test_dir"]).mkdir(parents=True, exist_ok=True)  # canonical base to copy
+    analysis = {"stub_candidates": {"a.c": ["foo"]}}
+    seen: dict = {}
+
+    def fake_generate(run_cfg, test_dir, func_name, *, stub_dir_override, history_dir_override):
+        seen["container"] = run_cfg.container_name
+        seen["mode"] = run_cfg.execution_mode
+        seen["pathmap"] = run_cfg.path_map
+        # Agent writes into the per-episode host dir (mounted at canonical).
+        stub_dir_override.mkdir(parents=True, exist_ok=True)
+        (stub_dir_override / "stub.c").write_text("void __wrap_foo(void){}\n", encoding="utf-8")
+        write_json(stub_dir_override / "result.json", {"validated": True})
+        return "x"
+
+    with patch.object(DC, "_prepare", return_value=({}, analysis)), \
+        patch.object(DC.container_mod, "create") as create, \
+        patch.object(DC.container_mod, "teardown") as teardown, \
+        patch.object(DC, "generate_stub_code", side_effect=fake_generate):
+        DC.run_selected_stage(cfg, paths)
+
+    create.assert_called_once()
+    teardown.assert_called_once()
+    assert seen["mode"] == "docker"
+    assert seen["container"].startswith("attempt_")
+    # create(cfg, name, ...): fresh name is what run_command targets; no dataset path.
+    assert create.call_args.args[1] == seen["container"]
+    assert "_trace_dataset" not in create.call_args.args[1]
+    # Mount remaps the per-episode host dir onto the canonical test path.
+    assert create.call_args.kwargs["canonical_test_dir"] == Path(paths["test_dir"])
+    host_p, cont_p = seen["pathmap"][0]
+    assert cont_p == str(paths["test_dir"])
+    assert "_trace_dataset" in host_p  # host side keeps episode dirs
+    # Host keeps the full per-episode test dir + harvested workspace.
+    ep = next((Path(paths["test_dir"]) / "_trace_dataset" / "episodes" / "stubs" / "foo").iterdir())
+    assert (ep / "testdir").exists()
+    assert (ep / "workspace" / "stub.c").exists()
 
 
 def test_select_and_materialize_stub(tmp_path: Path):

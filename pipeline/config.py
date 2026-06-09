@@ -19,6 +19,20 @@ class PipelineConfig:
     stage: str = "end-to-end"
     episodes_per_item: int = 1
     trace_dataset_dirname: str = "_trace_dataset"
+    # When true, each collect-* episode runs inside its own freshly created
+    # docker container (torn down after). Requires execution_mode=docker and
+    # container_image. The canonical test path is shared host<->container
+    # exactly like the single-container mode, so episodes run serially.
+    per_episode_container: bool = False
+    container_image: Optional[str] = None
+    # Extra args inserted into `docker run` (e.g. -v mounts), repeatable.
+    container_run_args: tuple[str, ...] = ()
+    # Max episodes run concurrently when per_episode_container is on.
+    episode_concurrency: int = 1
+    # (host_prefix, container_prefix) pairs. In docker mode, run_command and the
+    # agent prompt rewrite host_prefix -> container_prefix so the agent only ever
+    # sees canonical pristine paths even though the host writes per-episode dirs.
+    path_map: tuple[tuple[str, str], ...] = ()
     agent_timeout_sec: int = 1800
     max_agent_iterations: int = 25
     max_compile_fix_attempts: int = 5

@@ -63,6 +63,10 @@ def parse_args() -> PipelineConfig:
     ])
     p.add_argument("--episodes-per-item", type=int, default=1)
     p.add_argument("--trace-dataset-dirname", default="_trace_dataset")
+    p.add_argument("--per-episode-container", action="store_true")
+    p.add_argument("--container-image", default=None)
+    p.add_argument("--container-run-arg", action="append", default=[])
+    p.add_argument("--episode-concurrency", type=int, default=1)
 
     # to target specific function/level to process
     p.add_argument("--only-function", default=None)
@@ -94,6 +98,10 @@ def parse_args() -> PipelineConfig:
         stage=a.stage,
         episodes_per_item=max(1, a.episodes_per_item),
         trace_dataset_dirname=a.trace_dataset_dirname,
+        per_episode_container=a.per_episode_container,
+        container_image=a.container_image,
+        container_run_args=tuple(a.container_run_arg or ()),
+        episode_concurrency=max(1, a.episode_concurrency),
         only_function=a.only_function,
         only_level=a.only_level,
         agent_js=a.agent_js,

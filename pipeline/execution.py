@@ -23,6 +23,31 @@ def assert_no_forbidden_host_paths(
             )
 
 
+def containerize_text(cfg: PipelineConfig, text: str) -> str:
+    """Rewrite host-side per-episode prefixes to canonical container paths.
+
+    No-op unless docker mode with a configured path_map. Longest prefixes are
+    applied first so a host dir nested under the canonical root maps cleanly.
+    """
+    if getattr(cfg, "execution_mode", "local") != "docker":
+        return text
+    pairs = sorted(
+        (getattr(cfg, "path_map", ()) or ()),
+        key=lambda p: len(p[0]),
+        reverse=True,
+    )
+    for host_prefix, container_prefix in pairs:
+        if host_prefix:
+            text = text.replace(host_prefix, container_prefix)
+    return text
+
+
+def _containerize_cmd(cfg: PipelineConfig, cmd: list[str] | str) -> list[str] | str:
+    if isinstance(cmd, str):
+        return containerize_text(cfg, cmd)
+    return [containerize_text(cfg, str(part)) for part in cmd]
+
+
 def _command_text(cmd: list[str] | str, *, shell: bool) -> str:
     if isinstance(cmd, str):
         return cmd
@@ -64,9 +89,13 @@ def run_command(
     if not container:
         raise ValueError("--container-name is required when --execution-mode=docker")
 
+    # Map per-episode host paths to canonical container paths.
+    cmd = _containerize_cmd(cfg, cmd)
+    cwd = containerize_text(cfg, str(Path(cwd)))
+
     inner_cmd = _command_text(cmd, shell=shell)
     profile = shlex.quote(str(getattr(cfg, "container_profile")))
-    cwd_text = shlex.quote(str(Path(cwd)))
+    cwd_text = shlex.quote(str(cwd))
     script = f"source {profile}; cd {cwd_text}; exec {inner_cmd}"
 
     docker_cmd = ["docker", "exec"]

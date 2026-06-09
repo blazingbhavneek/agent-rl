@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import PipelineConfig
-from .execution import assert_no_forbidden_host_paths, run_command
+from .execution import assert_no_forbidden_host_paths, containerize_text, run_command
 
 
 # region IO helpers
@@ -254,6 +254,9 @@ def run_agent(
     )
     history_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Rewrite per-episode host paths to canonical so the agent only sees the
+    # pristine container layout (no-op outside docker/path_map mode).
+    prompt = containerize_text(cfg, prompt)
     assert_no_forbidden_host_paths(cfg, prompt, f"prompt {prompt_file}")
     write_text(prompt_file, prompt)
 
