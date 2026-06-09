@@ -14,8 +14,8 @@ import { promisify } from "node:util";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 
 const execFileAsync = promisify(execFile);
-
 const COVERAGE_PYTHON = "/home/seigyo/rl/.venv/bin/python";
+
 
 const CONFIG = {
   providerId: process.env.PROVIDER_ID || "openai-compatible",
@@ -24,9 +24,11 @@ const CONFIG = {
   apiKey: process.env.OPENAI_API_KEY || "EMPTY",
   ragUrl: process.env.RAG_SERVICE_URL || "http://10.160.152.38:51029/",
   maxIter: Number.parseInt(process.env.MAX_ITERATIONS || "15", 10),
+
   // Do not default to 0/infinite.
   maxWaitMs: Number.parseInt(process.env.MAX_WAIT_MS || "900000", 10),
   idleWaitMs: Number.parseInt(process.env.IDLE_WAIT_MS || "180000", 10),
+
   heartbeatMs: Number.parseInt(process.env.HEARTBEAT_MS || "30000", 10),
   captureRawHttpTrace: /^(1|true|yes)$/i.test(
     process.env.CAPTURE_RAW_HTTP_TRACE || "",
@@ -78,9 +80,11 @@ function formatError(error) {
 function shortText(value, max = 300) {
   const text =
     typeof value === "string" ? value : JSON.stringify(value ?? null);
+
   if (text.length <= max) {
     return text;
   }
+
   return `${text.slice(0, max)}...`;
 }
 
@@ -128,9 +132,11 @@ function getOutputLength(value) {
   if (value == null) {
     return 0;
   }
+
   if (typeof value === "string") {
     return value.length;
   }
+
   try {
     return JSON.stringify(value).length;
   } catch {
@@ -196,6 +202,7 @@ async function parseArgs() {
     if (!existsSync(promptFile)) {
       throw new Error(`Prompt file not found: ${promptFile}`);
     }
+
     CONFIG.prompt = await readFile(promptFile, "utf8");
   }
 
@@ -232,6 +239,7 @@ class RAGClient {
       }
 
       const data = await response.json();
+
       if (path === "/query") {
         log(
           `[RAG] cache result: action=${data?.action || "unknown"} hasAnswer=${Boolean(
@@ -241,6 +249,7 @@ class RAGClient {
       } else if (path === "/search") {
         log(`[RAG] search result: chunks=${data?.chunks?.length || 0}`);
       }
+
       return data;
     }, context);
   }
@@ -324,6 +333,7 @@ def find_file_recursive(root, wanted_name, max_depth=8):
     def walk(path, depth):
         if depth > max_depth:
             return None
+
         try:
             entries = list(path.iterdir())
         except Exception:
@@ -338,9 +348,11 @@ def find_file_recursive(root, wanted_name, max_depth=8):
                 continue
             if entry.name in {".git", "node_modules", ".cache"}:
                 continue
+
             found = walk(entry, depth + 1)
             if found:
                 return found
+
         return None
 
     return walk(root, 0)
@@ -357,6 +369,7 @@ def parse_gcov_line(line):
         return None
 
     source_text = parts[2]
+
     executable = False
     covered = False
     count = None
@@ -388,6 +401,7 @@ def parse_gcov_line(line):
 
 try:
     payload = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
+
     workspace = Path(payload["workspace"]).resolve()
     gcov_file = payload["gcov_file"]
     function_id = payload["function_id"]
@@ -397,6 +411,7 @@ try:
     end_line = int(payload["end_line"])
 
     gcov_path = Path(gcov_file)
+
     if not gcov_path.is_absolute():
         gcov_path = workspace / gcov_file
 
@@ -426,6 +441,7 @@ try:
         sys.exit(0)
 
     text = gcov_path.read_text(encoding="utf-8", errors="replace")
+
     executable = []
     covered = []
     uncovered = []
@@ -436,8 +452,10 @@ try:
             continue
 
         line_number = parsed["line_number"]
+
         if line_number < start_line or line_number > end_line:
             continue
+
         if not parsed["executable"]:
             continue
 
@@ -447,7 +465,9 @@ try:
             "raw_count": parsed["raw_count"],
             "source": parsed["source_text"].rstrip(),
         }
+
         executable.append(item)
+
         if parsed["covered"]:
             covered.append(item)
         else:
@@ -456,6 +476,7 @@ try:
     executable_lines = len(executable)
     covered_lines = len(covered)
     uncovered_lines = len(uncovered)
+
     coverage_percent = 100.0 if executable_lines == 0 else round((covered_lines / executable_lines) * 100.0, 2)
 
     print(json.dumps({
@@ -474,6 +495,7 @@ try:
         },
         "uncovered": uncovered,
     }))
+
 except Exception as e:
     print(json.dumps({
         "ok": False,
@@ -497,9 +519,11 @@ except Exception as e:
         }
 
         const result = JSON.parse(stdout.trim());
+
         log(
           `[TOOL] analyze_function_coverage done function=${input.function_name} coverage=${result?.summary?.coverage_percent ?? "unknown"}%`,
         );
+
         return result;
       } catch (error) {
         return {
@@ -534,6 +558,7 @@ function createSearchTool(rag) {
       log(`[SPECIALIST TOOL] search_knowledge_base query="${shortText(query, 250)}"`);
 
       const data = await rag.search(query);
+
       if (!data?.chunks?.length) {
         log("[SPECIALIST TOOL] search_knowledge_base done: chunks=0");
         return "No relevant context found.";
@@ -546,6 +571,7 @@ function createSearchTool(rag) {
       log(
         `[SPECIALIST TOOL] search_knowledge_base done: chunks=${data.chunks.length} outputChars=${output.length}`,
       );
+
       return output;
     },
   });
@@ -574,6 +600,7 @@ async function answerWithSpecialist(rag, question) {
   log(`[SPECIALIST] question: ${shortText(question, 250)}`);
 
   const cached = await rag.query(question);
+
   if (cached?.action === "answer" && cached.answer) {
     log(`[SPECIALIST] cache hit: answerChars=${getOutputLength(cached.answer)}`);
     return `Q: ${question}\nA: ${cached.answer}\n[source:cache]`;
@@ -634,6 +661,7 @@ async function answerWithSpecialist(rag, question) {
   }
 
   await rag.cacheAnswer(question, answer);
+
   return `Q: ${question}\nA: ${answer}\n[source:subagent]`;
 }
 
@@ -658,6 +686,7 @@ function createAskSpecialistsTool(rag) {
     }),
     async execute({ questions }) {
       log(`[TOOL] ask_specialists started: count=${questions.length}`);
+
       questions.forEach((question, index) => {
         log(`[TOOL] ask_specialists q${index + 1}: ${shortText(question, 250)}`);
       });
@@ -676,14 +705,17 @@ function createAskSpecialistsTool(rag) {
           if (result.status === "fulfilled" && result.value) {
             return result.value;
           }
+
           if (result.status === "rejected") {
             return `[ERR] ${formatError(result.reason)}`;
           }
+
           return "[ERR] Specialist returned no result.";
         })
         .join(`\n\n${"-".repeat(50)}\n\n`);
 
       log(`[TOOL] ask_specialists finished: outputChars=${output.length}`);
+
       return output;
     },
   });
@@ -698,6 +730,7 @@ function buildSystemPrompt() {
 function buildToolPolicies() {
   return {
     ask_specialists: { autoApprove: true },
+
     read_files: { autoApprove: true },
     search_codebase: { autoApprove: true },
     run_commands: { autoApprove: true },
@@ -706,7 +739,6 @@ function buildToolPolicies() {
     editor: { autoApprove: true },
     skills: { autoApprove: true },
     ask_question: { autoApprove: true },
-    submit_and_exit: { autoApprove: true },
     analyze_function_coverage: { autoApprove: true },
   };
 }
@@ -722,9 +754,11 @@ function getToolResultOutput(event) {
   const toolResult = event.message?.content?.find(
     (part) => part.type === "tool-result",
   );
+
   if (toolResult?.type === "tool-result") {
     return toolResult.output;
   }
+
   return event.result;
 }
 
@@ -751,6 +785,7 @@ function createEventHandler() {
             sawTextDeltaThisTurn = true;
             process.stdout.write(text);
           }
+
           break;
         }
 
@@ -778,8 +813,9 @@ function createEventHandler() {
         case "tool-started": {
           const toolName = event.toolCall?.toolName || "unknown";
           RUN_STATE.currentTool = toolName;
+
           if (toolName === "submit_and_exit") {
-            log("[EXIT] submit_and_exit called");
+            log(`[EXIT] submit_and_exit called`);
           } else {
             log(
               `[TOOL] ${toolName} started: ${summarizeToolInput(
@@ -787,6 +823,7 @@ function createEventHandler() {
               )}`,
             );
           }
+
           break;
         }
 
@@ -794,14 +831,16 @@ function createEventHandler() {
           const toolName =
             event.toolCall?.toolName || RUN_STATE.currentTool || "unknown";
           const output = getToolResultOutput(event);
+
           if (toolName === "submit_and_exit") {
             RUN_STATE.submitAndExitFinished = true;
-            log("[EXIT] submit_and_exit finished");
+            log(`[EXIT] submit_and_exit finished`);
           } else {
             log(
               `[TOOL] ${toolName} finished: outputChars=${getOutputLength(output)}`,
             );
           }
+
           RUN_STATE.currentTool = null;
           break;
         }
@@ -949,6 +988,7 @@ function normalizeTerminalEvent(event) {
   }
 
   const existingStatus = getStatus(event);
+
   if (existingStatus) {
     return {
       ...event,
@@ -962,6 +1002,7 @@ function normalizeTerminalEvent(event) {
         ...event,
         status: "failed",
       };
+
     case "completed":
     case "run-completed":
     case "session-ended":
@@ -970,6 +1011,7 @@ function normalizeTerminalEvent(event) {
         ...event,
         status: "completed",
       };
+
     default:
       return {
         ...event,
@@ -982,12 +1024,15 @@ function statusFromFinishReason(reason) {
   if (reason === "timeout") {
     return "timeout";
   }
+
   if (reason === "idle-timeout") {
     return "idle-timeout";
   }
+
   if (reason === "submit_and_exit") {
     return "completed";
   }
+
   return "completed";
 }
 
@@ -1007,6 +1052,7 @@ async function pollSessionUntilDone(cline, sessionId) {
   }
 
   log(`[POLL] watching session=${sessionId}`);
+
   const startedAt = Date.now();
   let lastStatus = null;
 
@@ -1066,6 +1112,7 @@ async function waitForSessionEnd(cline, sessionId) {
   }
 
   log(`[WAIT] session=${sessionId}`);
+
   return new Promise((resolve) => {
     let done = false;
     const startedAt = Date.now();
@@ -1078,6 +1125,7 @@ async function waitForSessionEnd(cline, sessionId) {
       done = true;
       clearInterval(heartbeat);
       clearTimeout(timeout);
+
       try {
         unsubscribe?.();
       } catch {
@@ -1094,14 +1142,17 @@ async function waitForSessionEnd(cline, sessionId) {
 
     const monitor = (event) => {
       markActivity();
+
       if (isTerminalEvent(event, sessionId)) {
         finish(event?.type || "terminal-event", event);
       }
     };
 
     const unsubscribe = subscribeIfPossible(cline, monitor, "waiter");
+
     const heartbeat = setInterval(() => {
       const idle = Date.now() - RUN_STATE.lastActivityAt;
+
       log(
         `[RUNNING] elapsed=${elapsedSec()}s idle=${idleSec()}s turn=${RUN_STATE.turn} currentTool=${
           RUN_STATE.currentTool || "none"
@@ -1155,6 +1206,7 @@ async function collectFinalResult(cline, resultOrSession) {
       () => cline.readMessages(sessionId),
       "cline.readMessages",
     );
+
     if (readMessages) {
       messages = readMessages;
     }
@@ -1200,16 +1252,21 @@ async function main() {
     workspace_root: CONFIG.workspace,
     workspace: CONFIG.workspace,
     workspaceRoot: CONFIG.workspace,
+
     enable_tools: true,
     enable_spawn: true,
     enable_teams: false,
+
     enableTools: true,
     enableSpawnAgent: true,
     enableAgentTeams: false,
+
     systemPrompt: buildSystemPrompt(),
     maxIterations: Number.isFinite(CONFIG.maxIter) ? CONFIG.maxIter : 15,
+
     extraTools: [askSpecialistsTool, analyzeFunctionCoverageTool],
     toolPolicies: buildToolPolicies(),
+
     ...buildModelOptions(),
   };
 
@@ -1218,6 +1275,7 @@ async function main() {
     modelId: CONFIG.modelId,
     baseUrl: CONFIG.baseUrl,
     apiKey: CONFIG.apiKey,
+
     ...commonRuntimeFields,
   };
 
@@ -1246,15 +1304,19 @@ async function main() {
 
     if (cline?.host?.startSession) {
       const originalStartSession = cline.host.startSession.bind(cline.host);
+
       cline.host.startSession = async (input) => {
         log(
           `[SESSION] startSession tools=${input?.config?.enableTools ?? input?.enableTools} spawn=${
             input?.config?.enableSpawnAgent ?? input?.enableSpawnAgent
           } cwd=${input?.config?.cwd || input?.cwd || "unknown"}`,
         );
+
         const result = await originalStartSession(input);
+
         RUN_STATE.currentSessionId = getSessionId(result);
         log(`[SESSION] started id=${RUN_STATE.currentSessionId || "unknown"}`);
+
         return result;
       };
     }
@@ -1263,20 +1325,26 @@ async function main() {
 
     log("[CLINE] starting run");
     const resultOrSession = await cline.start(startOptions);
+
     const sessionId = getSessionId(resultOrSession);
     RUN_STATE.currentSessionId = sessionId;
+
     log(`[CLINE] start returned session=${sessionId || "unknown"}`);
+
     subscribeIfPossible(resultOrSession, handler, "session");
 
     let terminalSession = null;
+
     if (sessionId) {
       const waiters = [
         waitForSessionEnd(cline, sessionId),
         pollSessionUntilDone(cline, sessionId),
       ];
+
       if (resultOrSession?.[Symbol.asyncIterator]) {
         waiters.push(consumeAsyncEventsIfPossible(resultOrSession, handler));
       }
+
       terminalSession = await Promise.race(waiters);
     } else if (resultOrSession?.[Symbol.asyncIterator]) {
       terminalSession = await Promise.race([

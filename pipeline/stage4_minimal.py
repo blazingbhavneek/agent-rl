@@ -43,8 +43,7 @@ Do not run real blocking loops, hardware calls, IPC, timers, daemon loops, or re
 CRITICAL:
 A successful `make test` exit code is NOT enough.
 
-You must personally verify the generated CUnit/gcov report before calling
-submit_and_exit.
+You must personally verify the generated CUnit/gcov report before giving up.
 
 After every edit, run:
 
@@ -78,7 +77,7 @@ coverage, for example:
   Lines executed:0.00%
 
 If either of those happens:
-- do NOT call submit_and_exit
+- do end the conversation, keep on going
 - fix the test
 - run `make test` again
 - read the report again
@@ -132,15 +131,18 @@ Expected CUnit main structure:
       if (CU_initialize_registry() != CUE_SUCCESS) {{
           return 1;
       }}
+
       CU_pSuite suite = CU_add_suite("minimal_startup", NULL, NULL);
       if (suite == NULL) {{
           CU_cleanup_registry();
           return 1;
       }}
+
       if (CU_add_test(suite, "startup_runs", test_startup_runs) == NULL) {{
           CU_cleanup_registry();
           return 1;
       }}
+
       CU_basic_set_mode(CU_BRM_VERBOSE);
       CU_basic_run_tests();
 
@@ -157,8 +159,7 @@ Important:
 - Do not submit if the production source under src/ says `Lines executed:0.00%`.
 - Keep editing/running/checking until the report proves real source execution.
 
-When the report proves at least one CUnit test ran and the production source has
-non-zero coverage, call submit_and_exit.
+When the report proves at least one CUnit test ran and the production source has non-zero coverage, only then end conversation, untill then keep trying. 
 """
 
 
@@ -193,9 +194,8 @@ FIX:
        return safe_return_value;  /* 0, NULL, or valid handle — do NOT loop or exit */
    }}
    ```
-5. Run `make test` after fixing.
+5. Run `make test` after fixing. Keep fixing until its successful
 
-When done, call submit_and_exit.
 """
 
 

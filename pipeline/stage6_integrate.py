@@ -206,14 +206,14 @@ Wrapper symbols already present in the master file:
 {existing_wraps}
 
 FILES YOU MAY EDIT
-
+-------------
 - Master integrated test file:
   `{master_test_file}`
 - Master test Makefile:
   `{master_makefile}`
 
 FILES YOU MUST READ
-
+-------------
 - Master integrated test file:
   `{master_test_file}`
 - Standalone unit test file:
@@ -228,7 +228,6 @@ FILES YOU MUST READ
 {source_makefiles}
 
 BUILD / CONTENT RULES
-
 1. Read the master test file first. A lot of wrapper stubs/helpers are already
    present, so do not duplicate them.
 2. Read the standalone unit test file before editing the master file.
@@ -256,9 +255,7 @@ BUILD / CONTENT RULES
 13. If compilation fails, fix include paths, macros, or wrap flags first rather
     than deleting the merged tests.
 14. After any edit, run:
-
     `make test`
-
     Then inspect the generated report and coverage output:
     `ls -lt *_report.txt`
     `cat *_report.txt`
@@ -270,14 +267,13 @@ FAILING BUILD / TEST OUTPUT
 {build_output}
 
 STRICT RULES
-
+-------------
 - You may only edit the master integrated test file and its Makefile.
 - You must not edit production source files or headers.
 - Do not remove existing working wrappers just because they look unrelated.
 - Do not weaken assertions just to make the build pass.
 - If the master file already has the needed wrappers, leave them alone.
 
-When done, call submit_and_exit.
 """
 
 
@@ -354,6 +350,10 @@ def integrate_all_unit_tests_sequential(
         if not result.get("passed"):
             continue
 
+        if f"/* --- unit: {func_id} --- */" in read_text(test_file):
+            print(f"[pipeline] already integrated: {func_id}", file=sys.stderr)
+            continue
+
         unit_dir = Path(result.get("unit_dir", ""))
         unit_test_file = unit_dir / f"test_{safe_id}.c"
         unit_makefile = unit_dir / "Makefile"
@@ -411,7 +411,6 @@ def integrate_all_unit_tests_sequential(
 
         source_makefile_candidates = list(dict.fromkeys(source_makefile_candidates))
         existing_source_makefiles = [p for p in source_makefile_candidates if p.exists()]
-
         prompt = prompt_for_master_test_fix(
             process_name=process_name,
             master_test_file=str(test_file),
@@ -432,6 +431,7 @@ def integrate_all_unit_tests_sequential(
                 f"Extracted test bodies: {len(test_cases.splitlines()) if test_cases else 0} lines"
             ),
         )
+
         run_agent(
             cfg,
             test_dir,
@@ -441,10 +441,6 @@ def integrate_all_unit_tests_sequential(
         )
         sync_wrap_flags(test_file, makefile)
 
-        # Syntax-check the master test file after each merge.
-        # gcc -fsyntax-only is much faster than a full build + link and is
-        # enough to catch declaration conflicts or missing types introduced
-        # by the newly pasted test code.
         attempt = 1
         final = None
         final_cov_pct = current_cov_pct
@@ -456,7 +452,7 @@ def integrate_all_unit_tests_sequential(
                 timeout=60,
             )
             if chk.returncode != 0:
-                err = (chk.stderr + chk.stdout)[:6000]
+                err = (chk.stderr + chk.stdout)
                 print(f"[pipeline] syntax error after {func_id} attempt {attempt}, fixing", file=sys.stderr)
                 run_agent(
                     cfg,
@@ -500,7 +496,7 @@ def integrate_all_unit_tests_sequential(
 
             diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
             diag += (
-                "\n\n================ FUNCTION COVERAGE CHECK ================\n"
+                "\n\n==================== FUNCTION COVERAGE CHECK ====================\n"
                 f"Target function: {func_id}\n"
                 f"Unit coverage: {unit_cov_pct}\n"
                 f"Master coverage: {final_cov_pct}\n"
@@ -515,7 +511,8 @@ def integrate_all_unit_tests_sequential(
                 file=sys.stderr,
             )
             run_agent(
-                cfg, test_dir,
+                cfg,
+                test_dir,
                 prompt_for_master_test_fix(
                     process_name=process_name,
                     master_test_file=str(test_file),
@@ -558,6 +555,7 @@ def integrate_all_unit_tests_sequential(
     final = run_make_test(test_dir)
     if not final["ok"]:
         print("[pipeline] WARN: final master make test failed after unit test integration", file=sys.stderr)
+        repo_root_f = cfg.source_dir.parent.parent.resolve()
         diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
         attempt = 1
         while attempt <= fix_limit:
@@ -580,11 +578,12 @@ def integrate_all_unit_tests_sequential(
                     build_output=diag,
                 ),
                 f"_final_master_fix_{int(time.time())}.json",
-                folder=repo_root,
+                folder=repo_root_f,
             )
             sync_wrap_flags(test_file, makefile)
             final = run_make_test(test_dir)
             if final["ok"]:
+                print(f"[pipeline] final master make test passed on attempt {attempt}", file=sys.stderr)
                 break
             diag = build_output_with_runtime_diagnostics(test_dir, test_file, final)
             attempt += 1

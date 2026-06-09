@@ -29,6 +29,7 @@ from .common import (
 
 # region Doc matching
 
+# Normalize a filename/path into a safe identifier (lowercase, stem only, underscores for non-alphanumerics)
 def _normalize_doc_name(s: str) -> str:
     s = Path(s).stem
     s = s.lower()
@@ -137,6 +138,7 @@ def generate_stub_code(
     stub_dir.mkdir(parents=True, exist_ok=True)
     stub_out = stub_dir / "stub.c"
 
+    # Remove surrounding Markdown code fences and trim whitespace from stub content
     def _clean_stub_body(raw: str) -> str:
         body = raw.strip()
         body = re.sub(r"^```[a-zA-Z0-9_+-]*\s*\n", "", body)
@@ -277,7 +279,7 @@ STUB RULES
 - If output pointers exist, guard NULL and fill minimal safe values.
 - If callbacks are registered, store callback pointers in static globals or invoke them with safe dummy values when appropriate.
 
-When done, call submit_and_exit.
+Dont end conversation until you are done.
 """
 
     run_agent(
@@ -352,6 +354,8 @@ int main(void) {{
 """
     write_text(validate_main, harness)
 
+    # TODO: Take care of this in branch code, this wont exist anymore
+    # Getting import flags for a minimal gcc compile attempt to make sure it works with our flags and wrap flags
     repo_root = cfg.source_dir.parent.parent.resolve()
     context_file = test_dir / "_pipeline_context.json"
     flags: dict = {}
@@ -370,6 +374,9 @@ int main(void) {{
 
     attempt = 1
     while True:
+
+        # TODO: Take care of this when we switch to docker
+        # Compile the generated stub into an object file.
         compile_res = subprocess.run(
             f"gcc -c {cflags} {stub_c} -o {stub_dir}/stub.o",
             shell=True, cwd=str(stub_dir),
@@ -377,12 +384,13 @@ int main(void) {{
             timeout=60,
         )
         if compile_res.returncode != 0:
-            err = (compile_res.stderr + compile_res.stdout)[:3000]
-            print(f"[pipeline] stub compile error {func_name} attempt {attempt}: {err[:200]}", file=sys.stderr)
+            err = (compile_res.stderr + compile_res.stdout)
+            print(f"[pipeline] stub compile error {func_name} attempt {attempt}: {err}", file=sys.stderr)
             _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
             attempt += 1
             continue
 
+        # Link the stub with a minimal validation harness using --wrap.
         link_res = subprocess.run(
             f"gcc {cflags} {stub_c} {validate_main} -Wl,--wrap={func_name} -o {validate_bin}",
             shell=True, cwd=str(stub_dir),
@@ -390,12 +398,13 @@ int main(void) {{
             timeout=60,
         )
         if link_res.returncode != 0:
-            err = (link_res.stderr + link_res.stdout)[:3000]
-            print(f"[pipeline] stub link error {func_name} attempt {attempt}: {err[:200]}", file=sys.stderr)
+            err = (link_res.stderr + link_res.stdout)
+            print(f"[pipeline] stub link error {func_name} attempt {attempt}: {err}", file=sys.stderr)
             _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
             attempt += 1
             continue
 
+        # Execute the validation binary to ensure the wrapped stub runs.
         run_res = subprocess.run(
             [str(validate_bin)],
             cwd=str(stub_dir),
@@ -404,11 +413,12 @@ int main(void) {{
         )
         if run_res.returncode != 0:
             err = f"runtime exit={run_res.returncode}\n{run_res.stderr}\n{run_res.stdout}"
-            print(f"[pipeline] stub runtime error {func_name} attempt {attempt}: {err[:200]}", file=sys.stderr)
+            print(f"[pipeline] stub runtime error {func_name} attempt {attempt}: {err}", file=sys.stderr)
             _fix_stub_with_agent(cfg, stub_dir, func_name, err, repo_root, test_dir)
             attempt += 1
             continue
 
+        # Mark the stub as validated once compile, link, and runtime checks pass.
         write_json(result_file, {"validated": True, "func_name": func_name})
         print(f"[pipeline] stub validated: {func_name}", file=sys.stderr)
         return True
@@ -428,7 +438,7 @@ def _fix_stub_with_agent(
 FILE: {stub_c}
 
 ERROR:
-{error[:3000]}
+{error}
 
 RULES:
 - Edit ONLY {stub_c}
@@ -437,7 +447,7 @@ RULES:
 - Raw C only, no markdown
 - Keep: fprintf(stderr, "__wrap_{func_name} called\\n");
 
-When done, call submit_and_exit.
+Dont end conversation until the task is done.
 """
     run_agent(
         cfg,
@@ -454,6 +464,8 @@ When done, call submit_and_exit.
 
 # region Stub integration
 
+# TODO Make cline do it in clean and organized way, grouping stuff together with previous stuff, no repeat headers etc, instead of prompt_for_compile_fix, do integration each step
+# TODO: At the end of this process, make a backup of this, so we can check the backup out in integration unit tests stage (stage 6)
 def integrate_all_stubs_sequential(
     cfg: PipelineConfig,
     paths: dict,
@@ -516,9 +528,11 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
     test_dir: Path = paths["test_dir"]
     batch_size = max(1, int(cfg.stub_batch_size))
 
+    # This just makes a set of stub candidates
     candidates = collect_stub_candidates(analysis)
     print(f"[pipeline] {len(candidates)} stub candidates total", file=sys.stderr)
 
+    # Basic validation if the __wrap_X exists or not
     def _validated_stub_body(name: str) -> Optional[str]:
         stub_dir = test_dir / "_stub_gen" / _safe_filename(name)
         stub_out = stub_dir / "stub.c"
@@ -534,7 +548,9 @@ def handle_stubs(cfg: PipelineConfig, paths: dict, analysis: dict) -> None:
         if not body or f"__wrap_{name}" not in body or f"__real_{name}" in body:
             return None
         return body
-
+    
+    # Check stubs which are already done
+    # TODO: Any cleaner way to do this? this is weird way to do this ig, hard to read
     bodies: dict[str, str] = {}
     for n in candidates:
         cached = _validated_stub_body(n)

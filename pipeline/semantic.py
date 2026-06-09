@@ -291,7 +291,7 @@ Required repair behavior:
 Do not weaken tests just to compile.
 If something does not compile, inspect headers/source and correct it.
 
-When done, call submit_and_exit.
+Dont end conversation until the task is done.
 """
 
 
@@ -397,7 +397,7 @@ Do not delete meaningful tests.
 Do not weaken assertions to pass build.
 If something does not compile, inspect source/header definitions and fix it.
 
-When done, call submit_and_exit.
+Dont end conversation until the task is done.
 """
 
 # endregion Semantic judge prompts
@@ -424,6 +424,7 @@ def run_semantic_test_judge(
     No parse retries.
     If coverage reached this stage, accept it.
     """
+
     score = 100
 
     make_ok = bool((make_result or {}).get("ok"))

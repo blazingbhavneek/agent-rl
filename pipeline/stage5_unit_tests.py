@@ -38,6 +38,7 @@ from .semantic import (
 
 # region Stub sync helpers (used only by this stage)
 
+# get list of all stub dirs which have validated stubs
 def _stub_srcs_absolute(test_dir: Path) -> list[tuple[str, str]]:
     """Return [(abs_stub_path, func_name)] for all validated stubs."""
     stubs_dir = test_dir / "_stub_gen"
@@ -57,7 +58,8 @@ def _stub_srcs_absolute(test_dir: Path) -> list[tuple[str, str]]:
             pass
     return result
 
-
+# Deduplication of __wrap_X functions if defined inside the unit test file and stub also included
+# TODO: Remove this, dont link stub to it, rather tell agent to read from it
 def _sync_stub_srcs(unit_test_file: Path, unit_makefile: Path, test_dir: Path) -> None:
     """
     Update STUB_SRCS in unit Makefile to exclude stubs whose __wrap_ function
@@ -122,7 +124,8 @@ def _scaffold_unit_test_dir(cfg: PipelineConfig, paths: dict, func: dict) -> Pat
 
     return unit_dir
 
-
+# Detect old/generated Makefiles that belong to some other test and regenerate them instead of reusing them
+# TODO: Why we needed this in first place?
 def _unit_makefile_matches_contract(unit_makefile: Path, test_program: str, test_src: str) -> bool:
     """Keep stale per-function Makefiles from drifting off the current file-name contract."""
     text = read_text(unit_makefile)
@@ -276,7 +279,6 @@ coverage-test:
 
 clean-test:
 \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o
-
 $(LEGACY_TEST_SRCS): $(TEST_SRCS)
 \t@:
 
@@ -319,10 +321,10 @@ def _generate_unit_test_for_func(
     judge_verdict_file = unit_dir / "judge_verdict.json"
     coverage_file = unit_dir / "coverage.json"
     source_file_abs = _resolve_source_file(cfg, func["source_file"])
+
     master_test_file = test_dir / f"test_{process_name}.c"
     master_makefile = paths["makefile"]
     stub_gen_dir = test_dir / "_stub_gen"
-    source_file_abs = _resolve_source_file(cfg, func["source_file"])
 
     source_makefile_candidates: list[Path] = []
     try:
@@ -398,8 +400,10 @@ def _generate_unit_test_for_func(
         try:
             _sync_stub_srcs(unit_test_file, unit_makefile, test_dir)
             sync_wrap_flags(unit_test_file, unit_makefile)
+
             existing_make_res = run_make_test(unit_dir)
             last_make_ok = bool(existing_make_res.get("ok"))
+
             coverage_result = check_function_coverage(
                 unit_dir,
                 source_file_abs,
@@ -408,12 +412,15 @@ def _generate_unit_test_for_func(
                 source_root=cfg.source_dir.resolve(),
             )
             coverage_pct = _coverage_pct(coverage_result)
+
             if coverage_pct is not None and coverage_pct >= float(cfg.coverage_threshold):
                 print(
                     f"[pipeline] existing test has coverage={coverage_pct}%, starting from semantic judge: {func_id}",
                     file=sys.stderr,
                 )
+
                 func_for_prompt = {**func, "source_file": str(source_file_abs)}
+
                 judge = run_semantic_test_judge(
                     cfg,
                     test_dir=unit_dir,
@@ -424,6 +431,7 @@ def _generate_unit_test_for_func(
                     coverage=coverage_result or {},
                     make_result=existing_make_res or {},
                 )
+
                 backup_good_cunit_if_best(
                     unit_dir=unit_dir,
                     unit_test_file=unit_test_file,
@@ -435,9 +443,11 @@ def _generate_unit_test_for_func(
                     judge_verdict=judge,
                     cfg=cfg,
                 )
+
                 write_json(coverage_file, coverage_result or {})
                 write_json(judge_verdict_file, judge)
                 last_judge = judge
+
                 if judge.get("passed"):
                     print(
                         f"[pipeline] unit test PASSED from existing gcov: {func_id} score={judge.get('score')}",
@@ -450,6 +460,7 @@ def _generate_unit_test_for_func(
                         "verdict": judge,
                         "unit_dir": str(unit_dir),
                     }
+
                 last_build_diag = (
                     "Existing test reached coverage threshold, but semantic judge failed.\n"
                     + json.dumps(judge, ensure_ascii=False, indent=2, default=str)
@@ -459,6 +470,7 @@ def _generate_unit_test_for_func(
                     f"[pipeline] existing test judge FAILED: {func_id} score={last_judge.get('score') if last_judge else 'n/a'}",
                     file=sys.stderr,
                 )
+
         except RuntimeError:
             raise
         except Exception as e:
@@ -586,6 +598,17 @@ def _generate_unit_test_for_func(
             if existing_source_makefiles
             else " - none found"
         )
+
+    def _run_current_coverage() -> tuple[Optional[dict], Optional[float]]:
+        current_source = _resolve_source_file(cfg, func["source_file"])
+        cov_obj = check_function_coverage(
+            unit_dir,
+            current_source,
+            func["start_line"],
+            func["end_line"],
+            source_root=cfg.source_dir.resolve(),
+        )
+        return cov_obj, _coverage_pct(cov_obj)
 
     def _location_context(
         func_for_prompt: dict,
@@ -747,13 +770,6 @@ Dont exit until you have written the test code in target test file and made sure
         except Exception:
             pass
 
-    last_make_ok = True
-    # coverage_result: raw gcov dict returned by check_function_coverage().
-    # coverage_pct:   line-coverage % for the target function's line range.
-    coverage_result: Optional[dict] = None
-    coverage_pct: Optional[float] = None
-    last_build_diag: Optional[str] = None
-
     max_attempts = int(cfg.max_test_attempts or 4)
 
     unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
@@ -808,22 +824,23 @@ Dont exit until you have written the test code in target test file and made sure
 {unit_agent_location_context}
 
 IMPORTANT BASELINE TEMPLATE RULE
------------------------------------------------------------------------
+--------------------------------
 There is already a working parent minimal CUnit test for this process:
 
   {master_test_file}
 
 This parent test is known to:
--- compile
--- link
--- run CUnit correctly
--- include the real production source correctly
--- provide working wrappers/stubs/helpers
--- generate non-zero coverage for the real src/ production file
+- compile
+- link
+- run CUnit correctly
+- include the real production source correctly
+- provide working wrappers/stubs/helpers
+- generate non-zero coverage for the real src/ production file
 
 Before writing this per-function unit test, read the parent minimal test file.
 
 Use the parent minimal test as the base template.
+
 Do NOT #include the parent test .c file directly.
 
 Instead:
@@ -887,7 +904,7 @@ FINAL REQUIREMENTS:
 - Prefer real project definitions from production headers over local test declarations.
 
 CRITICAL WRAP FLAG RULE
-------------------------
+-----------------------
 If you define any local wrapper function in the test file, such as:
 
   __wrap_clg_logoutput
@@ -1437,6 +1454,7 @@ def parallel_generate_unit_tests(
             if not res.get("passed"):
                 all_passed = False
                 break
+
     if all_passed:
         context_file = test_dir / "_pipeline_context.json"
         if context_file.exists():

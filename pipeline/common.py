@@ -110,7 +110,7 @@ TEST_FILE_MARKERS = [
     "/* === Test Registration === */",
 ]
 
-
+# Globally search all .c files in a folder
 def _project_source_files(cfg: PipelineConfig) -> list[Path]:
     """
     Return actual absolute .c files under cfg.source_dir.
@@ -162,7 +162,7 @@ def _source_files_json_for_prompt(cfg: PipelineConfig) -> str:
         return " (no .c files found under cfg.source_dir)"
     return "\n".join(f" - {p}" for p in files)
 
-
+# Give location of C files, gives and include containing the abosulute location of the file
 def _source_includes_for_test_file(cfg: PipelineConfig, test_file: Path) -> list[str]:
     """Build production #include lines using absolute paths — no depth guessing."""
     lines: list[str] = []
@@ -251,6 +251,7 @@ def run_agent(
     prompt_file = history_path.with_suffix(".prompt.txt")
     write_text(prompt_file, prompt)
 
+    # TODO: The raw HTTP trace didnt work recently, check this out
     cmd = [
         "node", str(cfg.agent_js),
         "--folder", str(agent_folder),
@@ -273,6 +274,7 @@ def run_agent(
 
     # Snapshot the source tree so we can restore any files the agent accidentally
     # modifies. Agents should only write inside test_dir; this is a safety net.
+    # TODO: Check this for docker images
     _protect_dir = cfg.source_dir.parent.resolve() if protect_source else None
     _snap = _snapshot_dir(_protect_dir) if _protect_dir is not None else {}
 
@@ -295,8 +297,8 @@ def run_agent(
     elapsed = time.time() - t0
     res = {
         "exit_code": proc.returncode if proc else -1,
-        "stdout": (proc.stdout if proc else "")[:4000],
-        "stderr": (proc.stderr if proc else "")[:4000],
+        "stdout": (proc.stdout if proc else ""),
+        "stderr": (proc.stderr if proc else ""),
         "timed_out": timed_out,
         "elapsed": elapsed,
     }
@@ -319,7 +321,7 @@ import re
 import subprocess
 from pathlib import Path
 
-
+# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
 def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
     cmd = ["make", "test"]
 
@@ -349,6 +351,7 @@ def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
         # GNU make hard failures
         r"make(?:\[\d+\])?: \*\*\* .* Error \d+",
         r"make(?:\[\d+\])?: .* Error \d+ \(ignored\)",
+
         # compiler/linker hard failures
         r"\berror:",
         r"undefined reference",
@@ -379,7 +382,7 @@ def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
         "errors": errors,
     }
 
-
+# TODO: Take care of paths when dockerized
 def check_function_coverage(
     test_dir: Path,
     source_file: str | Path,
@@ -402,13 +405,14 @@ def check_function_coverage(
     # We read that header, skip test harness gcov files, and match by resolved path.
     gcov_files = sorted(test_dir.glob("*.gcov"))
 
+    # Parse the source location of this gcov file
     def _gcov_source(gcov_file: Path) -> Optional[Path]:
         """Read the 'Source:' header line from a .gcov file and return the resolved path."""
         try:
             lines = read_text(gcov_file).splitlines()
         except Exception:
             return None
-        for line in lines[:40]:
+        for line in lines:
             if "Source:" not in line:
                 continue
             raw = line.split("Source:", 1)[1].strip()
@@ -510,6 +514,7 @@ def check_function_coverage(
 
 # region Diagnostics
 
+# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
 def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> str:
     chunks: list[str] = []
 
@@ -598,7 +603,7 @@ def collect_failure_diagnostics(test_dir: Path, test_file: Path, res: dict) -> s
 
     return "\n".join(chunks)
 
-
+# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
 def collect_runtime_crash_diagnostics(test_dir: Path, test_binary_name: str) -> str:
     chunks: list[str] = []
     test_bin = test_dir / test_binary_name
@@ -703,6 +708,10 @@ def build_output_with_runtime_diagnostics(test_dir: Path, test_file: Path, res: 
 
 # region Shared prompt
 
+# TODO: This assumes test code compilation only? Are the checks too limited and bounded? any way to make this fixing easier
+# Cline's patch tool often seems to be making mistakes with indentation and brackets, and they kind of accumulate v easily, we need to have it fix line ranges instead
+# of trying to patch small stuff and creating more problems, optionally add a C checker or something, which gives exact syntax error line range which it can rewrite instead
+# of micro patches that fail
 def prompt_for_compile_fix(
     makefile: str,
     test_file: str,
@@ -839,10 +848,11 @@ STRICT RULES
 - Preserve all existing tests and stubs.
 - Do not call `__real_*` from wrappers.
 
-After editing, run:
+After you are done editing, make sure to verify by running:
 make test
 
-When done, call submit_and_exit.
+Keep fixing until its successfull
+
 """
 
 # endregion Shared prompt

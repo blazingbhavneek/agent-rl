@@ -27,7 +27,10 @@ def ensure_test_file(cfg: PipelineConfig, paths: dict) -> None:
     process_name: str = paths["process_name"]
     test_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Make includes for all the files present in the source
     production_include_lines = _source_includes_for_test_file(cfg, test_file)
+
+    # Replace the main function with <process_name>_entry_main so we can write tests for it without it executing and interfering with test main.
     define_main = f"#define main {process_name}_entry_main"
     production_include_block = ""
     if production_include_lines:
@@ -37,7 +40,8 @@ def ensure_test_file(cfg: PipelineConfig, paths: dict) -> None:
             + "\n".join(production_include_lines)
             + "\n#undef main\n"
         )
-
+    
+    # This is the main test code for the process # TODO: Tell every prompt that is going to add stuff to it, to respect the boundaries defined by this
     if not test_file.exists():
         skeleton = f"""/* CUnit tests for {process_name} */
 {TEST_FILE_MARKERS[0]}
@@ -48,6 +52,7 @@ def ensure_test_file(cfg: PipelineConfig, paths: dict) -> None:
 #include <string.h>
 #include <stdarg.h>
 {production_include_block}
+
 {TEST_FILE_MARKERS[1]}
 /* Compatibility definitions go here if needed. */
 
@@ -87,10 +92,13 @@ int main(void)
         write_text(test_file, skeleton)
         print(f"[pipeline] created test file: {test_file}", file=sys.stderr)
         print("[pipeline] actual source files included:", file=sys.stderr)
+
+        # Logging number of C files
         for src in _project_source_files(cfg):
             print(f" - {src}", file=sys.stderr)
         return
-
+    
+    # Following is for continuation logic, if the test file already exists but an agent downstream made some bad edits it needs to detected and fixed
     text = read_text(test_file)
     changed = False
 
@@ -126,6 +134,8 @@ int main(void)
         changed = True
 
     # Ensure all section markers exist (append any that are missing at end of file).
+    # Instead of end of file, append just before main defintion, keep the main runner below always
+    # TODO: Add to prompt to not remove these header and anytime adding something to file it needs to organize based on this header
     for marker in TEST_FILE_MARKERS:
         if marker not in text:
             text += f"\n\n{marker}\n"

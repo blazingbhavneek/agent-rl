@@ -16,7 +16,7 @@ from .common import (
     write_text,
 )
 
-
+# Parses Makefile variable assignments (e.g. CFLAGS, CPPFLAGS), including line continuations using '\'
 def parse_source_makefile_flags(source_makefile: Path) -> dict:
     """Extract build flags from Makefile assignments, including continuations."""
     text = read_text(source_makefile)
@@ -56,6 +56,8 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
     """
     test_dir: Path = paths["test_dir"]
     context_file = test_dir / "_pipeline_context.json"
+
+    # if context file exists, means we are continuing, no need to do everything again
     if context_file.exists():
         try:
             ctx = load_json(context_file)
@@ -63,6 +65,8 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
             return ctx.get("flags", {})
         except Exception:
             pass
+
+    # Path resolution
     test_file: Path = paths["test_file"]
     makefile: Path = paths["makefile"]
     process_name: str = paths["process_name"]
@@ -75,11 +79,14 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
     test_program = test_file.stem
     test_src = test_file.name
 
+    # Run the command to setup the standard makefile of company
     def _run_do_mkmf() -> None:
         print(
             f"[pipeline] generating Makefile with: cd {test_dir} && do_mkmf {test_program}",
             file=sys.stderr,
         )
+
+        # TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
         res = subprocess.run(
             ["do_mkmf", test_program],
             cwd=str(test_dir),
@@ -88,6 +95,7 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
             stderr=subprocess.PIPE,
             timeout=300,
         )
+
         if res.returncode != 0:
             raise RuntimeError(
                 "do_mkmf failed\n"
@@ -96,6 +104,7 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
                 f"stdout:\n{res.stdout}\n"
                 f"stderr:\n{res.stderr}\n"
             )
+
         if not makefile.exists():
             raise RuntimeError(
                 "do_mkmf completed but Makefile was not created\n"
@@ -156,12 +165,17 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
 
     # Step 3: append/replace the test target block inside the Makefile.
     # The block is delimited by sentinel comments so it can be updated on re-runs.
+    test_program = test_file.stem
+    test_src = test_file.name
+
     block_start = f"# === TEST TARGET FOR {process_name} ==="
     block_end = f"# === END TEST TARGET FOR {process_name} ==="
 
     src_build_dir = source_dir / "linux"
     unit_test_program = f"unit_{test_program}"
 
+# TODO: Directly giving flags is a bad idea: For example if Home is "../.." then its a relative path, bringing that here will only cause problems, since relative to this the two folders up might look different
+# Also these flags will have to go downstream to other tasks too, so instead have an agent do this? and add comments to it too? Try to use absolute paths
     test_block = f"""
 {block_start}
 # TODO: review merged source Makefile flags below and keep the unit build aligned with production.
@@ -232,6 +246,8 @@ clean-test:
         "test_file": str(paths["test_file"]),
         "makefile": str(makefile),
     })
+
+    # Probably not needed here
     sync_wrap_flags(paths["test_file"], makefile)
     print(f"[pipeline] Stage 0: Makefile + context ready: {makefile}", file=sys.stderr)
     return flags

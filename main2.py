@@ -7,17 +7,9 @@ from pathlib import Path
 
 from pipeline.config import PipelineConfig, derive_paths
 from pipeline.analysis import run_or_load_analysis
-from pipeline.common import (
-    build_output_with_runtime_diagnostics,
-    load_json,
-    run_agent,
-    run_make_test,
-)
+from pipeline.common import build_output_with_runtime_diagnostics, load_json, run_agent, run_make_test
 from pipeline.stage1_scaffold import ensure_test_file
-from pipeline.stage2_makefile import (
-    build_annotated_makefile,
-    parse_source_makefile_flags,
-)
+from pipeline.stage2_makefile import build_annotated_makefile, parse_source_makefile_flags
 from pipeline.stage3_stubs import handle_stubs
 from pipeline.stage4_minimal import ensure_minimal_test_runs
 from pipeline.stage5_unit_tests import parallel_generate_unit_tests
@@ -26,32 +18,43 @@ from pipeline.stage6_integrate import (
     _source_files_json_for_prompt,
     integrate_all_unit_tests_sequential,
     prompt_for_master_test_fix,
-    sync_wrap_flags,
+    sync_wrap_flags, # Wrong import, this is supposed to be imported from common
 )
 
 
 def parse_args() -> PipelineConfig:
     p = argparse.ArgumentParser(description="CUnit test generation pipeline")
+
+    # main path of source code
     p.add_argument("source_dir", type=Path)
+
+    # where we want the tests to be written, if none is set, it would go till the folder where src/ is writtinten and make a dir called tests
     p.add_argument("--output-dir", type=Path, default=None)
+
+    # at what %age of coverage its ok to move on to next function
     p.add_argument("--coverage-threshold", type=float, default=70.0)
     p.add_argument("--max-functions", type=int, default=None)
     p.add_argument("--max-test-attempts", type=int, default=4)
+
+    # max parallel workers for handling unit tests (since each unit test function has its own workspace)
     p.add_argument("--max-unit-test-workers", type=int, default=4)
+
+    # to target specific function/level to process
     p.add_argument("--only-function", default=None)
     p.add_argument("--only-level", type=int, default=None)
-    p.add_argument(
-        "--agent-js",
-        type=Path,
-        default=Path("/home/seigyo/rl/agent.js"),
-    )
-    p.add_argument(
-        "--system-json",
-        type=Path,
-        default=Path("/home/seigyo/rl/system_functions.json"),
-    )
+
+    # path of agent js (cline sdk agent)
+    p.add_argument("--agent-js", type=Path, default=Path("/home/seigyo/rl/agent.js"))
+
+    # path to previosly extraced json which contains all the system functions
+    p.add_argument("--system-json", type=Path, default=Path("/home/seigyo/rl/system_functions.json"))
+
+    # agent time out (30minuts) in case stuck in some bs
     p.add_argument("--agent-timeout-sec", type=int, default=1800)
+
+    # Currently disable due to inability to write proper json files. TODO: Bring this back
     p.add_argument("--semantic-judge-min-score", type=int, default=75)
+    
     a = p.parse_args()
     return PipelineConfig(
         source_dir=a.source_dir.resolve(),
@@ -71,32 +74,42 @@ def parse_args() -> PipelineConfig:
 def run(cfg: PipelineConfig) -> None:
     paths = derive_paths(cfg)
 
+    # Paths we have:
+    # test_dir
+    # process_name
+    # test_file
+    # makefile
+    # history_dir
+    # analysis_path
+    # report_file
+    # log_file
+
     # Check if unit tests are already completed to skip previous stages
+    # this is needed becauase at stage 4 we made a minimal test to make sure everything is working, but if we are mid integrating already made unit tests that might fail
+    # so we need to make a flag that, stage 4 is long done and we already completed stage 5 so dont worry about main test file for now
     context_file = Path(paths["test_dir"]) / "_pipeline_context.json"
     if context_file.exists():
         ctx = load_json(context_file)
         if ctx.get("unit_tests_completed"):
-            print(
-                "[pipeline] Unit tests already completed. Skipping to integration.",
-                file=sys.stderr,
-            )
+            print("[pipeline] Unit tests already completed. Skipping to integration.", file=sys.stderr)
+
+            # TODO: Get what these are
             flags = ctx.get("flags", {})
             unit_results = ctx.get("unit_test_results", {})
             analysis = run_or_load_analysis(cfg, paths["analysis_path"])
+            
+            # run the make tests command in the test directory and parse errors etc
             pre = run_make_test(paths["test_dir"])
+            
+            # TODO: remove this, this shouldnt exists? this is interfereing with integration process ig? other way to check integration and checkpoint for working versions
             if not pre.get("ok"):
-                print(
-                    "[pipeline] WARN: existing master test suite does not compile before integration; attempting repairs",
-                    file=sys.stderr,
-                )
+                print("[pipeline] WARN: existing master test suite does not compile before integration; attempting repairs", file=sys.stderr)
                 test_file = Path(paths["test_file"])
                 makefile = Path(paths["makefile"])
                 for attempt in range(1, 6):
-                    diag = build_output_with_runtime_diagnostics(
-                        paths["test_dir"],
-                        test_file,
-                        pre,
-                    )
+                    diag = build_output_with_runtime_diagnostics(paths["test_dir"], test_file, pre)
+
+                    # this is the same prompt for compile fixer when integrating new tests
                     prompt = prompt_for_master_test_fix(
                         process_name=paths["process_name"],
                         master_test_file=str(test_file),
@@ -104,10 +117,7 @@ def run(cfg: PipelineConfig) -> None:
                         unit_test_file="",
                         unit_makefile="",
                         source_file_abs="",
-                        func={
-                            "id": "pre_integration_check",
-                            "name": "pre_integration_check",
-                        },
+                        func={"id": "pre_integration_check", "name": "pre_integration_check"},
                         unit_coverage_pct="unknown",
                         master_coverage_pct="unknown",
                         actual_source_files=_source_files_json_for_prompt(cfg),
@@ -115,41 +125,23 @@ def run(cfg: PipelineConfig) -> None:
                         existing_wraps=_existing_wrap_symbols(test_file),
                         build_output=diag,
                     )
-                    run_agent(
-                        cfg,
-                        paths["test_dir"],
-                        prompt,
-                        f"_pre_integration_fix_{int(time.time())}.json",
-                        folder=cfg.source_dir.parent.parent.resolve(),
-                    )
+                    run_agent(cfg, paths["test_dir"], prompt, f"_pre_integration_fix_{int(time.time())}.json", folder=cfg.source_dir.parent.parent.resolve())
                     sync_wrap_flags(test_file, makefile)
                     pre = run_make_test(paths["test_dir"])
                     if pre.get("ok"):
-                        print(
-                            f"[pipeline] pre-integration master build passed on attempt {attempt}",
-                            file=sys.stderr,
-                        )
+                        print(f"[pipeline] pre-integration master build passed on attempt {attempt}", file=sys.stderr)
                         break
                     if attempt >= 5:
-                        print(
-                            "[pipeline] ERROR: pre-integration build still failing after 5 attempts; aborting",
-                            file=sys.stderr,
-                        )
+                        print("[pipeline] ERROR: pre-integration build still failing after 5 attempts; aborting", file=sys.stderr)
                         return
-
-            integrate_all_unit_tests_sequential(
-                cfg,
-                paths,
-                analysis,
-                unit_results,
-                flags,
-            )
+            integrate_all_unit_tests_sequential(cfg, paths, analysis, unit_results, flags)
             return
 
     # Stage 1: ensure test scaffold exists
     ensure_test_file(cfg, paths)
 
     # Stage 2: build annotated Makefile with coverage + wrap flags
+    # TODO Remove this line, not needed, bottom one doing same stuff
     flags = parse_source_makefile_flags(cfg.source_dir / "Makefile")
     flags = build_annotated_makefile(cfg, paths)
 
