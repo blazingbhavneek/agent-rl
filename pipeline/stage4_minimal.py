@@ -152,6 +152,75 @@ Expected CUnit main structure:
       return failures == 0 ? 0 : 1;
   }}
 
+
+When modifying C code, avoid fragile inline edits whenever possible.
+
+Do NOT try to surgically insert, delete, or replace a few characters or individual lines inside existing code. Small patches frequently introduce mismatched braces, broken indentation, malformed conditionals, and partial edits that leave the surrounding code inconsistent.
+
+Instead:
+
+* Identify the smallest logical unit that contains the problem.
+* Rewrite that entire unit as a coherent block.
+* Prefer replacing:
+
+  * a complete statement block,
+  * an entire if/else block,
+  * a loop body,
+  * a helper function,
+  * a complete function,
+  * a struct definition,
+  * a header section,
+    rather than making tiny in-place edits.
+
+Guidelines:
+
+* Treat code as blocks, not lines.
+* Rewrite 10–100 lines cleanly if needed.
+* Ensure braces, parentheses, and control flow are fully balanced within the rewritten block.
+* Return the complete replacement block, not a diff of individual lines.
+* Minimize the number of edit regions; prefer one clean block replacement over many scattered edits.
+
+After every modification, run:
+
+gcc -fsyntax-only <filename>
+
+If a syntax error is reported:
+
+1. Locate the logical block containing the error.
+2. Rewrite the entire affected block.
+3. Do not stack additional micro-patches on top of previous edits.
+4. Repeat until `gcc -fsyntax-only` succeeds with no syntax errors.
+
+A clean block rewrite is preferred over a minimal patch if it improves structural correctness and reliability.
+
+When editing source code, output real source code, not an escaped representation of source code.
+
+Do NOT introduce escape characters unless they are required by the target language syntax.
+
+Examples:
+
+Correct:
+char *argv[] = {{ "dio110d", NULL }};
+
+Incorrect:
+char *argv[] = {{ \\"dio110d\\", NULL }};
+
+But remember, CPP style comments are not allowd, so for comments use this sytax instead: \\* Comment body *\\
+
+Only use escaped quotes (") when they are inside a string literal that itself contains quotation marks.
+
+Treat the file as plain source code, not as JSON, Markdown, Python strings, shell strings, or serialized text.
+
+Before finalizing edits, scan for suspicious escape sequences that commonly appear when code has been copied through another representation layer:
+
+* "
+* '
+* \n outside string literals
+* \t outside string literals
+
+If such escapes appear in normal C code, remove them unless they are intentionally part of a string literal.
+
+
 Important:
 - Do not submit only because compilation succeeded.
 - Do not submit only because `make test` returned 0.

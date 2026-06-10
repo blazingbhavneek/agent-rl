@@ -13,6 +13,7 @@ from . import container as container_mod
 from .analysis import collect_stub_candidates, functions_leaf_first, run_or_load_analysis
 from .common import _safe_filename, load_json, read_text, write_json
 from .config import PipelineConfig
+from .execution import run_command_to_files
 from .semantic import _load_semantic_context
 from .stage1_scaffold import ensure_test_file
 from .stage2_makefile import build_annotated_makefile
@@ -116,20 +117,101 @@ def _harvest_glob(src_dir: Path, dst_dir: Path, pattern: str) -> None:
             shutil.copy2(src, dst_dir / src.name)
 
 
-def _prepare_episode_testdir(base: Path, dest: Path, *, include_stub_gen: bool) -> None:
+def _prepare_episode_testdir(
+    base: Path,
+    dest: Path,
+    *,
+    include_stub_gen: bool,
+    seed_from_base: bool,
+) -> None:
     """Copy the prepared canonical test dir into a per-episode host dir.
 
     Excludes the dataset archive and the active per-function dirs so the agent
     sees a pristine layout. Stub episodes start without _stub_gen; unit episodes
     keep the selected/materialized stubs they depend on.
     """
-    ignore_names = {"_trace_dataset", "_unit_tests"}
-    if not include_stub_gen:
-        ignore_names.add("_stub_gen")
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if not seed_from_base:
+        dest.mkdir(parents=True, exist_ok=True)
+        return
+
+    ignore_names = {"_trace_dataset", "_unit_tests"}
+    if not include_stub_gen:
+        ignore_names.add("_stub_gen")
     shutil.copytree(base, dest, ignore=shutil.ignore_patterns(*ignore_names))
+
+
+def _episode_paths(paths: dict, host_test_dir: Path) -> dict:
+    episode_paths = dict(paths)
+    episode_paths["test_dir"] = host_test_dir
+    episode_paths["test_file"] = host_test_dir / Path(paths["test_file"]).name
+    episode_paths["makefile"] = host_test_dir / "Makefile"
+    episode_paths["history_dir"] = host_test_dir / "agent_history"
+    episode_paths["analysis_path"] = host_test_dir / "analysis.json"
+    episode_paths["report_file"] = host_test_dir / Path(paths["report_file"]).name
+    episode_paths["log_file"] = host_test_dir / Path(paths["log_file"]).name
+    return episode_paths
+
+
+def _inner_dataset_root(host_test_dir: Path) -> Path:
+    return host_test_dir / "_inner_trace_dataset"
+
+
+def _run_inner_stage(
+    run_cfg: PipelineConfig,
+    *,
+    source_dir: Path,
+    stage: str,
+    log_dir: Path,
+    extra_args: list[str],
+) -> None:
+    repo_main = Path(__file__).resolve().parent.parent / "main2.py"
+    cmd = [
+        "python3",
+        "-u",
+        str(repo_main),
+        str(source_dir),
+        "--stage",
+        stage,
+        "--execution-mode",
+        "local",
+        "--trace-dataset-dirname",
+        "_inner_trace_dataset",
+        *extra_args,
+    ]
+    print(
+        f"[pipeline] episode inner stage -> {stage} cwd={source_dir.parent.parent.resolve()}",
+        file=sys.stderr,
+    )
+    stdout_log = log_dir / "inner_stage.stdout.log"
+    stderr_log = log_dir / "inner_stage.stderr.log"
+    print(
+        f"[pipeline] inner logs -> stdout={stdout_log} stderr={stderr_log}",
+        file=sys.stderr,
+    )
+    res = run_command_to_files(
+        run_cfg,
+        cmd,
+        cwd=source_dir.parent.parent.resolve(),
+        stdout_path=stdout_log,
+        stderr_path=stderr_log,
+        env={
+            "PYTHONIOENCODING": "utf-8",
+            "LC_ALL": "C.UTF-8",
+            "LANG": "C.UTF-8",
+        },
+        timeout=max(3600, int(getattr(run_cfg, "agent_timeout_sec", 1800)) * 2),
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"inner stage failed: {stage}\n"
+            f"cmd={' '.join(cmd)}\n"
+            f"exit={res.returncode}\n"
+            f"stdout_log={stdout_log}\n"
+            f"stderr_log={stderr_log}\n"
+        )
 
 
 def _run_jobs(cfg: PipelineConfig, jobs: list) -> None:
@@ -145,7 +227,14 @@ def _run_jobs(cfg: PipelineConfig, jobs: list) -> None:
             fut.result()
 
 
-def _episode_container(cfg: PipelineConfig, paths: dict, episode_root: Path, *, include_stub_gen: bool):
+def _episode_container(
+    cfg: PipelineConfig,
+    paths: dict,
+    episode_root: Path,
+    *,
+    include_stub_gen: bool,
+    seed_from_base: bool,
+):
     """Set up one fresh container for an episode.
 
     Returns (run_cfg, host_test_dir, container_name). The host test dir is bound
@@ -155,7 +244,16 @@ def _episode_container(cfg: PipelineConfig, paths: dict, episode_root: Path, *, 
     canonical = Path(paths["test_dir"])
     repo_root = cfg.source_dir.parent.parent.resolve()
     host_test_dir = episode_root / "testdir"
-    _prepare_episode_testdir(canonical, host_test_dir, include_stub_gen=include_stub_gen)
+    print(
+        f"[pipeline] starting episode container root={episode_root}",
+        file=sys.stderr,
+    )
+    _prepare_episode_testdir(
+        canonical,
+        host_test_dir,
+        include_stub_gen=include_stub_gen,
+        seed_from_base=seed_from_base,
+    )
     name = container_mod.episode_container_name()
     container_mod.create(
         cfg,
@@ -163,6 +261,10 @@ def _episode_container(cfg: PipelineConfig, paths: dict, episode_root: Path, *, 
         host_test_dir=host_test_dir,
         canonical_test_dir=canonical,
         repo_root=repo_root,
+    )
+    print(
+        f"[pipeline] episode container ready name={name} mount={host_test_dir} -> {canonical}",
+        file=sys.stderr,
     )
     run_cfg = replace(
         cfg,
@@ -207,20 +309,45 @@ def _collect_one_stub(cfg: PipelineConfig, paths: dict, func_name: str, safe: st
     body: Optional[str]
 
     if cfg.per_episode_container:
-        run_cfg, H, name = _episode_container(cfg, paths, episode_root, include_stub_gen=False)
+        run_cfg, H, name = _episode_container(
+            cfg,
+            paths,
+            episode_root,
+            include_stub_gen=False,
+            seed_from_base=False,
+        )
         try:
-            body = generate_stub_code(
+            _run_inner_stage(
                 run_cfg,
-                test_dir,  # canonical: keeps generated content canonical
-                func_name,
-                stub_dir_override=H / "_stub_gen" / safe,      # host write location
-                history_dir_override=H / "agent_history",
+                source_dir=cfg.source_dir,
+                stage="collect-stubs",
+                log_dir=episode_root,
+                extra_args=[
+                    "--only-function",
+                    func_name,
+                    "--episodes-per-item",
+                    "1",
+                ],
             )
+            inner_root = _inner_dataset_root(H) / "episodes" / "stubs" / safe
+            inner_episodes = sorted(p for p in inner_root.iterdir() if p.is_dir()) if inner_root.exists() else []
+            inner_episode = inner_episodes[-1] if inner_episodes else None
+            if inner_episode is None:
+                raise RuntimeError(f"inner collect-stubs produced no episode for {func_name}")
+            workspace_src = inner_episode / "workspace"
+            result_src = workspace_src / "result.json"
+            if result_src.exists():
+                try:
+                    result = load_json(result_src)
+                    body = read_text(workspace_src / "stub.c") if (workspace_src / "stub.c").exists() else None
+                except Exception:
+                    body = None
         finally:
             container_mod.teardown(name)
-        _harvest(H / "_stub_gen" / safe, workspace, ["stub.c", "result.json", "stub_validate_main.c"])
-        _harvest_glob(H / "agent_history", ep_history, f"_gen_stub_{safe}.*")
-        _harvest_glob(H / "agent_history", ep_history, f"_stub_fix_{safe}_*")
+        if inner_episode is not None:
+            _harvest(workspace_src, workspace, ["stub.c", "result.json", "stub_validate_main.c"])
+            _harvest_glob(inner_episode / "agent_history", ep_history, f"_gen_stub_{safe}.*")
+            _harvest_glob(inner_episode / "agent_history", ep_history, f"_stub_fix_{safe}_*")
     else:
         active = test_dir / "_stub_gen" / safe
         history_dir = test_dir / "agent_history"
@@ -254,8 +381,13 @@ def _collect_one_stub(cfg: PipelineConfig, paths: dict, func_name: str, safe: st
 
 
 def _stage_collect_stubs(cfg: PipelineConfig, paths: dict) -> None:
-    _flags, analysis = _prepare(cfg, paths)
+    if cfg.per_episode_container:
+        analysis = run_or_load_analysis(cfg, paths["analysis_path"])
+    else:
+        _flags, analysis = _prepare(cfg, paths)
     candidates = collect_stub_candidates(analysis)
+    if cfg.only_function:
+        candidates = [name for name in candidates if name == cfg.only_function]
     eps = max(1, int(cfg.episodes_per_item))
     jobs = [
         partial(_collect_one_stub, cfg, paths, func_name, _safe_filename(func_name))
@@ -393,19 +525,38 @@ def _collect_one_unit(
     ]
 
     if cfg.per_episode_container:
-        run_cfg, H, name = _episode_container(cfg, paths, episode_root, include_stub_gen=True)
+        run_cfg, H, name = _episode_container(
+            cfg,
+            paths,
+            episode_root,
+            include_stub_gen=True,
+            seed_from_base=True,
+        )
         try:
-            fid, result = _generate_unit_test_for_func(
+            _run_inner_stage(
                 run_cfg,
-                paths,  # canonical: master refs + Makefile content stay canonical
-                func,
-                flags,
-                semantic_context,
-                unit_dir_override=H / "_unit_tests" / safe,  # host write location
+                source_dir=cfg.source_dir,
+                stage="collect-unit-tests",
+                log_dir=episode_root,
+                extra_args=[
+                    "--only-function",
+                    func["id"],
+                    "--episodes-per-item",
+                    "1",
+                ],
             )
+            inner_root = _inner_dataset_root(H) / "episodes" / "unit_tests" / safe
+            inner_episodes = sorted(p for p in inner_root.iterdir() if p.is_dir()) if inner_root.exists() else []
+            inner_episode = inner_episodes[-1] if inner_episodes else None
+            if inner_episode is None:
+                raise RuntimeError(f"inner collect-unit-tests produced no episode for {func['id']}")
+            metadata = load_json(inner_episode / "metadata.json")
+            fid = metadata.get("func_id", func["id"])
+            result = metadata.get("result", {})
         finally:
             container_mod.teardown(name)
-        _harvest(H / "_unit_tests" / safe, workspace, harvest_names)
+        if inner_episode is not None:
+            _harvest(inner_episode / "workspace", workspace, harvest_names)
     else:
         active = test_dir / "_unit_tests" / safe
         # Pristine start: clear only this function's active unit dir. Inputs
@@ -430,7 +581,11 @@ def _collect_one_unit(
 
 
 def _stage_collect_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
-    flags, analysis = _prepare(cfg, paths)
+    if cfg.per_episode_container:
+        flags = {}
+        analysis = run_or_load_analysis(cfg, paths["analysis_path"])
+    else:
+        flags, analysis = _prepare(cfg, paths)
     semantic_context = _load_semantic_context(Path(paths["test_dir"]))
     eps = max(1, int(cfg.episodes_per_item))
     jobs = [

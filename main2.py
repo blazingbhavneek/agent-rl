@@ -44,10 +44,20 @@ def parse_args() -> PipelineConfig:
     # max parallel workers for handling unit tests (since each unit test function has its own workspace)
     p.add_argument("--max-unit-test-workers", type=int, default=4)
 
+    # Whether this pipeline is running in local, or in docker container
     p.add_argument("--execution-mode", choices=["local", "docker"], default="local")
+
+    # TODO: What is this doing here? sometimes this doesnt give error when args are present in certain way, otherwise it gives error? we only should have a 
+    # container-image arg because for each trace a new docker image should be there? 
     p.add_argument("--container-name", default=None)
+
+    # Where is the bash profile present inside the container
     p.add_argument("--container-profile", type=Path, default=Path("/home/seigyo/.bash_profile"))
+
+    # TODO: What this is?
     p.add_argument("--forbid-host-prefix", action="append", default=[])
+
+    # Which stage to process in this dataset generation run? Or RL?
     p.add_argument("--stage", default="end-to-end", choices=[
         "end-to-end",
         "prepare",
@@ -61,11 +71,21 @@ def parse_args() -> PipelineConfig:
         "materialize-unit-tests",
         "integrate",
     ])
+
+    # How many generations for each item, currently seems to be running sequentially, better to flatten out for every entry and run with asyncio
     p.add_argument("--episodes-per-item", type=int, default=1)
+
+    # host side, what should be the name of the folder where we are storing traces
     p.add_argument("--trace-dataset-dirname", default="_trace_dataset")
+
+    # whether to make a new container for each episode (TODO: auto true if doing in docker mode)
     p.add_argument("--per-episode-container", action="store_true")
+
+    # name of the image used to setup containers for new trace
     p.add_argument("--container-image", default=None)
     p.add_argument("--container-run-arg", action="append", default=[])
+
+    # Main concurrency arguement
     p.add_argument("--episode-concurrency", type=int, default=1)
 
     # to target specific function/level to process
@@ -114,6 +134,7 @@ def parse_args() -> PipelineConfig:
 def run(cfg: PipelineConfig) -> None:
     paths = derive_paths(cfg)
 
+    # run selected stage if chosen
     if cfg.stage != "end-to-end":
         from pipeline.data_collection import run_selected_stage
 

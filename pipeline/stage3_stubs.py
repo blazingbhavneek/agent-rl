@@ -214,6 +214,22 @@ def generate_stub_code(
         for score, path in func_doc_candidates
     ) or " (no markdown candidates found)"
 
+    repo_root = cfg.source_dir.parent.parent.resolve()
+    context_file = test_dir / "_pipeline_context.json"
+    flags: dict = {}
+    if context_file.exists():
+        try:
+            flags = load_json(context_file).get("flags", {})
+        except Exception:
+            pass
+
+    cflags = " ".join(filter(None, [
+        flags.get("CFLAGS", ""),
+        flags.get("CFLAGS_LINUX", ""),
+        flags.get("CPPFLAGS", ""),
+        flags.get("INCLUDE", ""),
+    ]))
+
     prompt = f"""You are generating ONE C linker-wrapper stub for unit testing.
 
 TARGET FUNCTION
@@ -288,6 +304,11 @@ STUB RULES
 - If docs/source show failure/success conventions, follow them.
 - If output pointers exist, guard NULL and fill minimal safe values.
 - If callbacks are registered, store callback pointers in static globals or invoke them with safe dummy values when appropriate.
+
+Try to compile the stub file using gcc -c {cflags} stub.c -o {stub_dir}/stub.o
+
+Change the flags if you need to, keep fixing until it compile and works.
+
 
 Dont end conversation until you are done.
 """

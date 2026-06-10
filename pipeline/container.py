@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .config import PipelineConfig
+from .execution import forwarded_env
 
 """
 Per-episode docker container lifecycle for parallel trace collection.
@@ -37,23 +38,39 @@ def create(
     canonical_test_dir: Path,
     repo_root: Path,
 ) -> None:
-    """Create and start a detached container named `name` with the mounts above.
 
-    The container is kept alive with `sleep infinity` so run_command's
-    `docker exec` can target it, mirroring the single-container mode.
-    Extra mounts (e.g. /home/seigyo/rl) come from cfg.container_run_args.
-    """
     if not cfg.container_image:
         raise ValueError("--container-image is required with --per-episode-container")
+
     repo = str(Path(repo_root))
+
+    # Start building a detached container that will remain running
+    # for the lifetime of the episode.
     cmd = ["docker", "run", "-d", "--name", name]
-    # Immutable source/project tree, read-only, at its canonical path.
+
+    # Forward selected host environment variables into the container.
+    for key, value in forwarded_env().items():
+        cmd += ["-e", f"{key}={value}"]
+
+    # Mount the repository read-only at its canonical path so code and
+    # assets are visible without allowing modifications.
     cmd += ["-v", f"{repo}:{repo}:ro"]
-    # Per-episode writable test dir, overlaid at the canonical tests path.
+
+    # Overlay the episode-specific writable test directory at the
+    # canonical tests location inside the container.
     cmd += ["-v", f"{Path(host_test_dir)}:{Path(canonical_test_dir)}"]
+
+    # Apply any caller-specified docker run arguments (extra mounts,
+    # resource limits, networking, etc.).
     cmd += [str(a) for a in (cfg.container_run_args or ())]
+
+    # Keep the container alive so future commands can be executed via
+    # `docker exec` instead of starting a new container each time.
     cmd += [str(cfg.container_image), "sleep", "infinity"]
+
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    # Surface docker startup failures with the container name attached.
     if proc.returncode != 0:
         raise RuntimeError(
             f"docker run failed for {name}: {proc.stderr.strip() or proc.stdout.strip()}"

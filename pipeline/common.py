@@ -331,28 +331,49 @@ def run_agent(
 
 # region Build & coverage
 
-def run_make_test(cfg: PipelineConfig, test_dir: Path, timeout: int = 300) -> dict:
+import re
+import subprocess
+from pathlib import Path
+
+def safe_decode(data: bytes) -> str:
+    if isinstance(data, str):
+        return data
+
+    for encoding in ("utf-8", "euc_jp", "cp932", "shift_jis", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("utf-8", errors="replace")
+
+# TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
+def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
     cmd = ["make", "test"]
 
     try:
-        proc = run_command(
-            cfg,
+        proc = subprocess.run(
             cmd,
-            cwd=test_dir,
+            cwd=str(test_dir),
+            capture_output=True,
+            text=False,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        stdout = safe_decode(e.stdout or b"")
+        stderr = safe_decode(e.stderr or b"")
+
         return {
             "ok": False,
             "returncode": -1,
-            "stdout": "",
-            "stderr": f"make test timed out after {timeout}s",
+            "stdout": stdout,
+            "stderr": stderr + f"\nmake test timed out after {timeout}s",
             "timed_out": True,
             "errors": [f"make test timed out after {timeout}s"],
         }
 
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
+    stdout = safe_decode(proc.stdout or b"")
+    stderr = safe_decode(proc.stderr or b"")
     combined = stdout + "\n" + stderr
 
     blocking_error_patterns = [
@@ -796,6 +817,75 @@ Important:
 - Do not call `__real_*` from wrappers.
 - Do not hide crashes by deleting assertions or replacing them with always-pass assertions.
 - Do not edit production code to make the test pass.
+
+
+When modifying C code, avoid fragile inline edits whenever possible.
+
+Do NOT try to surgically insert, delete, or replace a few characters or individual lines inside existing code. Small patches frequently introduce mismatched braces, broken indentation, malformed conditionals, and partial edits that leave the surrounding code inconsistent.
+
+Instead:
+
+* Identify the smallest logical unit that contains the problem.
+* Rewrite that entire unit as a coherent block.
+* Prefer replacing:
+
+  * a complete statement block,
+  * an entire if/else block,
+  * a loop body,
+  * a helper function,
+  * a complete function,
+  * a struct definition,
+  * a header section,
+    rather than making tiny in-place edits.
+
+Guidelines:
+
+* Treat code as blocks, not lines.
+* Rewrite 5–20 lines cleanly if needed.
+* Ensure braces, parentheses, and control flow are fully balanced within the rewritten block.
+* Return the complete replacement block, not a diff of individual lines.
+* Minimize the number of edit regions; prefer one clean block replacement over many scattered edits.
+
+After every modification, run:
+
+gcc -fsyntax-only <filename>
+
+If a syntax error is reported:
+
+1. Locate the logical block containing the error.
+2. Rewrite the entire affected block.
+3. Do not stack additional micro-patches on top of previous edits.
+4. Repeat until `gcc -fsyntax-only` succeeds with no syntax errors.
+
+A clean block rewrite is preferred over a minimal patch if it improves structural correctness and reliability.
+
+When editing source code, output real source code, not an escaped representation of source code.
+
+Do NOT introduce escape characters unless they are required by the target language syntax.
+
+Examples:
+
+Correct:
+char *argv[] = {{ "dio110d", NULL }};
+
+Incorrect:
+char *argv[] = {{ \\"dio110d\\", NULL }};
+
+But remember, CPP style comments are not allowd, so for comments use this sytax instead: \\* Comment body *\\
+
+Only use escaped quotes (") when they are inside a string literal that itself contains quotation marks.
+
+Treat the file as plain source code, not as JSON, Markdown, Python strings, shell strings, or serialized text.
+
+Before finalizing edits, scan for suspicious escape sequences that commonly appear when code has been copied through another representation layer:
+
+* "
+* '
+* \n outside string literals
+* \t outside string literals
+
+If such escapes appear in normal C code, remove them unless they are intentionally part of a string literal.
+
 
 REFERENCE LOCATIONS
 - Source folder passed by user:

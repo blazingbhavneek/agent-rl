@@ -14,7 +14,7 @@ class PipelineConfig:
     func_docs_dir: Path = Path("/home/seigyo/rl/moove_docs/func")
     execution_mode: str = "local"
     container_name: Optional[str] = None
-    container_profile: Path = Path("/home/seigyo/.bash_profile")
+    container_profile: Optional[Path] = Path("/home/seigyo/.bash_profile")
     forbidden_host_prefixes: tuple[str, ...] = ()
     stage: str = "end-to-end"
     episodes_per_item: int = 1
