@@ -60,6 +60,7 @@ def parse_args() -> PipelineConfig:
     # Which stage to process in this dataset generation run? Or RL?
     p.add_argument("--stage", default="end-to-end", choices=[
         "end-to-end",
+        "all-collect",
         "prepare",
         "collect-stubs",
         "select-stubs",

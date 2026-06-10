@@ -13,7 +13,6 @@ from . import container as container_mod
 from .analysis import collect_stub_candidates, functions_leaf_first, run_or_load_analysis
 from .common import _safe_filename, load_json, read_text, write_json
 from .config import PipelineConfig
-from .execution import run_command_to_files
 from .semantic import _load_semantic_context
 from .stage1_scaffold import ensure_test_file
 from .stage2_makefile import build_annotated_makefile
@@ -143,77 +142,6 @@ def _prepare_episode_testdir(
     shutil.copytree(base, dest, ignore=shutil.ignore_patterns(*ignore_names))
 
 
-def _episode_paths(paths: dict, host_test_dir: Path) -> dict:
-    episode_paths = dict(paths)
-    episode_paths["test_dir"] = host_test_dir
-    episode_paths["test_file"] = host_test_dir / Path(paths["test_file"]).name
-    episode_paths["makefile"] = host_test_dir / "Makefile"
-    episode_paths["history_dir"] = host_test_dir / "agent_history"
-    episode_paths["analysis_path"] = host_test_dir / "analysis.json"
-    episode_paths["report_file"] = host_test_dir / Path(paths["report_file"]).name
-    episode_paths["log_file"] = host_test_dir / Path(paths["log_file"]).name
-    return episode_paths
-
-
-def _inner_dataset_root(host_test_dir: Path) -> Path:
-    return host_test_dir / "_inner_trace_dataset"
-
-
-def _run_inner_stage(
-    run_cfg: PipelineConfig,
-    *,
-    source_dir: Path,
-    stage: str,
-    log_dir: Path,
-    extra_args: list[str],
-) -> None:
-    repo_main = Path(__file__).resolve().parent.parent / "main2.py"
-    cmd = [
-        "python3",
-        "-u",
-        str(repo_main),
-        str(source_dir),
-        "--stage",
-        stage,
-        "--execution-mode",
-        "local",
-        "--trace-dataset-dirname",
-        "_inner_trace_dataset",
-        *extra_args,
-    ]
-    print(
-        f"[pipeline] episode inner stage -> {stage} cwd={source_dir.parent.parent.resolve()}",
-        file=sys.stderr,
-    )
-    stdout_log = log_dir / "inner_stage.stdout.log"
-    stderr_log = log_dir / "inner_stage.stderr.log"
-    print(
-        f"[pipeline] inner logs -> stdout={stdout_log} stderr={stderr_log}",
-        file=sys.stderr,
-    )
-    res = run_command_to_files(
-        run_cfg,
-        cmd,
-        cwd=source_dir.parent.parent.resolve(),
-        stdout_path=stdout_log,
-        stderr_path=stderr_log,
-        env={
-            "PYTHONIOENCODING": "utf-8",
-            "LC_ALL": "C.UTF-8",
-            "LANG": "C.UTF-8",
-        },
-        timeout=max(3600, int(getattr(run_cfg, "agent_timeout_sec", 1800)) * 2),
-    )
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"inner stage failed: {stage}\n"
-            f"cmd={' '.join(cmd)}\n"
-            f"exit={res.returncode}\n"
-            f"stdout_log={stdout_log}\n"
-            f"stderr_log={stderr_log}\n"
-        )
-
-
 def _run_jobs(cfg: PipelineConfig, jobs: list) -> None:
     """Run episode jobs, in parallel only for per-episode-container mode."""
     workers = max(1, int(cfg.episode_concurrency)) if cfg.per_episode_container else 1
@@ -230,22 +158,23 @@ def _run_jobs(cfg: PipelineConfig, jobs: list) -> None:
 def _episode_container(
     cfg: PipelineConfig,
     paths: dict,
-    episode_root: Path,
+    eid: str,
     *,
     include_stub_gen: bool,
     seed_from_base: bool,
 ):
     """Set up one fresh container for an episode.
 
-    Returns (run_cfg, host_test_dir, container_name). The host test dir is bound
-    at the canonical path; run_cfg carries the docker target + the host->canonical
-    path_map so the agent only sees canonical paths.
+    Returns (run_cfg, host_test_dir, container_name). The per-episode scratch
+    test dir lives at _trace_dataset/scratch/<eid> (visible, outside the episode
+    dir) and is bound at the canonical path; run_cfg carries the docker target +
+    the host->canonical path_map so the agent only sees canonical paths.
     """
     canonical = Path(paths["test_dir"])
     repo_root = cfg.source_dir.parent.parent.resolve()
-    host_test_dir = episode_root / "testdir"
+    host_test_dir = dataset_root(cfg, paths) / "scratch" / eid
     print(
-        f"[pipeline] starting episode container root={episode_root}",
+        f"[pipeline] starting episode container scratch={host_test_dir}",
         file=sys.stderr,
     )
     _prepare_episode_testdir(
@@ -306,48 +235,32 @@ def _collect_one_stub(cfg: PipelineConfig, paths: dict, func_name: str, safe: st
     episode_root = root / "episodes" / "stubs" / safe / eid
     workspace = episode_root / "workspace"
     ep_history = episode_root / "agent_history"
-    body: Optional[str]
+    body: Optional[str] = None
 
     if cfg.per_episode_container:
+        # Container = isolated execution env for ONE stub. Generate directly into
+        # the scratch test dir (bound at the canonical path); no stage dispatch,
+        # so no recursive collection and no _trace_dataset/testdir leak.
         run_cfg, H, name = _episode_container(
             cfg,
             paths,
-            episode_root,
+            eid,
             include_stub_gen=False,
-            seed_from_base=False,
+            seed_from_base=True,
         )
         try:
-            _run_inner_stage(
+            body = generate_stub_code(
                 run_cfg,
-                source_dir=cfg.source_dir,
-                stage="collect-stubs",
-                log_dir=episode_root,
-                extra_args=[
-                    "--only-function",
-                    func_name,
-                    "--episodes-per-item",
-                    "1",
-                ],
+                test_dir,
+                func_name,
+                stub_dir_override=H / "_stub_gen" / safe,
+                history_dir_override=H / "agent_history",
             )
-            inner_root = _inner_dataset_root(H) / "episodes" / "stubs" / safe
-            inner_episodes = sorted(p for p in inner_root.iterdir() if p.is_dir()) if inner_root.exists() else []
-            inner_episode = inner_episodes[-1] if inner_episodes else None
-            if inner_episode is None:
-                raise RuntimeError(f"inner collect-stubs produced no episode for {func_name}")
-            workspace_src = inner_episode / "workspace"
-            result_src = workspace_src / "result.json"
-            if result_src.exists():
-                try:
-                    result = load_json(result_src)
-                    body = read_text(workspace_src / "stub.c") if (workspace_src / "stub.c").exists() else None
-                except Exception:
-                    body = None
         finally:
             container_mod.teardown(name)
-        if inner_episode is not None:
-            _harvest(workspace_src, workspace, ["stub.c", "result.json", "stub_validate_main.c"])
-            _harvest_glob(inner_episode / "agent_history", ep_history, f"_gen_stub_{safe}.*")
-            _harvest_glob(inner_episode / "agent_history", ep_history, f"_stub_fix_{safe}_*")
+        _harvest(H / "_stub_gen" / safe, workspace, ["stub.c", "result.json", "stub_validate_main.c"])
+        _harvest_glob(H / "agent_history", ep_history, f"_gen_stub_{safe}.*")
+        _harvest_glob(H / "agent_history", ep_history, f"_stub_fix_{safe}_*")
     else:
         active = test_dir / "_stub_gen" / safe
         history_dir = test_dir / "agent_history"
@@ -525,38 +438,29 @@ def _collect_one_unit(
     ]
 
     if cfg.per_episode_container:
+        # Container = isolated execution env for ONE function's unit test.
+        # Generate directly into the scratch test dir (keeps materialized stubs);
+        # no stage dispatch, so no recursion / testdir leak.
         run_cfg, H, name = _episode_container(
             cfg,
             paths,
-            episode_root,
+            eid,
             include_stub_gen=True,
             seed_from_base=True,
         )
+        unit_dir = H / "_unit_tests" / safe
         try:
-            _run_inner_stage(
+            fid, result = _generate_unit_test_for_func(
                 run_cfg,
-                source_dir=cfg.source_dir,
-                stage="collect-unit-tests",
-                log_dir=episode_root,
-                extra_args=[
-                    "--only-function",
-                    func["id"],
-                    "--episodes-per-item",
-                    "1",
-                ],
+                paths,
+                func,
+                flags,
+                semantic_context,
+                unit_dir_override=unit_dir,
             )
-            inner_root = _inner_dataset_root(H) / "episodes" / "unit_tests" / safe
-            inner_episodes = sorted(p for p in inner_root.iterdir() if p.is_dir()) if inner_root.exists() else []
-            inner_episode = inner_episodes[-1] if inner_episodes else None
-            if inner_episode is None:
-                raise RuntimeError(f"inner collect-unit-tests produced no episode for {func['id']}")
-            metadata = load_json(inner_episode / "metadata.json")
-            fid = metadata.get("func_id", func["id"])
-            result = metadata.get("result", {})
         finally:
             container_mod.teardown(name)
-        if inner_episode is not None:
-            _harvest(inner_episode / "workspace", workspace, harvest_names)
+        _harvest(unit_dir, workspace, harvest_names)
     else:
         active = test_dir / "_unit_tests" / safe
         # Pristine start: clear only this function's active unit dir. Inputs
@@ -581,11 +485,7 @@ def _collect_one_unit(
 
 
 def _stage_collect_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
-    if cfg.per_episode_container:
-        flags = {}
-        analysis = run_or_load_analysis(cfg, paths["analysis_path"])
-    else:
-        flags, analysis = _prepare(cfg, paths)
+    flags, analysis = _prepare(cfg, paths)
     semantic_context = _load_semantic_context(Path(paths["test_dir"]))
     eps = max(1, int(cfg.episodes_per_item))
     jobs = [
@@ -737,22 +637,54 @@ def _stage_integrate(cfg: PipelineConfig, paths: dict) -> None:
     integrate_all_unit_tests_sequential(cfg, paths, analysis, unit_results, flags)
 
 
+_STAGE_HANDLERS = {
+    "prepare": _stage_prepare,
+    "collect-stubs": _stage_collect_stubs,
+    "select-stubs": _stage_select_stubs,
+    "materialize-stubs": _stage_materialize_stubs,
+    "integrate-stubs": _stage_integrate_stubs,
+    "minimal-master": _stage_minimal_master,
+    "collect-unit-tests": _stage_collect_unit_tests,
+    "select-unit-tests": _stage_select_unit_tests,
+    "materialize-unit-tests": _stage_materialize_unit_tests,
+    "integrate": _stage_integrate,
+}
+
+# Full collection sequence run by --stage all-collect, in order.
+COLLECTION_STAGE_ORDER = [
+    "prepare",
+    "collect-stubs",
+    "select-stubs",
+    "materialize-stubs",
+    "integrate-stubs",
+    "minimal-master",
+    "collect-unit-tests",
+    "select-unit-tests",
+    "materialize-unit-tests",
+    "integrate",
+]
+
+
+def _stage_all_collect(cfg: PipelineConfig, paths: dict) -> None:
+    """Run the whole collection pipeline stage-by-stage in one process.
+
+    Each stage reads/writes the canonical test dir + _trace_dataset on disk, so
+    chaining is just calling them in order. Per-episode container behavior is
+    identical to running each stage individually.
+    """
+    for stage in COLLECTION_STAGE_ORDER:
+        print(f"[pipeline] === all-collect: {stage} ===", file=sys.stderr)
+        _write_stage_event(cfg, paths, stage)
+        _STAGE_HANDLERS[stage](cfg, paths)
+
+
 def run_selected_stage(cfg: PipelineConfig, paths: dict) -> None:
-    stages = {
-        "prepare": _stage_prepare,
-        "collect-stubs": _stage_collect_stubs,
-        "select-stubs": _stage_select_stubs,
-        "materialize-stubs": _stage_materialize_stubs,
-        "integrate-stubs": _stage_integrate_stubs,
-        "minimal-master": _stage_minimal_master,
-        "collect-unit-tests": _stage_collect_unit_tests,
-        "select-unit-tests": _stage_select_unit_tests,
-        "materialize-unit-tests": _stage_materialize_unit_tests,
-        "integrate": _stage_integrate,
-    }
-    handler = stages.get(cfg.stage)
+    dataset_root(cfg, paths).mkdir(parents=True, exist_ok=True)
+    if cfg.stage == "all-collect":
+        _stage_all_collect(cfg, paths)
+        return
+    handler = _STAGE_HANDLERS.get(cfg.stage)
     if handler is None:
         raise ValueError(f"Unsupported stage: {cfg.stage}")
-    dataset_root(cfg, paths).mkdir(parents=True, exist_ok=True)
     _write_stage_event(cfg, paths, cfg.stage)
     handler(cfg, paths)
