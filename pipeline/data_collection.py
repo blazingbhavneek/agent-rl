@@ -419,26 +419,50 @@ def _rebase_paths_for_workspace(paths: dict, old_root: Path, new_root: Path) -> 
     old_root = old_root.resolve()
     new_root = new_root.resolve()
 
-    out = {}
-    for key, value in paths.items():
-        if isinstance(value, Path):
-            s = str(value.resolve())
-            if s == str(old_root) or s.startswith(str(old_root) + os.sep):
-                rel = Path(s).relative_to(old_root)
-                out[key] = new_root / rel
-            else:
-                out[key] = value
-        elif isinstance(value, str):
-            s = str(Path(value).resolve())
-            if s == str(old_root) or s.startswith(str(old_root) + os.sep):
-                rel = Path(s).relative_to(old_root)
-                out[key] = str(new_root / rel)
-            else:
-                out[key] = value
-        else:
-            out[key] = value
+    return {
+        key: _rebase_value_for_workspace(value, old_root, new_root)
+        for key, value in paths.items()
+    }
 
-    return out
+
+def _rebase_value_for_workspace(value: Any, old_root: Path, new_root: Path) -> Any:
+    old_root_str = str(old_root)
+
+    if isinstance(value, Path):
+        s = str(value.resolve())
+        if s == old_root_str or s.startswith(old_root_str + os.sep):
+            rel = Path(s).relative_to(old_root)
+            return new_root / rel
+        return value
+
+    if isinstance(value, str):
+        s = str(Path(value).resolve())
+        if s == old_root_str or s.startswith(old_root_str + os.sep):
+            rel = Path(s).relative_to(old_root)
+            return str(new_root / rel)
+        return value
+
+    if isinstance(value, dict):
+        return {
+            key: _rebase_value_for_workspace(item, old_root, new_root)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [_rebase_value_for_workspace(item, old_root, new_root) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(_rebase_value_for_workspace(item, old_root, new_root) for item in value)
+
+    return value
+
+
+def _rebase_unit_test_results_for_workspace(
+    unit_results: dict[str, dict],
+    old_root: Path,
+    new_root: Path,
+) -> dict[str, dict]:
+    return _rebase_value_for_workspace(unit_results, old_root, new_root)
 
 
 def _make_integrate_workspace(cfg: PipelineConfig, paths: dict, eid: str) -> Path:
@@ -908,6 +932,42 @@ def _stage_minimal_master(cfg: PipelineConfig, paths: dict) -> None:
         "episodes_succeeded": len(successes),
     })
 
+
+def _make_unit_test_workspace(cfg: PipelineConfig, paths: dict, safe: str, eid: str) -> Path:
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+    dataset_root_dir = dataset_root(cfg, paths)
+
+    workspace = dataset_root_dir / "unit_test_episodes" / safe / eid
+
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    test_file = Path(paths["test_file"]).resolve()
+    if test_file.exists():
+        shutil.copy2(test_file, workspace / test_file.name)
+
+    makefile = Path(paths["makefile"]).resolve()
+    if makefile.exists():
+        shutil.copy2(makefile, workspace / "Makefile")
+
+    context_file = canonical_test_dir / "_pipeline_context.json"
+    if context_file.exists():
+        shutil.copy2(context_file, workspace / "_pipeline_context.json")
+
+    analysis_file = canonical_test_dir / "analysis.json"
+    if analysis_file.exists():
+        shutil.copy2(analysis_file, workspace / "analysis.json")
+
+    stub_gen = canonical_test_dir / "_stub_gen"
+    if stub_gen.exists():
+        shutil.copytree(stub_gen, workspace / "_stub_gen")
+
+    (workspace / "agent_history").mkdir(parents=True, exist_ok=True)
+
+    return workspace
+
 def _collect_one_unit(
     cfg: PipelineConfig,
     paths: dict,
@@ -921,6 +981,7 @@ def _collect_one_unit(
     eid = _episode_id()
     episode_root = root / "episodes" / "unit_tests" / safe / eid
     workspace = episode_root / "workspace"
+    episode_workspace: Optional[Path] = None
     harvest_names = [
         f"test_{safe}.c",
         "Makefile",
@@ -932,19 +993,33 @@ def _collect_one_unit(
 
     if cfg.per_episode_container:
         # Container = isolated execution env for ONE function's unit test.
-        # Generate directly into the scratch test dir (keeps materialized stubs);
-        # no stage dispatch, so no recursion / testdir leak.
+        # Each episode gets its own dedicated workspace under unit_test_episodes/.
         canonical_test_dir = Path(paths["test_dir"]).resolve()
+        repo_root = cfg.source_dir.parent.parent.resolve()
+        H = _make_unit_test_workspace(cfg, paths, safe, eid).resolve()
+        episode_workspace = H
+        name = container_mod.episode_container_name()
 
-        run_cfg, H, name = _episode_container(
-            cfg,
-            paths,
-            eid,
-            include_stub_gen=True,
-            seed_from_base=True,
+        print(
+            f"[pipeline] starting unit-test episode {safe} workspace={H}",
+            file=sys.stderr,
         )
 
-        H = H.resolve()
+        container_mod.create(
+            cfg,
+            name,
+            host_test_dir=H,
+            canonical_test_dir=canonical_test_dir,
+            repo_root=repo_root,
+        )
+
+        run_cfg = replace(
+            cfg,
+            execution_mode="docker",
+            container_name=name,
+            per_episode_container=False,
+            path_map=((str(H), str(canonical_test_dir)),),
+        )
 
         episode_paths = _rebase_paths_for_workspace(
             paths,
@@ -965,6 +1040,10 @@ def _collect_one_unit(
             )
         finally:
             container_mod.teardown(name)
+            print(
+                f"[pipeline] unit-test episode container removed name={name}",
+                file=sys.stderr,
+            )
 
         _harvest(unit_dir, workspace, harvest_names)
     else:
@@ -987,6 +1066,8 @@ def _collect_one_unit(
         "coverage_pct": result.get("coverage_pct"),
         "semantic_score": result.get("semantic_score"),
     }
+    if episode_workspace is not None:
+        metadata["episode_workspace"] = str(episode_workspace)
     write_json(episode_root / "metadata.json", metadata)
 
 
@@ -1129,6 +1210,161 @@ def _stage_materialize_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
     write_json(context_file, ctx)
 
 
+def _make_final_integration_workspace(cfg: PipelineConfig, paths: dict, eid: str) -> Path:
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+    dataset_root_dir = dataset_root(cfg, paths)
+
+    workspace = dataset_root_dir / "final_integration_episodes" / eid
+
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    test_file = Path(paths["test_file"]).resolve()
+    if test_file.exists():
+        shutil.copy2(test_file, workspace / test_file.name)
+
+    makefile = Path(paths["makefile"]).resolve()
+    if makefile.exists():
+        shutil.copy2(makefile, workspace / "Makefile")
+
+    context_file = canonical_test_dir / "_pipeline_context.json"
+    if context_file.exists():
+        shutil.copy2(context_file, workspace / "_pipeline_context.json")
+
+    analysis_file = canonical_test_dir / "analysis.json"
+    if analysis_file.exists():
+        shutil.copy2(analysis_file, workspace / "analysis.json")
+
+    stub_gen = canonical_test_dir / "_stub_gen"
+    if stub_gen.exists():
+        shutil.copytree(stub_gen, workspace / "_stub_gen")
+
+    unit_tests = canonical_test_dir / "_unit_tests"
+    if unit_tests.exists():
+        shutil.copytree(unit_tests, workspace / "_unit_tests")
+
+    # Selected unit-test frontiers live under _trace_dataset and may be the
+    # target of unit_dir when the active _unit_tests copy is absent. Copy them
+    # to the rebased location so frontier-based unit_dir paths resolve inside
+    # the workspace.
+    frontier_unit_tests = dataset_root(cfg, paths) / "frontiers" / "unit_tests"
+    if frontier_unit_tests.exists():
+        dst = workspace / cfg.trace_dataset_dirname / "frontiers" / "unit_tests"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(frontier_unit_tests, dst)
+
+    (workspace / "agent_history").mkdir(parents=True, exist_ok=True)
+
+    return workspace
+
+
+def _run_one_final_integration_episode(
+    cfg: PipelineConfig,
+    paths: dict,
+    analysis: dict,
+    unit_results: dict[str, dict],
+    flags: dict,
+    episode_index: int,
+) -> dict[str, Any]:
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    eid = f"final_integration_{episode_index:06d}_{uuid.uuid4().hex[:8]}"
+    workspace = _make_final_integration_workspace(cfg, paths, eid).resolve()
+
+    episode_paths = _rebase_paths_for_workspace(
+        paths,
+        old_root=canonical_test_dir,
+        new_root=workspace,
+    )
+    episode_unit_results = _rebase_unit_test_results_for_workspace(
+        unit_results,
+        old_root=canonical_test_dir,
+        new_root=workspace,
+    )
+
+    name = container_mod.episode_container_name()
+
+    print(
+        f"[pipeline] starting final integration episode {episode_index} "
+        f"name={name} workspace={workspace}",
+        file=sys.stderr,
+    )
+
+    container_mod.create(
+        cfg,
+        name,
+        host_test_dir=workspace,
+        canonical_test_dir=canonical_test_dir,
+        repo_root=repo_root,
+    )
+
+    run_cfg = replace(
+        cfg,
+        execution_mode="docker",
+        container_name=name,
+        per_episode_container=False,
+        path_map=((str(workspace), str(canonical_test_dir)),),
+    )
+
+    try:
+        ok = bool(
+            integrate_all_unit_tests_sequential(
+                run_cfg,
+                episode_paths,
+                analysis,
+                episode_unit_results,
+                flags,
+            )
+        )
+        print(
+            f"[pipeline] final integration episode "
+            f"{'success' if ok else 'failed'} index={episode_index} workspace={workspace}",
+            file=sys.stderr,
+        )
+        return {
+            "ok": ok,
+            "episode_index": episode_index,
+            "eid": eid,
+            "workspace": workspace,
+        }
+    except Exception as exc:
+        print(
+            f"[pipeline] final integration episode failed index={episode_index} "
+            f"workspace={workspace}: {exc}",
+            file=sys.stderr,
+        )
+        return {
+            "ok": False,
+            "episode_index": episode_index,
+            "eid": eid,
+            "workspace": workspace,
+            "error": repr(exc),
+        }
+    finally:
+        container_mod.teardown(name)
+        print(
+            f"[pipeline] final integration episode container removed name={name}",
+            file=sys.stderr,
+        )
+
+
+def _promote_final_integration_workspace(paths: dict, workspace: Path) -> None:
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+
+    test_file = Path(paths["test_file"]).resolve()
+    workspace_test_file = workspace / test_file.name
+    if workspace_test_file.exists():
+        shutil.copy2(workspace_test_file, test_file)
+
+    workspace_makefile = workspace / "Makefile"
+    canonical_makefile = canonical_test_dir / "Makefile"
+    if workspace_makefile.exists():
+        shutil.copy2(workspace_makefile, canonical_makefile)
+
+
 def _stage_integrate(cfg: PipelineConfig, paths: dict) -> None:
     flags, analysis = _prepare(cfg, paths)
     context_file = Path(paths["test_dir"]) / "_pipeline_context.json"
@@ -1140,7 +1376,63 @@ def _stage_integrate(cfg: PipelineConfig, paths: dict) -> None:
             unit_results = {}
     if not unit_results:
         unit_results = _selected_unit_results(cfg, paths, prefer_active=True)
-    integrate_all_unit_tests_sequential(cfg, paths, analysis, unit_results, flags)
+
+    if not cfg.per_episode_container:
+        integrate_all_unit_tests_sequential(cfg, paths, analysis, unit_results, flags)
+        return
+
+    if cfg.execution_mode != "docker":
+        raise ValueError("--per-episode-container for integrate requires --execution-mode docker")
+    if not cfg.container_image:
+        raise ValueError("--container-image is required with --per-episode-container")
+
+    episode_count = int(getattr(cfg, "episodes_per_item", 1) or 1)
+    episode_concurrency = int(getattr(cfg, "episode_concurrency", 1) or 1)
+    max_workers = max(1, min(episode_concurrency, episode_count))
+
+    print(
+        f"[pipeline] final integration running {episode_count} episodes "
+        f"with concurrency={max_workers}",
+        file=sys.stderr,
+    )
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _run_one_final_integration_episode,
+                cfg,
+                paths,
+                analysis,
+                unit_results,
+                flags,
+                i,
+            )
+            for i in range(episode_count)
+        ]
+
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    successes = [r for r in results if r.get("ok")]
+
+    print(
+        f"[pipeline] final integration episodes complete: "
+        f"{len(successes)}/{len(results)} succeeded",
+        file=sys.stderr,
+    )
+
+    if not successes:
+        raise RuntimeError("all final integration episodes failed")
+
+    best = sorted(successes, key=lambda r: r["episode_index"])[0]
+    _promote_final_integration_workspace(paths, best["workspace"])
+
+    print(
+        f"[pipeline] promoted final integration workspace: {best['workspace']}",
+        file=sys.stderr,
+    )
 
 
 _STAGE_HANDLERS = {

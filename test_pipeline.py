@@ -223,6 +223,35 @@ def _mock_build_annotated_makefile(cfg, paths):
     return {}
 
 
+def _fake_integrate_all_unit_tests_sequential(cfg, paths, analysis, unit_test_results, flags):
+    test_dir = Path(paths["test_dir"]).resolve()
+    assert (test_dir / "_stub_gen").is_dir()
+    assert (test_dir / "_unit_tests").is_dir()
+
+    for result in unit_test_results.values():
+        unit_dir = result.get("unit_dir")
+        if unit_dir:
+            assert str(unit_dir).startswith(str(test_dir)), f"unit_dir not rebased into workspace: {unit_dir}"
+
+    test_file = Path(paths["test_file"])
+    marker = "/* final integration marker */\n"
+    current = test_file.read_text(encoding="utf-8") if test_file.exists() else ""
+    if "final integration marker" not in current:
+        if current and not current.endswith("\n"):
+            current += "\n"
+        test_file.write_text(current + marker, encoding="utf-8")
+
+    makefile = Path(paths["makefile"])
+    mk_marker = "# final integration marker\n"
+    mk_current = makefile.read_text(encoding="utf-8") if makefile.exists() else ""
+    if "final integration marker" not in mk_current:
+        if mk_current and not mk_current.endswith("\n"):
+            mk_current += "\n"
+        makefile.write_text(mk_current + mk_marker, encoding="utf-8")
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Patch helpers
 # ---------------------------------------------------------------------------
@@ -241,7 +270,10 @@ def _base_patches():
         patch("pipeline.container.teardown", return_value=None),
         patch("pipeline.data_collection.ensure_minimal_test_runs", return_value=True),
         patch("pipeline.data_collection.integrate_all_stubs_sequential", return_value=None),
-        patch("pipeline.data_collection.integrate_all_unit_tests_sequential", return_value=None),
+        patch(
+            "pipeline.data_collection.integrate_all_unit_tests_sequential",
+            side_effect=_fake_integrate_all_unit_tests_sequential,
+        ),
         patch("pipeline.data_collection._load_semantic_context", return_value={"functions": {}}),
         patch("pipeline.stage5_unit_tests._load_semantic_context", return_value={"functions": {}}),
     ]
@@ -580,10 +612,49 @@ class TestAllCollectContainer:
                 for ep in sd.iterdir():
                     assert not (ep / "testdir").exists()
 
-        # Scratch visible; stubs materialized; integrate stages ran (mocked)
-        assert (ds / "scratch").is_dir()
+        scratch = ds / "scratch"
+        assert scratch.is_dir()
+        scratch_dirs = [p for p in scratch.iterdir() if p.is_dir()]
+        assert len(scratch_dirs) == 6, f"expected 6 stub scratch dirs, got {len(scratch_dirs)}"
+
+        unit_workspaces = ds / "unit_test_episodes"
+        assert unit_workspaces.is_dir()
+        unit_workspace_count = sum(
+            len([p for p in func_dir.iterdir() if p.is_dir()])
+            for func_dir in unit_workspaces.iterdir() if func_dir.is_dir()
+        )
+        assert unit_workspace_count == 6, f"expected 6 unit-test workspaces, got {unit_workspace_count}"
+        for func_dir in sorted(p for p in unit_workspaces.iterdir() if p.is_dir()):
+            for ep in sorted(p for p in func_dir.iterdir() if p.is_dir()):
+                assert (ep / f"test_{paths['process_name']}.c").exists()
+                assert (ep / "Makefile").exists()
+                assert (ep / "_pipeline_context.json").exists()
+                assert (ep / "_stub_gen").is_dir()
+                assert (ep / "_unit_tests" / func_dir.name).is_dir()
+
+        integrate_eps = ds / "integrate_episodes"
+        assert integrate_eps.is_dir()
+        assert len([p for p in integrate_eps.iterdir() if p.is_dir()]) == 2
+
+        minimal_eps = ds / "minimal_episodes"
+        assert minimal_eps.is_dir()
+        assert len([p for p in minimal_eps.iterdir() if p.is_dir()]) == 2
+
+        final_integration_eps = ds / "final_integration_episodes"
+        assert final_integration_eps.is_dir()
+        final_eps = [p for p in final_integration_eps.iterdir() if p.is_dir()]
+        assert len(final_eps) == 2, f"expected 2 final integration workspaces, got {len(final_eps)}"
+        for ep in final_eps:
+            assert (ep / f"test_{paths['process_name']}.c").exists()
+            assert (ep / "Makefile").exists()
+            assert (ep / "_pipeline_context.json").exists()
+            assert (ep / "_stub_gen").is_dir()
+            assert (ep / "_unit_tests").is_dir()
+
         assert (test_dir / "_stub_gen" / "FuncA" / "stub.c").exists()
         assert (test_dir / "_stub_gen" / "FuncC" / "stub.c").exists()
+        assert "final integration marker" in Path(paths["test_file"]).read_text()
+        assert "final integration marker" in Path(paths["makefile"]).read_text()
 
         print()
         print("=" * 70)
