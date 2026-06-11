@@ -11,9 +11,9 @@ from typing import Optional
 from .config import PipelineConfig
 from .analysis import functions_leaf_first
 from .common import (
+    _function_artifact_key,
     _project_source_files,
     _resolve_source_file,
-    _safe_filename,
     _source_files_json_for_prompt,
     build_output_with_runtime_diagnostics,
     check_function_coverage,
@@ -95,7 +95,7 @@ def _scaffold_unit_test_dir(
     test_dir: Path = paths["test_dir"]
     process_name: str = paths["process_name"]
     func_id = func["id"]
-    safe_id = _safe_filename(func_id)
+    safe_id = _function_artifact_key(cfg, func)
     test_program = f"test_{safe_id}"
     test_src = f"{test_program}.c"
 
@@ -132,7 +132,8 @@ def _unit_makefile_matches_contract(unit_makefile: Path, test_program: str, test
         rf"(?m)^TEST_SRCS\s*=\s*{re.escape(test_src)}\s*$",
         text,
     ) is not None
-    return program_ok and src_ok
+    multi_c_gcov_ok = "$(notdir $(PROD_SRC)).gcov" not in text and "gcov -p -b -c" in text
+    return program_ok and src_ok and multi_c_gcov_ok
 
 
 def _generate_unit_test_makefile(
@@ -205,9 +206,6 @@ TEST_SRCS = {test_src}
 # Compiling it separately while #including it causes duplicate symbol errors.
 PROD_SRC = {prod_src_abs}
 
-# Keep only the production gcov output.
-TARGET_GCOV = $(notdir $(PROD_SRC)).gcov
-
 # Test object gcno — only TEST_SRCS produce gcno because PROD_SRC is #included.
 TEST_GCNO = $(TEST_SRCS:.c=.gcno)
 
@@ -245,7 +243,7 @@ $(TEST_PROGRAM): $(TEST_SRCS) $(STUB_SRCS)
 coverage-test:
 \t@echo "=== coverage-test ===" >> $(TEST_REPORT_FILE)
 \t@echo "PWD=$$(pwd)" >> $(TEST_REPORT_FILE)
-\t@echo "Target production gcov file: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
+\t@echo "Target production source: $(PROD_SRC)" >> $(TEST_REPORT_FILE)
 \t@echo "Test gcno file: $(TEST_GCNO)" >> $(TEST_REPORT_FILE)
 \t@echo "Files before gcov:" >> $(TEST_REPORT_FILE)
 \t@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
@@ -253,18 +251,14 @@ coverage-test:
 \tfor f in $(TEST_GCNO); do \
 \t\t[ -e "$$f" ] || continue; \
 \t\tfound=1; \
-\t\techo "Running gcov -b -c $$f" >> $(TEST_REPORT_FILE); \
-\t\tgcov -b -c "$$f" >> $(TEST_REPORT_FILE) 2>&1 || true; \
+\t\techo "Running gcov -p -b -c $$f" >> $(TEST_REPORT_FILE); \
+\t\tgcov -p -b -c "$$f" >> $(TEST_REPORT_FILE) 2>&1 || true; \
 \tdone; \
 \tif [ "$$found" -eq 0 ]; then \
 \t\techo "No .gcno files found; coverage cannot be generated." >> $(TEST_REPORT_FILE); \
 \tfi
-\t@echo "Filtering .gcov files. Keeping only: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE)
-\t@find . -maxdepth 1 -name '*.gcov' ! -name '$(TARGET_GCOV)' -delete
-\t@if [ ! -f "$(TARGET_GCOV)" ]; then \
-\t\techo "WARNING: target production gcov file was not generated: $(TARGET_GCOV)" >> $(TEST_REPORT_FILE); \
-\tfi
-	@echo "Files after gcov filtering:" >> $(TEST_REPORT_FILE)
+\t@echo "Keeping all .gcov files; coverage checker matches by Source header." >> $(TEST_REPORT_FILE)
+	@echo "Files after gcov generation:" >> $(TEST_REPORT_FILE)
 	@ls -la >> $(TEST_REPORT_FILE) 2>&1 || true
 	@echo "=== COVERAGE REPORT ==="
 	@cat $(TEST_REPORT_FILE)
@@ -304,7 +298,8 @@ def _generate_unit_test_for_func(
       - semantic judge JSON is simple: {"score": int, "reason": str}
     """
     func_id = func["id"]
-    safe_id = _safe_filename(func_id)
+    function_key = _function_artifact_key(cfg, func)
+    safe_id = function_key
     test_dir: Path = paths["test_dir"]
     process_name: str = paths["process_name"]
 
@@ -447,7 +442,9 @@ def _generate_unit_test_for_func(
                         f"[pipeline] unit test PASSED from existing gcov: {func_id} score={judge.get('score')}",
                         file=sys.stderr,
                     )
-                    return func_id, {
+                    return function_key, {
+                        "func_id": func_id,
+                        "function_key": function_key,
                         "passed": True,
                         "coverage_pct": coverage_pct,
                         "semantic_score": judge.get("score"),
@@ -823,7 +820,9 @@ Dont exit until you have written the test code in target test file and made sure
                 cached_pct = _coverage_pct(cached_coverage)
 
                 print(f"[pipeline] unit test already done: {func_id}", file=sys.stderr)
-                return func_id, {
+                return function_key, {
+                    "func_id": func_id,
+                    "function_key": function_key,
                     "passed": True,
                     "coverage_pct": cached_pct,
                     "semantic_score": v.get("score"),
@@ -1194,11 +1193,14 @@ Then verify:
  - target function has called count >= 1 in gcov
 """
 
+        # Distinct history name for semantic-repair runs so scoring can tell
+        # repair traces apart from fresh generation (token classification + fix_loops).
+        _gen_kind = "semantic_repair" if (last_judge and not last_judge.get("passed")) else "test"
         run_agent(
             cfg,
             unit_dir,
             prompt,
-            f"{safe_id}_test_{int(time.time())}.json",
+            f"{safe_id}_{_gen_kind}_{int(time.time())}.json",
             folder=repo_root,
             history_dir=unit_dir / "agent_history",
         )
@@ -1257,7 +1259,9 @@ Then verify:
                     f"[pipeline] unit test PASSED: {func_id} score={judge.get('score')}",
                     file=sys.stderr,
                 )
-                return func_id, {
+                return function_key, {
+                    "func_id": func_id,
+                    "function_key": function_key,
                     "passed": True,
                     "coverage_pct": coverage_pct,
                     "semantic_score": judge.get("score"),
@@ -1402,7 +1406,9 @@ STRICT COMPILE-FIX RULES:
                         f"[pipeline] unit test PASSED after compile_fix: {func_id} score={judge.get('score')}",
                         file=sys.stderr,
                     )
-                    return func_id, {
+                    return function_key, {
+                        "func_id": func_id,
+                        "function_key": function_key,
                         "passed": True,
                         "coverage_pct": coverage_pct,
                         "semantic_score": judge.get("score"),
@@ -1489,6 +1495,7 @@ in:
             {
                 "passed": False,
                 "func_id": func_id,
+                "function_key": function_key,
                 "attempts": max_attempts,
                 "coverage_pct": coverage_pct,
                 "make_ok": last_make_ok,
@@ -1506,7 +1513,9 @@ in:
         file=sys.stderr,
     )
 
-    return func_id, {
+    return function_key, {
+        "func_id": func_id,
+        "function_key": function_key,
         "passed": False,
         "coverage_pct": coverage_pct,
         "semantic_score": None if not last_judge else last_judge.get("score"),
@@ -1572,10 +1581,15 @@ def parallel_generate_unit_tests(
                     all_results[fid] = result
                 except Exception as e:
                     print(f"[pipeline] unit test error {func['id']}: {e}", file=sys.stderr)
-                    all_results[func["id"]] = {"passed": False, "error": str(e)}
+                    all_results[_function_artifact_key(cfg, func)] = {
+                        "func_id": func["id"],
+                        "function_key": _function_artifact_key(cfg, func),
+                        "passed": False,
+                        "error": str(e),
+                    }
 
         for func in level_funcs:
-            result = all_results.get(func["id"], {})
+            result = all_results.get(_function_artifact_key(cfg, func), {})
             if result.get("passed"):
                 src_abs = _resolve_source_file(cfg, func["source_file"])
                 _append_semantic_context(test_dir, {**func, "source_file": str(src_abs)}, result["verdict"])

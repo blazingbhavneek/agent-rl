@@ -505,7 +505,7 @@ class TestContainerStubs:
                 assert not list(ep.rglob("_inner_trace_dataset")), f"inner dataset in {ep}"
                 assert not list(ep.rglob("_trace_dataset")), f"nested _trace_dataset in {ep}"
 
-                allowed = {"metadata.json", "workspace", "agent_history"}
+                allowed = {"metadata.json", "score.json", "workspace", "agent_history"}
                 extra = {c.name for c in ep.iterdir()} - allowed
                 assert not extra, f"unexpected entries in episode {ep}: {extra}"
 
@@ -661,3 +661,152 @@ class TestAllCollectContainer:
         print(f"[all-collect container] tests/{paths['process_name']}/")
         print("=" * 70)
         print_tree(test_dir)
+
+
+class TestMultiCBlindSpots:
+    def test_resolve_source_file_rejects_ambiguous_basename(self, tmp_path):
+        from pipeline.common import _function_artifact_key, _resolve_source_file
+        from pipeline.config import PipelineConfig
+
+        src_dir = tmp_path / "project" / "src" / "proc"
+        (src_dir / "foo").mkdir(parents=True)
+        (src_dir / "bar").mkdir(parents=True)
+        (src_dir / "foo" / "main.c").write_text("int foo_main(void) { return 0; }\n")
+        (src_dir / "bar" / "main.c").write_text("int bar_main(void) { return 0; }\n")
+
+        cfg = PipelineConfig(source_dir=src_dir, agent_js=tmp_path / "agent.js")
+
+        with pytest.raises(ValueError, match="Ambiguous source_file"):
+            _resolve_source_file(cfg, "main.c")
+
+        assert _resolve_source_file(cfg, "foo/main.c") == (src_dir / "foo" / "main.c").resolve()
+        assert _function_artifact_key(cfg, {"id": "init", "source_file": "foo/main.c"}) != (
+            _function_artifact_key(cfg, {"id": "init", "source_file": "bar/main.c"})
+        )
+
+    def test_check_function_coverage_accepts_test_named_production_source(self, tmp_path):
+        from pipeline.common import check_function_coverage
+
+        source_root = tmp_path / "project" / "src" / "proc"
+        source_root.mkdir(parents=True)
+        source_file = source_root / "test_mode.c"
+        source_file.write_text("int test_mode(void) {\n    return 1;\n}\n")
+
+        test_dir = tmp_path / "project" / "tests" / "proc"
+        test_dir.mkdir(parents=True)
+        (test_dir / "test_proc.c.gcov").write_text(
+            f"        -:    0:Source:{test_dir / 'test_proc.c'}\n"
+            "        1:    1:int main(void) { return 0; }\n"
+        )
+        (test_dir / "test_mode.c.gcov").write_text(
+            f"        -:    0:Source:{source_file}\n"
+            "        1:    1:int test_mode(void) {\n"
+            "    #####:    2:    return 1;\n"
+            "        -:    3:}\n"
+        )
+
+        result = check_function_coverage(test_dir, source_file, 1, 2, source_root=source_root)
+
+        assert result is not None
+        assert result["source_file"] == str(source_file.resolve())
+        assert result["summary"]["covered_lines"] == 1
+        assert result["summary"]["executable_lines"] == 2
+
+    def test_generated_unit_makefile_keeps_all_gcov_files(self, tmp_path):
+        from pipeline.config import PipelineConfig, derive_paths
+        from pipeline.stage5_unit_tests import _scaffold_unit_test_dir
+
+        src_dir = tmp_path / "project" / "src" / "proc"
+        (src_dir / "sub").mkdir(parents=True)
+        (src_dir / "sub" / "init.c").write_text("int init(void) { return 0; }\n")
+        test_dir = tmp_path / "project" / "tests" / "proc"
+        test_dir.mkdir(parents=True)
+        (test_dir / "_pipeline_context.json").write_text('{"flags": {}}\n')
+
+        cfg = PipelineConfig(source_dir=src_dir, agent_js=tmp_path / "agent.js")
+        paths = derive_paths(cfg)
+        func = {"id": "init", "source_file": "sub/init.c", "start_line": 1, "end_line": 1}
+
+        unit_dir = _scaffold_unit_test_dir(cfg, paths, func)
+        makefile = (unit_dir / "Makefile").read_text()
+
+        assert "gcov -p -b -c" in makefile
+        assert "TARGET_GCOV" not in makefile
+        assert "! -name '$(TARGET_GCOV)' -delete" not in makefile
+        assert "_unit_tests/sub_init.c__init" in str(unit_dir)
+
+    def test_unit_makefile_contract_rejects_old_gcov_filter(self, tmp_path):
+        from pipeline.stage5_unit_tests import _unit_makefile_matches_contract
+
+        makefile = tmp_path / "Makefile"
+        makefile.write_text(
+            "TEST_PROGRAM = test_sub_init\n"
+            "TEST_SRCS = test_sub_init.c\n"
+            "TARGET_GCOV = $(notdir $(PROD_SRC)).gcov\n"
+            "coverage-test:\n"
+            "\t@gcov -b -c $(TEST_GCNO)\n"
+        )
+
+        assert not _unit_makefile_matches_contract(
+            makefile,
+            "test_sub_init",
+            "test_sub_init.c",
+        )
+
+    def test_functions_leaf_first_keeps_duplicate_function_ids(self):
+        from pipeline.analysis import functions_leaf_first
+
+        analysis = {
+            "functions": [
+                {"id": "init", "depth": 2, "source_file": "a.c"},
+                {"id": "init", "depth": 1, "source_file": "b.c"},
+            ],
+            "function_levels": {"2": ["init"], "1": ["init"]},
+        }
+
+        ordered = functions_leaf_first(analysis)
+
+        assert [f["source_file"] for f in ordered] == ["a.c", "b.c"]
+
+    def test_master_makefile_does_not_link_included_process_objects(self, tmp_path):
+        from pipeline.config import PipelineConfig, derive_paths
+        from pipeline.stage2_makefile import build_annotated_makefile
+
+        src_dir = tmp_path / "project" / "src" / "proc"
+        src_dir.mkdir(parents=True)
+        (src_dir / "a.c").write_text("int a(void) { return 0; }\n")
+        (src_dir / "b.c").write_text("int b(void) { return 0; }\n")
+        (src_dir / "Makefile").write_text("CFLAGS = -Wall\n")
+
+        test_dir = tmp_path / "project" / "tests" / "proc"
+        test_dir.mkdir(parents=True)
+        (test_dir / "Makefile").write_text("all:\n\t@true\n")
+
+        cfg = PipelineConfig(source_dir=src_dir, agent_js=tmp_path / "agent.js")
+        paths = derive_paths(cfg)
+
+        build_annotated_makefile(cfg, paths)
+        makefile = (test_dir / "Makefile").read_text()
+
+        assert "SRC_OBJS =" in makefile
+        assert "$(filter-out $(SRC_BUILD_DIR)" not in makefile
+        assert "gcov -p -b -c *.gcno" in makefile
+
+    def test_extract_test_additions_renames_test_symbols_only(self, tmp_path):
+        from pipeline.stage6_integrate import extract_test_additions
+
+        unit_test = tmp_path / "test_init.c"
+        unit_test.write_text(
+            "static void test_init(void) {\n"
+            "    init();\n"
+            "}\n"
+            "int main(void) {\n"
+            "    CU_add_test(local_suite, \"init\", test_init);\n"
+            "}\n"
+        )
+
+        cases, calls = extract_test_additions(unit_test, name_prefix="sub_init_c__init")
+
+        assert "void sub_init_c__init_test_init" in cases
+        assert "    init();" in cases
+        assert "sub_init_c__init_test_init" in "\n".join(calls)

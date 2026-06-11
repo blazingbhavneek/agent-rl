@@ -9,7 +9,8 @@ from pathlib import Path
 from .config import PipelineConfig
 from .analysis import functions_leaf_first
 from .common import (
-    _safe_filename,
+    _function_artifact_key,
+    _safe_c_identifier,
     _resolve_source_file,
     _source_files_json_for_prompt,
     build_output_with_runtime_diagnostics,
@@ -40,7 +41,7 @@ def _extract_func_body(text: str, func_name: str) -> str:
     return text[start:i]
 
 
-def extract_test_additions(unit_test_file: Path) -> tuple[str, list[str]]:
+def extract_test_additions(unit_test_file: Path, *, name_prefix: str = "") -> tuple[str, list[str]]:
     """Extract test functions and CU_add_test calls from a standalone unit test file.
 
     Unit test files are complete CUnit files (not marker-based fragments).
@@ -69,10 +70,29 @@ def extract_test_additions(unit_test_file: Path) -> tuple[str, list[str]]:
 
     # Extract each test function body.
     bodies: list[str] = []
+    rename_map: dict[str, str] = {}
     for name in func_names:
         body = _extract_func_body(text, name)
         if body:
+            if name_prefix:
+                new_name = _safe_c_identifier(f"{name_prefix}_{name}")
+                body = re.sub(
+                    rf"((?:static\s+)?void\s+){re.escape(name)}\b",
+                    rf"\1{new_name}",
+                    body,
+                    count=1,
+                )
+                rename_map[name] = new_name
             bodies.append(body)
+
+    if rename_map:
+        renamed_calls: list[str] = []
+        for call in reg_calls:
+            new_call = call
+            for old, new in rename_map.items():
+                new_call = re.sub(rf"\b{re.escape(old)}\b", new, new_call)
+            renamed_calls.append(new_call)
+        reg_calls = renamed_calls
 
     test_cases = "\n\n".join(bodies)
     return test_cases, reg_calls
@@ -259,7 +279,7 @@ BUILD / CONTENT RULES
     Then inspect the generated report and coverage output:
     `ls -lt *_report.txt`
     `cat *_report.txt`
-    `gcov -b -c *.gcno`
+    `gcov -p -b -c *.gcno`
 15. Keep the merged file readable: group tests, helpers, wrappers, and
     registrations cleanly instead of scattering additions around the file.
 
@@ -345,12 +365,14 @@ def integrate_all_unit_tests_sequential(
 
     for func in functions_leaf_first(analysis):
         func_id = func["id"]
-        safe_id = _safe_filename(func_id)
-        result = unit_test_results.get(func_id, {})
+        function_key = _function_artifact_key(cfg, func)
+        safe_id = function_key
+        result = unit_test_results.get(function_key) or unit_test_results.get(func_id, {})
         if not result.get("passed"):
             continue
 
-        if f"/* --- unit: {func_id} --- */" in read_text(test_file):
+        unit_marker = f"/* --- unit: {function_key} --- */"
+        if unit_marker in read_text(test_file):
             print(f"[pipeline] already integrated: {func_id}", file=sys.stderr)
             continue
 
@@ -360,7 +382,10 @@ def integrate_all_unit_tests_sequential(
         if not unit_test_file.exists():
             continue
 
-        test_cases, reg_calls = extract_test_additions(unit_test_file)
+        test_cases, reg_calls = extract_test_additions(
+            unit_test_file,
+            name_prefix=_safe_c_identifier(function_key),
+        )
         if not test_cases.strip() and not reg_calls:
             print(f"[pipeline] no additions to integrate for {func_id}", file=sys.stderr)
             continue
@@ -371,7 +396,7 @@ def integrate_all_unit_tests_sequential(
         current_cov_obj, current_cov_pct = _current_function_coverage(
             cfg, test_dir, source_file_abs, func
         )
-        current_has_block = f"/* --- unit: {func_id} --- */" in read_text(test_file)
+        current_has_block = unit_marker in read_text(test_file)
 
         if current_has_block and _coverage_matches_target(
             current_cov_pct,
@@ -388,7 +413,7 @@ def integrate_all_unit_tests_sequential(
         reg_marker = "CU_basic_set_mode"
 
         if not current_has_block and cases_marker in current and test_cases.strip():
-            insertion = f"\n\n/* --- unit: {func_id} --- */\n{test_cases}\n"
+            insertion = f"\n\n{unit_marker}\n/* function id: {func_id} */\n{test_cases}\n"
             current = current.replace(cases_marker, cases_marker + insertion, 1)
 
         if not current_has_block and reg_calls and reg_marker in current:

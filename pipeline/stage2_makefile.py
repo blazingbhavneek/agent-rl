@@ -186,8 +186,9 @@ SOURCE_DIR = {source_dir}
 SRC_BUILD_DIR = {src_build_dir}
 SRC_OBJS_ALL = $(wildcard $(SRC_BUILD_DIR)/*.o)
 
-# Exclude likely production main/program object to avoid duplicate main().
-SRC_OBJS = $(filter-out $(SRC_BUILD_DIR)/{process_name}.o $(SRC_BUILD_DIR)/main.o,$(SRC_OBJS_ALL))
+# Production .c files are included directly by $(TEST_SRCS). Linking the same
+# process objects again causes duplicate symbols in multi-C processes.
+SRC_OBJS =
 
 TEST_LIBS += -lcunit
 TEST_REPORT_FILE = $(TEST_PROGRAM)_report.txt
@@ -209,7 +210,7 @@ $(TEST_PROGRAM): $(TEST_SRCS)
 \t$(WRAP_FLAGS)
 
 coverage-test:
-\t@gcov -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
+\t@gcov -p -b -c *.gcno >> $(TEST_REPORT_FILE) 2>&1 || true
 
 clean-test:
 \trm -f $(TEST_PROGRAM) $(TEST_REPORT_FILE) $(TEST_LOG_FILE) *.gcda *.gcno *.gcov *.o

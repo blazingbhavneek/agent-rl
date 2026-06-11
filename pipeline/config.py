@@ -35,7 +35,7 @@ class PipelineConfig:
     path_map: tuple[tuple[str, str], ...] = ()
     agent_timeout_sec: int = 1800
     max_agent_iterations: int = 25
-    max_compile_fix_attempts: int = 5
+    max_compile_fix_attempts: int = 3
     max_test_attempts: int = 4
     # Skip a function if it already has line coverage >= this value.
     coverage_threshold: float = 80.0
@@ -51,7 +51,7 @@ class PipelineConfig:
     max_minimal_test_attempts: int = 5
     semantic_judge_min_score: int = 75
     max_unit_test_workers: int = 4
-    max_fix_attempts: int = 20
+    max_fix_attempts: int = 3
 
 
 def derive_test_dir(src_dir: Path) -> Path:

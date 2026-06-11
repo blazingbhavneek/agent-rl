@@ -34,29 +34,17 @@ def run_or_load_analysis(cfg: PipelineConfig, out_path: Path) -> dict:
 def functions_leaf_first(analysis: dict) -> list[dict]:
     """
     Order functions leaf -> root.
-    function_levels maps depth-string -> list of function ids.
-    Leaves have the highest depth.
+    Leaves have the highest depth. Keep duplicate function ids as separate
+    records because multi-C projects can have same-named static functions.
     """
-    levels: dict[int, list[str]] = {}
-    for k, v in (analysis.get("function_levels") or {}).items():
+    funcs = list(analysis.get("functions", []) or [])
+    def _depth(func: dict) -> int:
         try:
-            levels[int(k)] = list(v)
+            return int(func.get("depth", 0))
         except Exception:
-            continue
+            return 0
 
-    index: dict[str, dict] = {}
-    for f in analysis.get("functions", []) or []:
-        index[f["id"]] = f
-
-    # Sort descending: highest depth = leaves (deepest callees) come first.
-    # depth=0 is the entry-point root; tests are generated leaf-to-root so
-    # lower-level behavior is proven before the callers that depend on it.
-    ordered: list[dict] = []
-    for depth in sorted(levels.keys(), reverse=True):
-        for fid in levels[depth]:
-            if fid in index:
-                ordered.append(index[fid])
-    return ordered
+    return sorted(funcs, key=_depth, reverse=True)
 
 
 def collect_stub_candidates(analysis: dict) -> list[str]:

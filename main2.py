@@ -71,6 +71,8 @@ def parse_args() -> PipelineConfig:
         "select-unit-tests",
         "materialize-unit-tests",
         "integrate",
+        "score",
+        "build-dpo",
     ])
 
     # How many generations for each item, currently seems to be running sequentially, better to flatten out for every entry and run with asyncio

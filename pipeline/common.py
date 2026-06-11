@@ -52,6 +52,34 @@ def _safe_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
 
 
+def _safe_c_identifier(s: str) -> str:
+    ident = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_")
+    if not ident:
+        ident = "generated"
+    if not re.match(r"[A-Za-z_]", ident):
+        ident = f"f_{ident}"
+    return ident
+
+
+def _function_artifact_key(cfg: PipelineConfig, func: dict) -> str:
+    """Stable per-function key that includes source location when available."""
+    fid = str(func.get("id") or func.get("name") or "unknown_function")
+    source_file = str(func.get("source_file") or "")
+    if not source_file:
+        return _safe_filename(fid)
+
+    src = Path(source_file)
+    if src.is_absolute():
+        try:
+            source_file = src.resolve().relative_to(cfg.source_dir.resolve()).as_posix()
+        except Exception:
+            source_file = src.as_posix()
+    else:
+        source_file = src.as_posix()
+
+    return _safe_filename(f"{source_file}__{fid}") or _safe_filename(fid)
+
+
 def _read_json_loose(path: Path) -> dict:
     """
     Read JSON written by the agent.
@@ -135,24 +163,40 @@ def _resolve_source_file(cfg: PipelineConfig, source_file: str | Path) -> Path:
         return src.resolve()
     # Relative — try joining directly under source_dir first.
     direct = (source_dir / src).resolve()
-    if direct.exists():
-        return direct
     # Fall back to recursive filename search under source_dir.
     matches = sorted(
         p.resolve()
         for p in source_dir.rglob(src.name)
         if p.is_file()
     )
+    if direct.exists():
+        if len(src.parts) == 1 and len(matches) > 1:
+            candidates = "\n".join(f" - {m}" for m in matches)
+            raise ValueError(
+                "Ambiguous source_file in multi-C source tree. "
+                f"source_file={source_file!s}\nCandidates:\n{candidates}"
+            )
+        return direct
     if len(matches) == 1:
         return matches[0]
-    # Multiple hits: prefer the candidate whose path ends with the requested suffix
-    # (handles subdirectory disambiguation like "subdir/foo.c").
+    # Multiple hits: accept only an unambiguous suffix match. A bare basename in
+    # a multi-C tree is unsafe because coverage could be credited to the wrong
+    # source file.
     if len(matches) > 1:
         wanted_suffix = src.as_posix()
-        for m in matches:
-            if m.as_posix().endswith(wanted_suffix):
-                return m
-        return matches[0]
+        suffix_matches = [
+            m
+            for m in matches
+            if m.as_posix().endswith("/" + wanted_suffix)
+            or m.as_posix() == wanted_suffix
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        candidates = "\n".join(f" - {m}" for m in matches)
+        raise ValueError(
+            "Ambiguous source_file in multi-C source tree. "
+            f"source_file={source_file!s}\nCandidates:\n{candidates}"
+        )
     return direct
 
 
@@ -423,8 +467,8 @@ def check_function_coverage(
 ) -> Optional[dict]:
     """
     Check coverage for original production source.
-    Ignores test_*.c.gcov.
-    Matches .gcov by Source: header.
+    Matches .gcov by Source: header and skips harness sources by resolved path
+    under test_dir, not by basename.
     """
     test_dir = Path(test_dir).resolve()
     source_abs = Path(source_file).resolve()
@@ -469,9 +513,6 @@ def check_function_coverage(
             continue
         except ValueError:
             pass
-        # Skip explicitly named test files.
-        if src.name.startswith("test_"):
-            continue
         # If a source root is given, skip files outside it (other libraries etc.).
         if source_root is not None:
             try:

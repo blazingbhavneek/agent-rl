@@ -11,9 +11,10 @@ from typing import Any, Optional
 
 from . import container as container_mod
 from .analysis import collect_stub_candidates, functions_leaf_first, run_or_load_analysis
-from .common import _safe_filename, load_json, read_text, write_json
+from .common import _function_artifact_key, _safe_filename, load_json, read_text, write_json
 from .config import PipelineConfig
 from .semantic import _load_semantic_context
+from . import scoring
 from .stage1_scaffold import ensure_test_file
 from .stage2_makefile import build_annotated_makefile
 from .stage3_stubs import generate_stub_code, integrate_all_stubs_sequential
@@ -233,6 +234,26 @@ def _load_selected_json(frontier_dir: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _score_workspace_results(stage: str, cfg: PipelineConfig, paths: dict, results: list) -> None:
+    """Write score.json for episodic workspace stages (minimal / integrate)."""
+    for r in results:
+        ws = Path(r["workspace"])
+        meta = {
+            "episode_id": r.get("eid"),
+            "process_name": paths["process_name"],
+            "ok": bool(r.get("ok")),
+        }
+        try:
+            scoring.write_episode_score(
+                stage, ws, meta,
+                coverage_threshold=cfg.coverage_threshold,
+                semantic_min=cfg.semantic_judge_min_score,
+                agent_history=ws / "agent_history",
+            )
+        except Exception as exc:
+            print(f"[pipeline] WARN score failed {ws}: {exc}", file=sys.stderr)
+
+
 def _stage_prepare(cfg: PipelineConfig, paths: dict) -> None:
     _prepare(cfg, paths)
 
@@ -300,6 +321,12 @@ def _collect_one_stub(cfg: PipelineConfig, paths: dict, func_name: str, safe: st
         "result": result,
     }
     write_json(episode_root / "metadata.json", metadata)
+    scoring.write_episode_score(
+        "collect-stubs", episode_root, metadata,
+        coverage_threshold=cfg.coverage_threshold,
+        semantic_min=cfg.semantic_judge_min_score,
+        agent_history=ep_history,
+    )
 
 
 def _stage_collect_stubs(cfg: PipelineConfig, paths: dict) -> None:
@@ -688,6 +715,7 @@ def _stage_integrate_stubs(cfg: PipelineConfig, paths: dict) -> None:
         for fut in as_completed(futures):
             results.append(fut.result())
 
+    _score_workspace_results("integrate-stubs", cfg, paths, results)
     successes = [r for r in results if r.get("ok")]
 
     print(
@@ -892,6 +920,7 @@ def _stage_minimal_master(cfg: PipelineConfig, paths: dict) -> None:
         for fut in as_completed(futures):
             results.append(fut.result())
 
+    _score_workspace_results("minimal-master", cfg, paths, results)
     successes = [r for r in results if r.get("ok")]
 
     print(
@@ -1030,7 +1059,7 @@ def _collect_one_unit(
         unit_dir = H / "_unit_tests" / safe
 
         try:
-            fid, result = _generate_unit_test_for_func(
+            result_key, result = _generate_unit_test_for_func(
                 run_cfg,
                 episode_paths,
                 func,
@@ -1051,13 +1080,14 @@ def _collect_one_unit(
         # Pristine start: clear only this function's active unit dir. Inputs
         # (selected _stub_gen, minimal-master baseline, context) survive.
         _reset_dir(active)
-        fid, result = _generate_unit_test_for_func(cfg, paths, func, flags, semantic_context)
+        result_key, result = _generate_unit_test_for_func(cfg, paths, func, flags, semantic_context)
         _harvest(active, workspace, harvest_names)
         _reset_dir(active)  # leave pristine for the next episode/stage
 
     metadata = {
         **_metadata_base(cfg, paths, "collect-unit-tests", eid),
-        "func_id": fid,
+        "func_id": func.get("id"),
+        "function_key": result_key,
         "safe_id": safe,
         "func": func,
         "workspace": str(workspace),
@@ -1069,6 +1099,12 @@ def _collect_one_unit(
     if episode_workspace is not None:
         metadata["episode_workspace"] = str(episode_workspace)
     write_json(episode_root / "metadata.json", metadata)
+    scoring.write_episode_score(
+        "collect-unit-tests", episode_root, metadata,
+        coverage_threshold=cfg.coverage_threshold,
+        semantic_min=cfg.semantic_judge_min_score,
+        agent_history=workspace / "agent_history",
+    )
 
 
 def _stage_collect_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
@@ -1076,7 +1112,7 @@ def _stage_collect_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
     semantic_context = _load_semantic_context(Path(paths["test_dir"]))
     eps = max(1, int(cfg.episodes_per_item))
     jobs = [
-        partial(_collect_one_unit, cfg, paths, func, _safe_filename(func["id"]), flags, semantic_context)
+        partial(_collect_one_unit, cfg, paths, func, _function_artifact_key(cfg, func), flags, semantic_context)
         for func in _target_functions(cfg, analysis)
         for _ in range(eps)
     ]
@@ -1156,10 +1192,13 @@ def _selected_unit_results(
             continue
         result = selected.get("result") if isinstance(selected.get("result"), dict) else {}
         func_id = selected.get("func_id") or result.get("func_id") or frontier.name
+        function_key = selected.get("function_key") or result.get("function_key") or frontier.name
         active_dir = test_dir / "_unit_tests" / frontier.name
         unit_dir = active_dir if prefer_active and (active_dir / f"test_{frontier.name}.c").exists() else frontier
-        results[str(func_id)] = {
+        results[str(function_key)] = {
             **result,
+            "func_id": str(func_id),
+            "function_key": str(function_key),
             "passed": bool(selected.get("passed") or result.get("passed")),
             "coverage_pct": selected.get("coverage_pct", result.get("coverage_pct")),
             "semantic_score": selected.get("semantic_score", result.get("semantic_score")),
@@ -1199,9 +1238,9 @@ def _stage_materialize_unit_tests(cfg: PipelineConfig, paths: dict) -> None:
         except Exception:
             ctx = {}
     ctx["unit_test_results"] = unit_results
-    targeted_ids = [func["id"] for func in _target_functions(cfg, analysis)]
-    all_targeted_passed = bool(targeted_ids) and all(
-        unit_results.get(fid, {}).get("passed") for fid in targeted_ids
+    targeted_keys = [_function_artifact_key(cfg, func) for func in _target_functions(cfg, analysis)]
+    all_targeted_passed = bool(targeted_keys) and all(
+        unit_results.get(key, {}).get("passed") for key in targeted_keys
     )
     if all_targeted_passed:
         ctx["unit_tests_completed"] = True
@@ -1415,6 +1454,7 @@ def _stage_integrate(cfg: PipelineConfig, paths: dict) -> None:
         for fut in as_completed(futures):
             results.append(fut.result())
 
+    _score_workspace_results("integrate", cfg, paths, results)
     successes = [r for r in results if r.get("ok")]
 
     print(
@@ -1435,6 +1475,48 @@ def _stage_integrate(cfg: PipelineConfig, paths: dict) -> None:
     )
 
 
+def _stage_score(cfg: PipelineConfig, paths: dict) -> None:
+    """Backfill base score.json over the dataset, then normalize within item groups."""
+    root = dataset_root(cfg, paths)
+    for meta_path in sorted(root.rglob("metadata.json")):
+        episode_dir = meta_path.parent
+        if (episode_dir / "score.json").exists():
+            continue
+        try:
+            meta = load_json(meta_path)
+        except Exception:
+            continue
+        stage = meta.get("stage")
+        if not stage:
+            continue
+        # Prefer the history path recorded in metadata; fall back to layout guesses.
+        hist = None
+        if meta.get("agent_history"):
+            hist = Path(meta["agent_history"])
+        elif meta.get("workspace"):
+            hist = Path(meta["workspace"]) / "agent_history"
+        if hist is None or not hist.exists():
+            hist = episode_dir / "agent_history"
+        if not hist.exists():
+            hist = episode_dir / "workspace" / "agent_history"
+        try:
+            scoring.write_episode_score(
+                stage, episode_dir, meta,
+                coverage_threshold=cfg.coverage_threshold,
+                semantic_min=cfg.semantic_judge_min_score,
+                agent_history=hist,
+            )
+        except Exception as exc:
+            print(f"[pipeline] WARN score backfill {episode_dir}: {exc}", file=sys.stderr)
+    scoring.finalize_scores(root)
+
+
+def _stage_build_dpo(cfg: PipelineConfig, paths: dict) -> None:
+    root = dataset_root(cfg, paths)
+    scoring.finalize_scores(root)
+    scoring.build_dpo_pairs(root)
+
+
 _STAGE_HANDLERS = {
     "prepare": _stage_prepare,
     "collect-stubs": _stage_collect_stubs,
@@ -1446,6 +1528,8 @@ _STAGE_HANDLERS = {
     "select-unit-tests": _stage_select_unit_tests,
     "materialize-unit-tests": _stage_materialize_unit_tests,
     "integrate": _stage_integrate,
+    "score": _stage_score,
+    "build-dpo": _stage_build_dpo,
 }
 
 # Full collection sequence run by --stage all-collect, in order.
@@ -1460,6 +1544,7 @@ COLLECTION_STAGE_ORDER = [
     "select-unit-tests",
     "materialize-unit-tests",
     "integrate",
+    "score",
 ]
 
 
