@@ -12,47 +12,47 @@ from .config import PipelineConfig
 # region Forwarded environement variables
 
 _FORWARDED_ENV_KEYS = (
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TERM",
-    "TMPDIR",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LD_LIBRARY_PATH",
-    "LIBRARY_PATH",
-    "CPATH",
-    "C_INCLUDE_PATH",
-    "CPLUS_INCLUDE_PATH",
-    "PROVIDER_ID",
-    "MODEL_NAME",
-    "OPENAI_BASE_URL",
-    "OPENAI_API_KEY",
-    "RAG_SERVICE_URL",
-    "MAX_WAIT_MS",
-    "IDLE_WAIT_MS",
-    "HEARTBEAT_MS",
-    "CAPTURE_RAW_HTTP_TRACE",
-    "DISABLE_STREAMING",
-    "CC",
-    "CXX",
-    "CUDA_HOME",
-    "CUDA_PATH",
-    "NVM_DIR",
-    "BUN_INSTALL",
-    "CONDA_EXE",
-    "CONDA_PREFIX",
-    "CONDA_DEFAULT_ENV",
-    "CONDA_PYTHON_EXE",
-    "CONDA_SHLVL",
-    "MAMBA_ROOT_PREFIX",
-    "PYTHONPATH",
-    "HF_HUB_ENABLE_HF_TRANSFER",
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "VLLM_USE_FLASHINFER_SAMPLER",
+    # "PATH",
+    # "HOME",
+    # "USER",
+    # "LOGNAME",
+    # "SHELL",
+    # "TERM",
+    # "TMPDIR",
+    # "LANG",
+    # "LC_ALL",
+    # "LC_CTYPE",
+    # "LD_LIBRARY_PATH",
+    # "LIBRARY_PATH",
+    # "CPATH",
+    # "C_INCLUDE_PATH",
+    # "CPLUS_INCLUDE_PATH",
+    # "PROVIDER_ID",
+    # "MODEL_NAME",
+    # "OPENAI_BASE_URL",
+    # "OPENAI_API_KEY",
+    # "RAG_SERVICE_URL",
+    # "MAX_WAIT_MS",
+    # "IDLE_WAIT_MS",
+    # "HEARTBEAT_MS",
+    # "CAPTURE_RAW_HTTP_TRACE",
+    # "DISABLE_STREAMING",
+    # "CC",
+    # "CXX",
+    # "CUDA_HOME",
+    # "CUDA_PATH",
+    # "NVM_DIR",
+    # "BUN_INSTALL",
+    # "CONDA_EXE",
+    # "CONDA_PREFIX",
+    # "CONDA_DEFAULT_ENV",
+    # "CONDA_PYTHON_EXE",
+    # "CONDA_SHLVL",
+    # "MAMBA_ROOT_PREFIX",
+    # "PYTHONPATH",
+    # "HF_HUB_ENABLE_HF_TRANSFER",
+    # "PYTORCH_CUDA_ALLOC_CONF",
+    # "VLLM_USE_FLASHINFER_SAMPLER",
     "http_proxy",
     "https_proxy",
     "no_proxy",
@@ -62,32 +62,32 @@ _FORWARDED_ENV_KEYS = (
 )
 
 _FORWARDED_ENV_PREFIXES = (
-    "OPENAI_",
-    "RAG_",
-    "VLLM_",
-    "CUDA",
-    "CONDA",
-    "HF_",
-    "PYTHON",
-    "PIP_",
-    "UV_",
-    "NVM_",
-    "BUN_",
+    # "OPENAI_",
+    # "RAG_",
+    # "VLLM_",
+    # "CUDA",
+    # "CONDA",
+    # "HF_",
+    # "PYTHON",
+    # "PIP_",
+    # "UV_",
+    # "NVM_",
+    # "BUN_",
     "http_",
     "https_",
-    "no_",
+    # "no_",
     "HTTP_",
     "HTTPS_",
-    "NO_",
+    # "NO_",
 )
 
 _MERGED_ENV_KEYS = (
-    "PATH",
-    "LD_LIBRARY_PATH",
-    "LIBRARY_PATH",
-    "CPATH",
-    "C_INCLUDE_PATH",
-    "CPLUS_INCLUDE_PATH",
+    # "PATH",
+    # "LD_LIBRARY_PATH",
+    # "LIBRARY_PATH",
+    # "CPATH",
+    # "C_INCLUDE_PATH",
+    # "CPLUS_INCLUDE_PATH",
 )
 
 # endregion Forwarded environement variables
@@ -211,7 +211,14 @@ def _docker_script(
     script = f"{prologue}; exec {inner_cmd}"
 
     # Build the final docker exec command.
-    docker_cmd = ["docker", "exec"]
+    docker_cmd = [
+        "docker",
+        "exec",
+        "-u",
+        "seigyo",
+        "-e",
+        "HOME=/home/seigyo",
+    ]
 
     # Forward non-merged environment variables.
     for key, value in passthrough_env.items():
@@ -223,6 +230,12 @@ def _docker_script(
     return docker_cmd, script
 
 # runs the command based on either the host (source code is being generated in same host) or docker (actual generation/checking is happening in seperate docker container)
+import os
+import shlex
+import subprocess
+from pathlib import Path
+
+
 def run_command(
     cfg: PipelineConfig,
     cmd: list[str] | str,
@@ -239,6 +252,11 @@ def run_command(
     if mode == "local":
         run_env = os.environ.copy()
         run_env.update(env_updates)
+
+        print(
+            cmd if isinstance(cmd, str) else shlex.join(cmd)
+        )
+
         return subprocess.run(
             cmd,
             cwd=str(cwd),
@@ -246,13 +264,14 @@ def run_command(
             shell=shell,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
         )
 
     if mode != "docker":
         raise ValueError(f"Unsupported execution_mode: {mode}")
 
-    docker_cmd, _script = _docker_script(
+    docker_cmd, script = _docker_script(
         cfg,
         cwd=cwd,
         cmd=cmd,
@@ -260,10 +279,13 @@ def run_command(
         shell=shell,
     )
 
+    print(docker_cmd)
+
     return subprocess.run(
         docker_cmd,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
     )
 

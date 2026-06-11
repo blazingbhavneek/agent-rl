@@ -144,11 +144,20 @@ def _prepare_episode_testdir(
 
 def _run_jobs(cfg: PipelineConfig, jobs: list) -> None:
     """Run episode jobs, in parallel only for per-episode-container mode."""
-    workers = max(1, int(cfg.episode_concurrency)) if cfg.per_episode_container else 1
+    if not jobs:
+        return
+
+    workers = (
+        min(len(jobs), max(1, int(cfg.episode_concurrency)))
+        if cfg.per_episode_container
+        else 1
+    )
+
     if workers == 1:
         for job in jobs:
             job()
         return
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(job) for job in jobs]
         for fut in as_completed(futures):
@@ -391,29 +400,513 @@ def _validated_stub_bodies(paths: dict, analysis: dict) -> dict[str, str]:
             bodies[name] = body
     return bodies
 
+import os
+import shutil
+import uuid
+from pathlib import Path
+
+
+def _rebase_paths_for_workspace(paths: dict, old_root: Path, new_root: Path) -> dict:
+    """
+    Copy paths dict and rewrite anything under old_root to the matching path
+    under new_root.
+
+    Example:
+      /repo/tests/dio100d/test_dio100d.c
+    becomes:
+      /repo/tests/dio100d/_trace_dataset/integrate_episodes/eid/test_dio100d.c
+    """
+    old_root = old_root.resolve()
+    new_root = new_root.resolve()
+
+    out = {}
+    for key, value in paths.items():
+        if isinstance(value, Path):
+            s = str(value.resolve())
+            if s == str(old_root) or s.startswith(str(old_root) + os.sep):
+                rel = Path(s).relative_to(old_root)
+                out[key] = new_root / rel
+            else:
+                out[key] = value
+        elif isinstance(value, str):
+            s = str(Path(value).resolve())
+            if s == str(old_root) or s.startswith(str(old_root) + os.sep):
+                rel = Path(s).relative_to(old_root)
+                out[key] = str(new_root / rel)
+            else:
+                out[key] = value
+        else:
+            out[key] = value
+
+    return out
+
+
+def _make_integrate_workspace(cfg: PipelineConfig, paths: dict, eid: str) -> Path:
+    """
+    Create a clean workspace for one integrate-stubs episode.
+
+    Copies only the minimal files needed:
+      - Makefile
+      - main test file
+      - _stub_gen
+      - _pipeline_context.json
+      - analysis.json
+
+    Does NOT copy:
+      - _trace_dataset
+      - old agent_history
+      - stdout/stderr logs
+      - object files
+    """
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+
+    dataset_root_dir = dataset_root(cfg, paths)
+    workspace = dataset_root_dir / "integrate_episodes" / eid
+
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Copy main test file.
+    test_file = Path(paths["test_file"]).resolve()
+    if test_file.exists():
+        shutil.copy2(test_file, workspace / test_file.name)
+
+    # Copy Makefile.
+    makefile = canonical_test_dir / "Makefile"
+    if makefile.exists():
+        shutil.copy2(makefile, workspace / "Makefile")
+
+    # Copy cached pipeline context if available.
+    context_file = canonical_test_dir / "_pipeline_context.json"
+    if context_file.exists():
+        shutil.copy2(context_file, workspace / "_pipeline_context.json")
+
+    # Copy analysis if available.
+    analysis_file = canonical_test_dir / "analysis.json"
+    if analysis_file.exists():
+        shutil.copy2(analysis_file, workspace / "analysis.json")
+
+    # Copy generated stubs.
+    stub_gen = canonical_test_dir / "_stub_gen"
+    if stub_gen.exists():
+        shutil.copytree(stub_gen, workspace / "_stub_gen")
+
+    # Fresh isolated agent history for this episode.
+    (workspace / "agent_history").mkdir(parents=True, exist_ok=True)
+
+    return workspace
+
+def _run_one_integrate_episode(
+    cfg: PipelineConfig,
+    paths: dict,
+    bodies: list,
+    flags,
+    episode_index: int,
+):
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    eid = f"integrate_{episode_index:06d}_{uuid.uuid4().hex[:8]}"
+    workspace = _make_integrate_workspace(cfg, paths, eid)
+
+    episode_paths = _rebase_paths_for_workspace(
+        paths,
+        old_root=canonical_test_dir,
+        new_root=workspace,
+    )
+
+    name = container_mod.episode_container_name()
+
+    print(
+        f"[pipeline] starting integrate episode {episode_index} "
+        f"name={name} workspace={workspace}",
+        file=sys.stderr,
+    )
+
+    container_mod.create(
+        cfg,
+        name,
+        host_test_dir=workspace,
+        canonical_test_dir=canonical_test_dir,
+        repo_root=repo_root,
+    )
+
+    run_cfg = replace(
+        cfg,
+        execution_mode="docker",
+        container_name=name,
+        per_episode_container=False,
+        # Host workspace paths must become canonical container test paths.
+        path_map=((str(workspace), str(canonical_test_dir)),),
+    )
+
+    try:
+        integrate_all_stubs_sequential(
+            run_cfg,
+            episode_paths,
+            bodies,
+            flags,
+        )
+
+        print(
+            f"[pipeline] integrate episode success index={episode_index} "
+            f"workspace={workspace}",
+            file=sys.stderr,
+        )
+
+        return {
+            "ok": True,
+            "episode_index": episode_index,
+            "eid": eid,
+            "workspace": workspace,
+        }
+
+    except Exception as exc:
+        print(
+            f"[pipeline] integrate episode failed index={episode_index} "
+            f"workspace={workspace}: {exc}",
+            file=sys.stderr,
+        )
+
+        return {
+            "ok": False,
+            "episode_index": episode_index,
+            "eid": eid,
+            "workspace": workspace,
+            "error": repr(exc),
+        }
+
+    finally:
+        container_mod.teardown(name)
+        print(
+            f"[pipeline] integrate episode container removed name={name}",
+            file=sys.stderr,
+        )
+
+def _promote_integrate_workspace(paths: dict, workspace: Path) -> None:
+    """
+    Copy selected episode result back into the real canonical test dir.
+
+    Only promote files that integration is expected to modify.
+    Do NOT copy trace logs, agent_history, object files, etc.
+    """
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+
+    test_file = Path(paths["test_file"]).resolve()
+    workspace_test_file = workspace / test_file.name
+
+    if workspace_test_file.exists():
+        shutil.copy2(workspace_test_file, test_file)
+
+    workspace_makefile = workspace / "Makefile"
+    canonical_makefile = canonical_test_dir / "Makefile"
+
+    if workspace_makefile.exists():
+        shutil.copy2(workspace_makefile, canonical_makefile)
 
 def _stage_integrate_stubs(cfg: PipelineConfig, paths: dict) -> None:
+    """
+    Integrate validated stubs using multiple clean workspaces.
+
+    Each episode gets:
+      - copied Makefile
+      - copied main test file
+      - copied _stub_gen
+      - copied cached context/analysis
+      - fresh agent_history
+      - fresh container
+    """
     flags, analysis = _prepare(cfg, paths)
     bodies = _validated_stub_bodies(paths, analysis)
-    integrate_all_stubs_sequential(cfg, paths, bodies, flags)
 
+    print(
+        f"[pipeline] integrate-stubs: {len(bodies)} validated stub bodies found",
+        file=sys.stderr,
+    )
+
+    if not cfg.per_episode_container:
+        integrate_all_stubs_sequential(cfg, paths, bodies, flags)
+        return
+
+    if cfg.execution_mode != "docker":
+        raise ValueError("--per-episode-container for integrate-stubs requires --execution-mode docker")
+    if not cfg.container_image:
+        raise ValueError("--container-image is required with --per-episode-container")
+
+    episode_count = int(getattr(cfg, "episodes_per_item", 1) or 1)
+
+    episode_concurrency = int(getattr(cfg, "episode_concurrency", 1) or 1)
+    max_workers = max(1, min(episode_concurrency, episode_count))
+
+    results = []
+
+    print(
+        f"[pipeline] integrate-stubs running {episode_count} episodes "
+        f"with concurrency={max_workers}",
+        file=sys.stderr,
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _run_one_integrate_episode,
+                cfg,
+                paths,
+                bodies,
+                flags,
+                i,
+            )
+            for i in range(episode_count)
+        ]
+
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    successes = [r for r in results if r.get("ok")]
+
+    print(
+        f"[pipeline] integrate-stubs episodes complete: "
+        f"{len(successes)}/{len(results)} succeeded",
+        file=sys.stderr,
+    )
+
+    if not successes:
+        raise RuntimeError("all integrate-stubs episodes failed")
+
+    # For now, promote the first successful workspace.
+    best = successes[0]
+    _promote_integrate_workspace(paths, best["workspace"])
+
+    print(
+        f"[pipeline] promoted integrate workspace: {best['workspace']}",
+        file=sys.stderr,
+    )
+
+
+def _make_minimal_workspace(cfg: PipelineConfig, paths: dict, eid: str) -> Path:
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+    dataset_root_dir = dataset_root(cfg, paths)
+
+    workspace = dataset_root_dir / "minimal_episodes" / eid
+
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    test_file = Path(paths["test_file"]).resolve()
+    if test_file.exists():
+        shutil.copy2(test_file, workspace / test_file.name)
+
+    makefile = Path(paths["makefile"]).resolve()
+    if makefile.exists():
+        shutil.copy2(makefile, workspace / "Makefile")
+
+    context_file = canonical_test_dir / "_pipeline_context.json"
+    if context_file.exists():
+        shutil.copy2(context_file, workspace / "_pipeline_context.json")
+
+    analysis_file = canonical_test_dir / "analysis.json"
+    if analysis_file.exists():
+        shutil.copy2(analysis_file, workspace / "analysis.json")
+
+    stub_gen = canonical_test_dir / "_stub_gen"
+    if stub_gen.exists():
+        shutil.copytree(stub_gen, workspace / "_stub_gen")
+
+    (workspace / "agent_history").mkdir(parents=True, exist_ok=True)
+
+    return workspace
+
+def _run_one_minimal_episode(
+    cfg: PipelineConfig,
+    paths: dict,
+    episode_index: int,
+):
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+    repo_root = cfg.source_dir.parent.parent.resolve()
+
+    eid = f"minimal_{episode_index:06d}_{uuid.uuid4().hex[:8]}"
+    workspace = _make_minimal_workspace(cfg, paths, eid)
+
+    episode_paths = _rebase_paths_for_workspace(
+        paths,
+        old_root=canonical_test_dir,
+        new_root=workspace,
+    )
+
+    name = container_mod.episode_container_name()
+
+    print(
+        f"[pipeline] starting minimal episode {episode_index} "
+        f"name={name} workspace={workspace}",
+        file=sys.stderr,
+    )
+
+    container_mod.create(
+        cfg,
+        name,
+        host_test_dir=workspace,
+        canonical_test_dir=canonical_test_dir,
+        repo_root=repo_root,
+    )
+
+    run_cfg = replace(
+        cfg,
+        execution_mode="docker",
+        container_name=name,
+        per_episode_container=False,
+        path_map=((str(workspace), str(canonical_test_dir)),),
+    )
+
+    try:
+        ensure_minimal_test_runs(run_cfg, episode_paths)
+
+        print(
+            f"[pipeline] minimal episode success index={episode_index} "
+            f"workspace={workspace}",
+            file=sys.stderr,
+        )
+
+        return {
+            "ok": True,
+            "episode_index": episode_index,
+            "eid": eid,
+            "workspace": workspace,
+        }
+
+    except Exception as exc:
+        print(
+            f"[pipeline] minimal episode failed index={episode_index} "
+            f"workspace={workspace}: {exc}",
+            file=sys.stderr,
+        )
+
+        return {
+            "ok": False,
+            "episode_index": episode_index,
+            "eid": eid,
+            "workspace": workspace,
+            "error": repr(exc),
+        }
+
+    finally:
+        container_mod.teardown(name)
+        print(
+            f"[pipeline] minimal episode container removed name={name}",
+            file=sys.stderr,
+        )
+
+def _promote_minimal_workspace(paths: dict, workspace: Path) -> None:
+    canonical_test_dir = Path(paths["test_dir"]).resolve()
+
+    test_file = Path(paths["test_file"]).resolve()
+    workspace_test_file = workspace / test_file.name
+
+    if workspace_test_file.exists():
+        shutil.copy2(workspace_test_file, test_file)
+
+    workspace_makefile = workspace / "Makefile"
+    canonical_makefile = canonical_test_dir / "Makefile"
+
+    if workspace_makefile.exists():
+        shutil.copy2(workspace_makefile, canonical_makefile)
 
 def _stage_minimal_master(cfg: PipelineConfig, paths: dict) -> None:
     _prepare(cfg, paths)
-    ensure_minimal_test_runs(cfg, paths)
+
+    if not cfg.per_episode_container:
+        ensure_minimal_test_runs(cfg, paths)
+
+        root = dataset_root(cfg, paths)
+        frontier = root / "frontiers" / "minimal_master"
+        frontier.mkdir(parents=True, exist_ok=True)
+
+        _copy_if_exists(Path(paths["test_file"]), frontier / Path(paths["test_file"]).name)
+        _copy_if_exists(Path(paths["makefile"]), frontier / "Makefile")
+
+        write_json(frontier / "selected.json", {
+            "stage": "minimal-master",
+            "process_name": paths["process_name"],
+            "source_dir": str(cfg.source_dir),
+            "test_file": str(paths["test_file"]),
+            "makefile": str(paths["makefile"]),
+        })
+        return
+
+    if cfg.execution_mode != "docker":
+        raise ValueError("--per-episode-container for minimal-master requires --execution-mode docker")
+
+    if not cfg.container_image:
+        raise ValueError("--container-image is required with --per-episode-container")
+
+    episode_count = int(getattr(cfg, "episodes_per_item", 1) or 1)
+    episode_concurrency = int(getattr(cfg, "episode_concurrency", 1) or 1)
+    max_workers = max(1, min(episode_concurrency, episode_count))
+
+    print(
+        f"[pipeline] minimal-master running {episode_count} episodes "
+        f"with concurrency={max_workers}",
+        file=sys.stderr,
+    )
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _run_one_minimal_episode,
+                cfg,
+                paths,
+                i,
+            )
+            for i in range(episode_count)
+        ]
+
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    successes = [r for r in results if r.get("ok")]
+
+    print(
+        f"[pipeline] minimal-master episodes complete: "
+        f"{len(successes)}/{len(results)} succeeded",
+        file=sys.stderr,
+    )
+
+    if not successes:
+        raise RuntimeError("all minimal-master episodes failed")
+
+    # Deterministic choice: lowest episode_index wins.
+    best = sorted(successes, key=lambda r: r["episode_index"])[0]
+
+    _promote_minimal_workspace(paths, best["workspace"])
+
+    print(
+        f"[pipeline] promoted minimal workspace: {best['workspace']}",
+        file=sys.stderr,
+    )
+
     root = dataset_root(cfg, paths)
     frontier = root / "frontiers" / "minimal_master"
     frontier.mkdir(parents=True, exist_ok=True)
+
     _copy_if_exists(Path(paths["test_file"]), frontier / Path(paths["test_file"]).name)
     _copy_if_exists(Path(paths["makefile"]), frontier / "Makefile")
+
     write_json(frontier / "selected.json", {
         "stage": "minimal-master",
         "process_name": paths["process_name"],
         "source_dir": str(cfg.source_dir),
         "test_file": str(paths["test_file"]),
         "makefile": str(paths["makefile"]),
+        "selected_workspace": str(best["workspace"]),
+        "episode_index": best["episode_index"],
+        "episodes_total": len(results),
+        "episodes_succeeded": len(successes),
     })
-
 
 def _collect_one_unit(
     cfg: PipelineConfig,
@@ -441,6 +934,8 @@ def _collect_one_unit(
         # Container = isolated execution env for ONE function's unit test.
         # Generate directly into the scratch test dir (keeps materialized stubs);
         # no stage dispatch, so no recursion / testdir leak.
+        canonical_test_dir = Path(paths["test_dir"]).resolve()
+
         run_cfg, H, name = _episode_container(
             cfg,
             paths,
@@ -448,11 +943,21 @@ def _collect_one_unit(
             include_stub_gen=True,
             seed_from_base=True,
         )
+
+        H = H.resolve()
+
+        episode_paths = _rebase_paths_for_workspace(
+            paths,
+            old_root=canonical_test_dir,
+            new_root=H,
+        )
+
         unit_dir = H / "_unit_tests" / safe
+
         try:
             fid, result = _generate_unit_test_for_func(
                 run_cfg,
-                paths,
+                episode_paths,
                 func,
                 flags,
                 semantic_context,
@@ -460,6 +965,7 @@ def _collect_one_unit(
             )
         finally:
             container_mod.teardown(name)
+
         _harvest(unit_dir, workspace, harvest_names)
     else:
         active = test_dir / "_unit_tests" / safe

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import PipelineConfig
-from .execution import assert_no_forbidden_host_paths, containerize_text, run_command
+from .execution import assert_no_forbidden_host_paths, containerize_text, run_command, run_command_to_files
 
 
 # region IO helpers
@@ -348,16 +348,16 @@ def safe_decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 # TODO: Take care of it when we need to pursue branching and move this pipelne code to the host
-def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
-    cmd = ["make", "test"]
-
+def run_make_test(cfg: PipelineConfig, test_dir: Path, timeout: int = 300) -> dict:
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(test_dir),
-            capture_output=True,
-            text=False,
+        # Use run_command instead of subprocess.run to support Docker mode
+        proc = run_command_to_files(
+            cfg,
+            ["make", "test"],
+            cwd=test_dir,
             timeout=timeout,
+            stderr_path=test_dir / "stderr.txt",
+            stdout_path=test_dir / "stdout.txt"
         )
     except subprocess.TimeoutExpired as e:
         stdout = safe_decode(e.stdout or b"")
@@ -372,8 +372,10 @@ def run_make_test(test_dir: Path, timeout: int = 300) -> dict:
             "errors": [f"make test timed out after {timeout}s"],
         }
 
-    stdout = safe_decode(proc.stdout or b"")
-    stderr = safe_decode(proc.stderr or b"")
+    # Normalize the result to match the expected dictionary format
+    # run_command already returns decoded strings for stdout/stderr
+    stdout = proc.stdout
+    stderr = proc.stderr
     combined = stdout + "\n" + stderr
 
     blocking_error_patterns = [
