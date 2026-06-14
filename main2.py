@@ -102,7 +102,7 @@ def parse_args() -> PipelineConfig:
     p.add_argument("--system-json", type=Path, default=Path("/home/seigyo/rl/system_functions.json"))
 
     # agent time out (30minuts) in case stuck in some bs
-    p.add_argument("--agent-timeout-sec", type=int, default=600)
+    p.add_argument("--agent-timeout-sec", type=int, default=1200)
 
     # Currently disable due to inability to write proper json files. TODO: Bring this back
     p.add_argument("--semantic-judge-min-score", type=int, default=75)

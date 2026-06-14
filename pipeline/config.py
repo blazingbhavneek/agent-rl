@@ -34,7 +34,7 @@ class PipelineConfig:
     # sees canonical pristine paths even though the host writes per-episode dirs.
     path_map: tuple[tuple[str, str], ...] = ()
     agent_timeout_sec: int = 1800
-    max_agent_iterations: int = 25
+    max_agent_iterations: int = 100
     max_compile_fix_attempts: int = 3
     max_test_attempts: int = 4
     # Skip a function if it already has line coverage >= this value.

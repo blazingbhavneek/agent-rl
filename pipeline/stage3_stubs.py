@@ -279,7 +279,9 @@ Before writing the stub:
    - whether NULL arguments are allowed
 
 STRICT FILE RULES
-- You may read anything under the repository.
+- Read and Search repository headers and source under include/ and source headers for declarations.
+- Be careful when using search tool, otherwise you might read whole binary files.
+- DO NOT USE SEARCH_CODEBASE TOOL, READ FILES ONLY.
 - Do NOT modify production source files.
 - Do NOT modify headers.
 - Do NOT modify the final test file.

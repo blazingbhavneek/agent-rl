@@ -4,6 +4,8 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
+from dataclasses import replace
+from . import container as container_mod
 
 from .config import PipelineConfig
 from .common import (
@@ -14,7 +16,7 @@ from .common import (
     write_json,
     write_text,
 )
-from .execution import assert_no_forbidden_host_paths, run_command
+from .execution import assert_no_forbidden_host_paths, run_command, run_command_to_files
 
 # Parses Makefile variable assignments (e.g. CFLAGS, CPPFLAGS), including line continuations using '\'
 def parse_source_makefile_flags(source_makefile: Path) -> dict:
@@ -86,12 +88,51 @@ def build_annotated_makefile(cfg: PipelineConfig, paths: dict) -> dict:
             file=sys.stderr,
         )
 
-        res = run_command(
-            cfg,
-            ["do_mkmf", test_program],
-            cwd=test_dir,
-            timeout=300,
-        )
+        run_cfg = cfg
+        tmp_container_name: Optional[str] = None
+
+        # In per-episode-container mode, the base/reused container may not have
+        # this newly created test_dir mounted. Create a one-shot container with
+        # test_dir mounted at the same canonical path, run do_mkmf there, then
+        # tear it down.
+        if cfg.execution_mode == "docker" and cfg.per_episode_container:
+            tmp_container_name = container_mod.episode_container_name()
+            repo_root = cfg.source_dir.parent.parent.resolve()
+
+            print(
+                f"[pipeline] Stage 0: starting temporary makefile container "
+                f"name={tmp_container_name} mount={test_dir} -> {test_dir}",
+                file=sys.stderr,
+            )
+
+            container_mod.create(
+                cfg,
+                tmp_container_name,
+                host_test_dir=test_dir,
+                canonical_test_dir=test_dir,
+                repo_root=repo_root,
+            )
+
+            run_cfg = replace(
+                cfg,
+                execution_mode="docker",
+                container_name=tmp_container_name,
+                per_episode_container=False,
+                path_map=((str(test_dir), str(test_dir)),),
+            )
+
+        try:
+            res = run_command_to_files(
+                run_cfg,
+                ["do_mkmf", test_program],
+                cwd=test_dir,
+                stderr_path=test_dir / "stderr.txt",
+                stdout_path=test_dir / "stdout.txt",
+                timeout=300,
+            )
+        finally:
+            if tmp_container_name is not None:
+                container_mod.teardown(tmp_container_name)
 
         if res.returncode != 0:
             raise RuntimeError(

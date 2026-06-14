@@ -383,6 +383,8 @@ def run_command_to_files(
                 shell=shell,
             )
 
+            print(docker_cmd)
+
             proc = subprocess.run(
                 docker_cmd,
                 stdout=out_f,
