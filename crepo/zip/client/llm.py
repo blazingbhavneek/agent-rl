@@ -72,9 +72,9 @@ class OllamaClient:
         if self.openai_model:
             # self.client = (
             #     AzureOpenAI(
-            #     api_key= 'sk-sXRoS3fmlU7bW797ulQysg',
+            #     api_key= '',
             #     api_version = "2025-04-01-preview",
-            #     azure_endpoint = "https://mesw-openai-api.azurewebsites.net/"
+            #     azure_endpoint = "https://api.openai.com/v1"
             #     )
             #         if not self.async_Openai else
             #             AsyncOpenAI(
