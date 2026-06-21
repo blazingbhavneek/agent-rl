@@ -4,6 +4,8 @@ import json
 import time
 import asyncio
 import argparse
+import hashlib
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -15,9 +17,7 @@ from tree_sitter import Language, Parser
 from tree_sitter_c import language as c_language
 import subprocess
 
-# =========================
-# Config
-# =========================
+# region 1: Configuration
 
 LOCAL_BASE_URL = os.getenv(
     "LOCAL_LLM_BASE_URL",
@@ -56,16 +56,18 @@ LOCAL_JUDGE_MODEL = os.getenv("LOCAL_JUDGE_MODEL", ORIGINAL_MODEL)
 OUT_DIR = Path("eval_runs")
 OUT_DIR.mkdir(exist_ok=True)
 
+# endregion
 
-# =========================
-# Data structures
-# =========================
+
+# region 2: Data structures
 
 @dataclass
 class Problem:
     id: str
     question: str
     metadata: dict[str, Any]
+    # The reference answer is used only by the absolute judge, never generation.
+    answer: str = ""
 
 
 @dataclass
@@ -109,11 +111,14 @@ class RunResult:
     rag_query_count: int
     rag_queries: list[str]
 
+    # Defaults keep older results.jsonl rows readable.
+    created_at: str = ""
 
-# =========================
-# Function call analyzer
-# Use your local analyzer, not broken remote analyzer.
-# =========================
+
+# endregion
+
+
+# region 3: Local C call analysis
 
 class FunctionCallAnalyzer:
     def __init__(self):
@@ -126,10 +131,10 @@ class FunctionCallAnalyzer:
         def visit(node):
             if node.type == "call_expression":
                 fn = node.child_by_field_name("function")
-                if fn:
-                    name = self._extract_name(fn)
-                    if name:
-                        called.add(name)
+                # A member/function-pointer expression (for example s.fn())
+                # is not evidence of a direct call to the required library API.
+                if fn and fn.type == "identifier":
+                    called.add(fn.text.decode())
 
             for c in node.children:
                 visit(c)
@@ -137,27 +142,44 @@ class FunctionCallAnalyzer:
         visit(tree.root_node)
         return called
 
-    def _extract_name(self, node):
-        if node.type == "identifier":
-            return node.text.decode()
+    def extract_defined_functions(self, code: str) -> set[str]:
+        """Return function names implemented in the generated source."""
+        tree = self.parser.parse(code.encode("utf8"))
+        defined = set()
 
-        if node.type == "field_expression":
-            f = node.child_by_field_name("field")
-            if f:
-                return f.text.decode()
+        def declarator_name(node):
+            if node.type == "identifier":
+                return node.text.decode()
+            for child in node.children:
+                name = declarator_name(child)
+                if name:
+                    return name
+            return None
 
-        return None
+        def visit(node):
+            if node.type == "function_definition":
+                declarator = node.child_by_field_name("declarator")
+                if declarator:
+                    name = declarator_name(declarator)
+                    if name:
+                        defined.add(name)
+            for child in node.children:
+                visit(child)
+
+        visit(tree.root_node)
+        return defined
 
 
 analyzer = FunctionCallAnalyzer()
 
 
-# =========================
-# Helpers
-# =========================
+# endregion
+
+
+# region 4: Task and prompt helpers
 
 def extract_c_code(text: str) -> str:
-    m = re.search(r"```c\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    m = re.search(r"```(?:c)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
@@ -171,11 +193,22 @@ def approx_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def make_prompt(
     question: str,
     required: list[str],
     main_c_path: Optional[Path] = None,
+    rag_enabled: bool = False,
 ) -> str:
+    required_text = (
+        "\n".join(f"- {name}" for name in required)
+        if required
+        else "- No specific library function is mandated."
+    )
+
     if main_c_path is not None:
         target_file_text = (
             f"The target file already exists at this absolute path:\n"
@@ -186,24 +219,29 @@ def make_prompt(
             f"  {main_c_path.resolve()}\n"
             f"- Do not write to ./main.c unless it is the same file as the absolute path above.\n"
         )
+        research_rule = (
+            "- Use the configured MCP tools to research the required library "
+            "functions before coding.\n"
+            if rag_enabled
+            else "- No MCP tools are available for this run; solve only from the task.\n"
+        )
     else:
-        target_file_text = (
-            "You are in a workspace that contains a file named main.c.\n"
-        )
+        target_file_text = "You are responding through a chat-completions API.\n"
         write_rule = (
-            "- Write the complete C solution into main.c.\n"
+            "- Return the complete C solution in one fenced ```c code block.\n"
         )
+        research_rule = "- You have no tools or filesystem access.\n"
 
     return f"""Solve this C code-generation task.
 
 {target_file_text}
-Research properly using the given tools first, dont make assumptions, the functions are part of the library.
 
 Rules:
-{write_rule}- Do not create or edit any other files.
+{write_rule}{research_rule}- Do not create or edit any other files.
 - Do not ask the user questions.
 - Do not include explanations.
-- The final answer in chat can be brief, but the actual solution must be in the target C file.
+- The following required library functions must be called directly when they are listed:
+{required_text}
 
 Task:
 {question}
@@ -213,27 +251,56 @@ def load_tasks(path: str) -> list[Problem]:
     problems = []
 
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 continue
 
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in {path} line {line_no}: {e}") from e
+
+            if not isinstance(row, dict):
+                raise ValueError(f"Task row {line_no} must be a JSON object")
+
+            question = row.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError(f"Task row {line_no} must contain a non-empty question")
+
+            required = row.get("required", [])
+            if not isinstance(required, list) or not all(
+                isinstance(name, str) and name.strip() for name in required
+            ):
+                raise ValueError(
+                    f"Task row {line_no} field 'required' must be a list of non-empty strings"
+                )
+
+            answer = row.get("answer", "")
+            if answer is None:
+                answer = ""
+            if not isinstance(answer, str):
+                raise ValueError(f"Task row {line_no} field 'answer' must be a string")
+
+            task_id = row.get("id") or f"task_{len(problems):05d}"
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise ValueError(f"Task row {line_no} field 'id' must be a non-empty string")
 
             problems.append(
                 Problem(
-                    id=row.get("id") or f"task_{len(problems):05d}",
-                    question=row["question"],
-                    metadata={"required": row.get("required", [])},
+                    id=task_id,
+                    question=question,
+                    metadata={"required": required},
+                    answer=answer,
                 )
             )
 
     return problems
 
 
-# =========================
-# Verifier
-# Server compile logic + local required-function analyzer.
-# =========================
+# endregion
+
+
+# region 5: Verification
 
 def verify_code(
     problem: Problem,
@@ -242,15 +309,6 @@ def verify_code(
     timeout: float = 60.0,
 ) -> VerifyResult:
     required = problem.metadata.get("required", [])
-
-    if not required:
-        return VerifyResult(
-            compiled=False,
-            passed=0,
-            total=0,
-            error="No required functions specified",
-            details={"required": [], "missing": []},
-        )
 
     try:
         payload = {
@@ -291,8 +349,37 @@ def verify_code(
             },
         )
 
-    data = r.json()
-    compiled = bool(data.get("compiled"))
+    try:
+        data = r.json()
+    except ValueError as e:
+        return VerifyResult(
+            compiled=False,
+            passed=0,
+            total=len(required),
+            error=f"Verifier returned invalid JSON: {e}",
+            details={
+                "required": required,
+                "missing": required,
+                "compile_logs": r.text,
+            },
+        )
+
+    if not isinstance(data, dict):
+        return VerifyResult(
+            compiled=False,
+            passed=0,
+            total=len(required),
+            error="Verifier returned a JSON value other than an object",
+            details={
+                "required": required,
+                "missing": required,
+                "compile_logs": r.text,
+            },
+        )
+
+    # Be strict here: a malformed value such as the string "false" must not
+    # be treated as a successful compile.
+    compiled = data.get("compiled") is True
 
     compile_logs = (
         data.get("compile_logs")
@@ -301,9 +388,39 @@ def verify_code(
         or ""
     )
 
-    called = analyzer.extract_called_functions(code)
-    missing = [fn for fn in required if fn not in called]
-    present = [fn for fn in required if fn in called]
+    try:
+        called = analyzer.extract_called_functions(code)
+        defined = analyzer.extract_defined_functions(code)
+    except Exception as e:
+        return VerifyResult(
+            compiled=compiled,
+            passed=0,
+            total=len(required),
+            error=f"Local required-call analysis failed: {e}",
+            details={
+                "required": required,
+                "called": [],
+                "missing": required,
+                "compile_logs": compile_logs,
+                "required_pass": False,
+                "external_pass": False,
+                "hard_pass": False,
+            },
+        )
+
+    # Do not count calls that can be satisfied by generated local definitions,
+    # generated macros, or declared callbacks instead of the intended library API.
+    macro_names = set(
+        re.findall(r"^\s*#\s*define\s+([A-Za-z_]\w*)", code, re.MULTILINE)
+    )
+    function_pointer_names = set(
+        re.findall(r"\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(", code)
+    )
+    shadowed = defined | macro_names | function_pointer_names
+    shadowed_required = [fn for fn in required if fn in shadowed]
+
+    missing = [fn for fn in required if fn not in called or fn in shadowed]
+    present = [fn for fn in required if fn in called and fn not in shadowed]
 
     total_external = data.get("total_external_functions_executed")
     total_correct = data.get("total_correct_functions_executed")
@@ -313,6 +430,7 @@ def verify_code(
         "called": sorted(called),
         "present": present,
         "missing": missing,
+        "shadowed_required": shadowed_required,
         "compile_logs": compile_logs,
         "total_external_functions_executed": total_external,
         "total_correct_functions_executed": total_correct,
@@ -324,26 +442,40 @@ def verify_code(
 
     # Also keep your external-function rule if server provides it.
     external_ok = True
-    if total_external is not None and total_correct is not None:
+    if required and total_external is not None and total_correct is not None:
         if total_external == 0 or total_correct != total_external:
             external_ok = False
 
-    final_compiled = compiled and required_pass and external_ok
+    hard_pass = compiled and required_pass and external_ok
+
+    if hard_pass:
+        error = None
+    else:
+        error = (
+            f"compiled={compiled}; missing={missing}; "
+            f"shadowed_required={shadowed_required}; "
+            f"external_pass={external_ok}; compile_logs={compile_logs}"
+        )
+
+    details["required_pass"] = required_pass
+    details["external_pass"] = external_ok
+    details["hard_pass"] = hard_pass
 
     return VerifyResult(
-        compiled=final_compiled,
-        passed=len(present) if final_compiled else 0,
+        # This is strictly the compiler result. Requirement and external checks
+        # are reported separately so judge inputs remain truthful.
+        compiled=compiled,
+        passed=len(present),
         total=len(required),
-        error=None if final_compiled else f"Missing={missing}; compile_logs={compile_logs}",
+        error=error,
         details=details,
     )
 
 
-# =========================
-# Copilot CLI setup
-# =========================
-import subprocess
-from pathlib import Path
+# endregion
+
+
+# region 6: Copilot CLI invocation and MCP trace parsing
 
 def prepare_copilot_home(name: str, rag_enabled: bool) -> Path:
     home = (OUT_DIR / f"copilot_home_{name}").resolve()
@@ -373,6 +505,7 @@ def prepare_copilot_home(name: str, rag_enabled: bool) -> Path:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=30.0,
         )
 
         print("[prepare_copilot_home] copilot mcp add stdout:", flush=True)
@@ -428,14 +561,15 @@ def extract_mcp_queries(raw: str) -> list[str]:
     queries = []
 
     pattern = re.compile(
-        r"●\s+([^\n]+?)\s+\(MCP:\s*([^)]+)\).*?(?:name:\s*\"([^\"]+)\")?",
-        re.DOTALL,
+        r"●\s+([^\n]+?)\s+\(MCP:\s*([^)]+)\)([^\n]*)"
     )
 
     for m in pattern.finditer(raw):
         tool = (m.group(1) or "").strip()
         server = (m.group(2) or "").strip()
-        name = (m.group(3) or "").strip()
+        tail = m.group(3) or ""
+        name_match = re.search(r"\bname:\s*\"([^\"]+)\"", tail)
+        name = name_match.group(1).strip() if name_match else ""
 
         if name:
             queries.append(f"{server}.{tool}(name={name})")
@@ -518,6 +652,9 @@ async def call_copilot_cli(
     last_exc: Optional[Exception] = None
     last_raw = ""
     overall_t0 = time.time()
+    failed_attempt_input_tokens = 0
+    failed_attempt_output_tokens = 0
+    failed_attempt_rag_queries: list[str] = []
 
     # Use caller-provided workspace if available.
     # Do NOT overwrite this with OUT_DIR / f"copilot_workspace_{setup}".
@@ -529,6 +666,9 @@ async def call_copilot_cli(
     workspace.mkdir(parents=True, exist_ok=True)
 
     main_c_path = (workspace / "main.c").resolve()
+    # Each invocation gets its own COPILOT_HOME, preventing stale MCP entries
+    # from a previous task or resumed run from colliding with `mcp add`.
+    run_token = f"{setup}_{workspace.name}_{os.getpid()}_{time.time_ns()}"
 
     for attempt in range(1, attempts + 1):
         print(
@@ -542,6 +682,10 @@ async def call_copilot_cli(
         print(f"workspace={workspace}", flush=True)
         print(f"main_c_path={main_c_path}", flush=True)
         print("=========================================================\n", flush=True)
+
+        attempt_transcript = ""
+        prompt_for_copilot = prompt
+        copilot_started = False
 
         try:
             # Critical:
@@ -558,9 +702,15 @@ async def call_copilot_cli(
 
             exact_main_c_path = main_c_path.resolve()
 
+            mcp_instruction = (
+                "You must use the MCP server tools for library/function research before coding."
+                if rag_enabled
+                else "No MCP server is configured for this run; do not attempt tool research."
+            )
+
             prompt_for_copilot = f"""{prompt}
 
-You must use the MCP server tools for library/function research before coding.
+{mcp_instruction}
 
 IMPORTANT WORKSPACE INSTRUCTION:
 - Your current working directory is:
@@ -578,7 +728,7 @@ IMPORTANT WORKSPACE INSTRUCTION:
 """
 
             copilot_home = prepare_copilot_home(
-                f"{setup}_attempt_{attempt}",
+                f"{run_token}_attempt_{attempt}",
                 rag_enabled,
             )
 
@@ -611,47 +761,46 @@ IMPORTANT WORKSPACE INSTRUCTION:
             print(prompt_for_copilot[:1500], flush=True)
             print("==========================================\n", flush=True)
 
-            # -------------------------
-            # MCP list check
-            # -------------------------
+            if rag_enabled:
+                # Confirm that the unique home actually exposes MCP before
+                # launching a RAG evaluation; a non-zero list result is not a
+                # valid RAG run.
+                print("\n========== COPILOT MCP LIST ==========", flush=True)
+                print(f"[DEBUG] COPILOT_HOME for mcp list = {env['COPILOT_HOME']}", flush=True)
+                print(f"[DEBUG] cwd for mcp list = {workspace}", flush=True)
 
-            print("\n========== COPILOT MCP LIST ==========", flush=True)
-            print(f"[DEBUG] COPILOT_HOME for mcp list = {env['COPILOT_HOME']}", flush=True)
-            print(f"[DEBUG] cwd for mcp list = {workspace}", flush=True)
-
-            mcp_proc = await asyncio.create_subprocess_exec(
-                "copilot",
-                "mcp",
-                "list",
-                env=env,
-                cwd=str(workspace),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            try:
-                mcp_stdout, mcp_stderr = await asyncio.wait_for(
-                    mcp_proc.communicate(),
-                    timeout=30.0,
+                mcp_proc = await asyncio.create_subprocess_exec(
+                    "copilot",
+                    "mcp",
+                    "list",
+                    env=env,
+                    cwd=str(workspace),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
 
-            except asyncio.TimeoutError:
                 try:
-                    mcp_proc.kill()
-                except ProcessLookupError:
-                    pass
+                    mcp_stdout, mcp_stderr = await asyncio.wait_for(
+                        mcp_proc.communicate(),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        mcp_proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await mcp_proc.wait()
+                    raise RuntimeError("copilot mcp list timed out after 30 seconds")
 
-                await mcp_proc.wait()
-
-                raise RuntimeError("copilot mcp list timed out after 30 seconds")
-
-            print(mcp_stdout.decode("utf-8", errors="replace"), flush=True)
-
-            if mcp_stderr:
-                print("[copilot mcp stderr]", flush=True)
-                print(mcp_stderr.decode("utf-8", errors="replace"), flush=True)
-
-            print("======================================\n", flush=True)
+                print(mcp_stdout.decode("utf-8", errors="replace"), flush=True)
+                if mcp_stderr:
+                    print("[copilot mcp stderr]", flush=True)
+                    print(mcp_stderr.decode("utf-8", errors="replace"), flush=True)
+                if mcp_proc.returncode != 0:
+                    raise RuntimeError(
+                        f"copilot mcp list failed with returncode={mcp_proc.returncode}"
+                    )
+                print("======================================\n", flush=True)
 
             # -------------------------
             # Main Copilot run
@@ -683,8 +832,7 @@ IMPORTANT WORKSPACE INSTRUCTION:
             print("command=", " ".join(cmd[:1] + ["-p", "<PROMPT>"] + cmd[3:]), flush=True)
             print("=======================================\n", flush=True)
 
-            t0 = time.time()
-
+            copilot_started = True
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 env=env,
@@ -730,8 +878,6 @@ IMPORTANT WORKSPACE INSTRUCTION:
                 return_exceptions=True,
             )
 
-            latency_ms = int((time.time() - t0) * 1000)
-
             stdout_text = "".join(stdout_buf)
             stderr_text = "".join(stderr_buf)
 
@@ -742,6 +888,8 @@ IMPORTANT WORKSPACE INSTRUCTION:
 
             if stderr_text.strip():
                 transcript_raw += "\n\n[stderr]\n" + stderr_text
+
+            attempt_transcript = transcript_raw
 
             generated_code = ""
             if main_c_path.exists():
@@ -808,15 +956,20 @@ IMPORTANT WORKSPACE INSTRUCTION:
             )
 
             if parsed_input_tokens is not None and parsed_output_tokens is not None:
-                input_tokens = parsed_input_tokens
-                output_tokens = parsed_output_tokens
-                token_source = "copilot_cli_stdout"
+                input_tokens = parsed_input_tokens + failed_attempt_input_tokens
+                output_tokens = parsed_output_tokens + failed_attempt_output_tokens
+                token_source = (
+                    "copilot_cli_stdout"
+                    if not failed_attempt_input_tokens and not failed_attempt_output_tokens
+                    else "copilot_cli_stdout_plus_estimated_retries"
+                )
             else:
-                input_tokens = approx_tokens(prompt_for_copilot)
-                output_tokens = approx_tokens(transcript_raw)
-                token_source = "estimated"
+                input_tokens = failed_attempt_input_tokens + approx_tokens(prompt_for_copilot)
+                output_tokens = failed_attempt_output_tokens + approx_tokens(transcript_raw)
+                token_source = "estimated_all_attempts"
 
-            rag_queries = extract_mcp_queries(transcript_raw)
+            rag_queries = failed_attempt_rag_queries + extract_mcp_queries(transcript_raw)
+            latency_ms = int((time.time() - overall_t0) * 1000)
 
             print("\n========== COPILOT RUN END ==========", flush=True)
             print(f"setup={setup}", flush=True)
@@ -847,6 +1000,10 @@ IMPORTANT WORKSPACE INSTRUCTION:
 
         except Exception as e:
             last_exc = e
+            if copilot_started:
+                failed_attempt_input_tokens += approx_tokens(prompt_for_copilot)
+                failed_attempt_output_tokens += approx_tokens(attempt_transcript)
+                failed_attempt_rag_queries.extend(extract_mcp_queries(attempt_transcript))
 
             print(
                 f"[WARN] copilot attempt={attempt}/{attempts} failed: "
@@ -876,9 +1033,10 @@ IMPORTANT WORKSPACE INSTRUCTION:
         f"Last raw excerpt:\n{raw_excerpt}"
     ) from last_exc
 
-# =========================
-# Direct OpenAI-compatible local call
-# =========================
+# endregion
+
+
+# region 7: Direct OpenAI-compatible invocation
 
 async def call_direct_local(
     model: str,
@@ -887,6 +1045,8 @@ async def call_direct_local(
     timeout: float = 180.0,
     max_retries: int = 2,
     retry_delay_sec: float = 5.0,
+    provider_base_url: Optional[str] = None,
+    provider_api_key: Optional[str] = None,
 ) -> tuple[str, int, Optional[int], Optional[int], str]:
     """
     Direct OpenAI-compatible local call with retries.
@@ -902,6 +1062,12 @@ async def call_direct_local(
     attempts = max_retries + 1
     last_exc: Optional[Exception] = None
     overall_t0 = time.time()
+    failed_attempt_input_tokens = 0
+
+    if provider_base_url is None:
+        provider_base_url = LOCAL_BASE_URL
+    if provider_api_key is None:
+        provider_api_key = "dummy"
 
     for attempt in range(1, attempts + 1):
         try:
@@ -911,11 +1077,9 @@ async def call_direct_local(
             )
 
             client = OpenAI(
-                base_url=LOCAL_BASE_URL,
-                api_key="dummy",
+                base_url=provider_base_url,
+                api_key=provider_api_key,
             )
-
-            t0 = time.time()
 
             resp = client.chat.completions.create(
                 model=model,
@@ -927,7 +1091,7 @@ async def call_direct_local(
                 timeout=timeout,
             )
 
-            latency_ms = int((time.time() - t0) * 1000)
+            latency_ms = int((time.time() - overall_t0) * 1000)
 
             raw = resp.choices[0].message.content or ""
 
@@ -935,16 +1099,26 @@ async def call_direct_local(
             if usage:
                 input_tokens = getattr(usage, "prompt_tokens", None)
                 output_tokens = getattr(usage, "completion_tokens", None)
-                token_source = "provider_usage"
+                if input_tokens is not None:
+                    input_tokens += failed_attempt_input_tokens
+                token_source = (
+                    "provider_usage"
+                    if not failed_attempt_input_tokens
+                    else "provider_usage_plus_estimated_retries"
+                )
             else:
-                input_tokens = approx_tokens(system_prompt + "\n" + prompt)
+                input_tokens = (
+                    failed_attempt_input_tokens
+                    + approx_tokens(system_prompt + "\n" + prompt)
+                )
                 output_tokens = approx_tokens(raw)
-                token_source = "estimated"
+                token_source = "estimated_all_attempts"
 
             return raw, latency_ms, input_tokens, output_tokens, token_source
 
         except Exception as e:
             last_exc = e
+            failed_attempt_input_tokens += approx_tokens(system_prompt + "\n" + prompt)
 
             print(
                 f"[WARN] direct_local attempt={attempt}/{attempts} failed: "
@@ -968,9 +1142,11 @@ async def call_direct_local(
         f"{type(last_exc).__name__ if last_exc else 'UnknownError'}: {last_exc}"
     ) from last_exc
 
-# =========================
-# Run one setup
-# =========================
+
+# endregion
+
+
+# region 8: Run one task/setup
 
 async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
     setup = setup_cfg["id"]
@@ -1004,9 +1180,14 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
                 encoding="utf-8",
             )
 
-        prompt = make_prompt(problem.question, required, main_c_path=main_c_path)
+        prompt = make_prompt(
+            problem.question,
+            required,
+            main_c_path=main_c_path,
+            rag_enabled=rag_enabled,
+        )
     else:
-        prompt = make_prompt(problem.question, required)
+        prompt = make_prompt(problem.question, required, rag_enabled=False)
 
     run_t0 = time.time()
 
@@ -1026,6 +1207,8 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
             raw, latency_ms, input_tokens, output_tokens, token_source = await call_direct_local(
                 model=model,
                 prompt=prompt,
+                provider_base_url=setup_cfg.get("provider_base_url", LOCAL_BASE_URL),
+                provider_api_key=setup_cfg.get("provider_api_key", "dummy"),
             )
             rag_queries = []
 
@@ -1086,6 +1269,7 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
 
             rag_query_count=0,
             rag_queries=[],
+            created_at=now_iso(),
         )
 
     if invocation == "copilot" and main_c_path is not None and main_c_path.exists():
@@ -1096,15 +1280,59 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
     else:
         code = extract_c_code(raw)
 
-    verify = verify_code(problem, code)
+    try:
+        verify = verify_code(problem, code)
+    except Exception as e:
+        verification_error = (
+            f"[VERIFICATION_FAILED]\n"
+            f"error_type={type(e).__name__}\n"
+            f"error={e}\n"
+        )
+        print(
+            f"[ERROR] setup={setup} task={problem.id} verification failed, "
+            f"marking only this result as failed: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        total_tokens = (
+            input_tokens + output_tokens
+            if input_tokens is not None and output_tokens is not None
+            else None
+        )
+        return RunResult(
+            task_id=problem.id,
+            setup=setup,
+            model=model,
+            invocation=invocation,
+            rag_enabled=rag_enabled,
+            prompt=prompt,
+            raw_response=raw,
+            extracted_code=code,
+            required=required,
+            called=[],
+            missing=required,
+            required_pass=False,
+            compile_pass=False,
+            compile_logs=verification_error,
+            hard_pass=False,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            token_source=token_source,
+            latency_ms=latency_ms,
+            rag_query_count=len(rag_queries),
+            rag_queries=rag_queries,
+            created_at=now_iso(),
+        )
 
     called = verify.details.get("called", [])
     missing = verify.details.get("missing", required)
     compile_logs = verify.details.get("compile_logs", "") or ""
 
-    required_pass = len(missing) == 0
+    required_pass = bool(verify.details.get("required_pass", len(missing) == 0))
     compile_pass = bool(verify.compiled)
-    hard_pass = required_pass and compile_pass
+    hard_pass = bool(
+        verify.details.get("hard_pass", required_pass and compile_pass)
+    )
 
     total_tokens = None
     if input_tokens is not None and output_tokens is not None:
@@ -1140,96 +1368,139 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
 
         rag_query_count=len(rag_queries),
         rag_queries=rag_queries,
+        created_at=now_iso(),
     )
 
-# =========================
-# Judge
-# Local judge in --dev mode.
-# Cloud judge when --dev is not passed.
-# =========================
+# endregion
 
-def make_judge_prompt(problem: Problem, results: list[RunResult]) -> str:
-    compact = []
 
-    for r in results:
-        compact.append(
-            {
-                "setup": r.setup,
-                "model": r.model,
-                "invocation": r.invocation,
-                "rag_enabled": r.rag_enabled,
+# region 9: Absolute judging
 
-                "code": r.extracted_code,
-                "required": r.required,
-                "called": r.called,
-                "missing": r.missing,
-                "required_pass": r.required_pass,
+ABSOLUTE_SCORE_KEYS = (
+    "correctness",
+    "required_function_usage",
+    "code_quality",
+    "retrieval_use",
+    "efficiency",
+    "overall",
+)
 
-                "compile_pass": r.compile_pass,
-                "compile_logs": r.compile_logs,
 
-                "input_tokens": r.input_tokens,
-                "output_tokens": r.output_tokens,
-                "total_tokens": r.total_tokens,
-                "latency_ms": r.latency_ms,
+def result_fingerprint(result: RunResult) -> str:
+    """Stable identity for deciding whether an existing judgment is current."""
+    payload = {
+        "task_id": result.task_id,
+        "setup": result.setup,
+        "code": result.extracted_code,
+        "raw_response": result.raw_response,
+        "required": result.required,
+        "called": result.called,
+        "missing": result.missing,
+        "compile_pass": result.compile_pass,
+        "hard_pass": result.hard_pass,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "latency_ms": result.latency_ms,
+        "rag_queries": result.rag_queries,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-                "rag_query_count": r.rag_query_count,
-                "rag_queries": r.rag_queries,
-            }
-        )
 
-    return f"""You are judging multiple model outputs for the same C code-generation task.
+def make_judge_prompt(problem: Problem, result: RunResult) -> str:
+    candidate = {
+        "setup": result.setup,
+        "model": result.model,
+        "invocation": result.invocation,
+        "rag_enabled": result.rag_enabled,
+        "code": result.extracted_code,
+        "required": result.required,
+        "called": result.called,
+        "missing": result.missing,
+        "required_pass": result.required_pass,
+        "compile_pass": result.compile_pass,
+        "hard_pass": result.hard_pass,
+        "compile_logs": result.compile_logs,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "total_tokens": result.total_tokens,
+        "latency_ms": result.latency_ms,
+        "rag_query_count": result.rag_query_count,
+        "rag_queries": result.rag_queries,
+    }
 
-Judge relatively, not absolutely.
+    return f"""You are an absolute evaluator for one C code-generation result.
 
 Task:
 {problem.question}
 
-Required functions:
+Reference answer / expected behavior:
+{problem.answer or "No reference answer was supplied; rely on the task and verifier facts."}
+
+Required library functions:
 {problem.metadata.get("required", [])}
 
-You are given each setup's code, compile result, required-function result, token count, latency, and RAG queries.
-Use only the RAG queries, not hidden retrieved responses.
+Evaluate only this result. Do not compare it to other models or setups. Compiler and
+required-call facts are authoritative. Use only visible RAG query names, never infer
+hidden retrieval contents.
 
-Categories:
-1. compile_result
-2. required_function_usage
-3. efficiency
-4. rag_efficiency
+Scoring rubric (0-10, absolute):
+- correctness: semantic fit to the task and reference answer; compilation failure is 0.
+- required_function_usage: required calls are correct and complete; missing calls are 0.
+- code_quality: safety, clarity, and unnecessary complexity.
+- retrieval_use: appropriate and economical use of retrieval for this setup.
+- efficiency: tokens and latency in isolation, not relative to another result.
+- overall: evidence-based aggregate, never higher than correctness when compilation fails.
 
-Rules:
-- A model that compiles and calls all required functions should usually beat one that does not.
-- If two models both pass, prefer the one with simpler code, fewer tokens, lower latency, and fewer unnecessary RAG queries.
-- If RAG was used but the result still failed, penalize it.
-- If the RL/no-RAG model matches RAG quality with much less effort, reward that.
-- Scores must be relative 0-10 among these candidates.
-
-Return only valid JSON:
+Return only valid JSON with exactly these keys:
 {{
-  "ranking": ["best_setup", "second_setup", "third_setup"],
-  "scores": {{
-    "setup_id": {{
-      "compile_result": 0,
-      "required_function_usage": 0,
-      "efficiency": 0,
-      "rag_efficiency": 0,
-      "overall": 0
-    }}
-  }},
-  "reasoning": {{
-    "setup_id": "brief reason"
-  }},
-  "winner": "setup_id"
+  "correctness": 0,
+  "required_function_usage": 0,
+  "code_quality": 0,
+  "retrieval_use": 0,
+  "efficiency": 0,
+  "overall": 0,
+  "verdict": "pass|partial|fail",
+  "reasoning": "brief evidence-based explanation"
 }}
 
-Candidates:
-{json.dumps(compact, indent=2)}
+Result:
+{json.dumps(candidate, ensure_ascii=False, indent=2)}
 """
+
+
+def validate_absolute_judgment(parsed: Any) -> dict[str, Any]:
+    if not isinstance(parsed, dict):
+        raise ValueError("judge output must be a JSON object")
+
+    expected_keys = set(ABSOLUTE_SCORE_KEYS) | {"verdict", "reasoning"}
+    if set(parsed) != expected_keys:
+        raise ValueError(
+            f"judge output keys must be exactly {sorted(expected_keys)}, got {sorted(parsed)}"
+        )
+
+    normalized: dict[str, Any] = {}
+    for key in ABSOLUTE_SCORE_KEYS:
+        value = parsed[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"judge score {key!r} must be a number")
+        if not 0 <= value <= 10:
+            raise ValueError(f"judge score {key!r} must be between 0 and 10")
+        normalized[key] = value
+
+    if parsed["verdict"] not in {"pass", "partial", "fail"}:
+        raise ValueError("judge verdict must be pass, partial, or fail")
+    if not isinstance(parsed["reasoning"], str):
+        raise ValueError("judge reasoning must be a string")
+
+    normalized["verdict"] = parsed["verdict"]
+    normalized["reasoning"] = parsed["reasoning"]
+    return normalized
 
 
 async def judge_task(
     problem: Problem,
-    results: list[RunResult],
+    result: RunResult,
     dev: bool,
 ) -> dict[str, Any]:
     if dev:
@@ -1254,7 +1525,7 @@ async def judge_task(
         api_key=judge_api_key,
     )
 
-    prompt = make_judge_prompt(problem, results)
+    prompt = make_judge_prompt(problem, result)
 
     print("\n========== JUDGE START ==========", flush=True)
     print(f"judge_mode={judge_mode}", flush=True)
@@ -1275,24 +1546,31 @@ async def judge_task(
             },
         ],
         temperature=0.0,
+        timeout=180.0,
     )
 
     raw = resp.choices[0].message.content or ""
 
     try:
-        parsed = json.loads(raw)
+        parsed = validate_absolute_judgment(json.loads(raw))
         parsed["_judge_mode"] = judge_mode
         parsed["_judge_model"] = judge_model
         return parsed
 
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError) as e:
         return {
-            "error": "judge_json_parse_failed",
+            "error": "judge_output_invalid",
+            "message": str(e),
             "raw": raw,
             "_judge_mode": judge_mode,
             "_judge_model": judge_model,
         }
 
+
+# endregion
+
+
+# region 10: Setup registry and persisted result loading
 
 def build_setup_registry() -> dict[str, dict[str, Any]]:
     """
@@ -1303,7 +1581,7 @@ def build_setup_registry() -> dict[str, dict[str, Any]]:
 
     Important:
     - Cloud API key is only required if cloud_rag_copilot is selected.
-    - RL setup can exist here even if you do not run it yet.
+    - The RL baseline is direct-only; there is intentionally no RL Copilot setup.
     """
 
     return {
@@ -1325,20 +1603,13 @@ def build_setup_registry() -> dict[str, dict[str, Any]]:
             "provider_api_key": CLOUD_API_KEY,
         },
 
-        "rl_copilot": {
-            "id": "rl_copilot",
-            "model": RL_MODEL,
-            "invocation": "copilot",
-            "rag_enabled": False,
-            "provider_base_url": LOCAL_BASE_URL,
-            "provider_api_key": "dummy",
-        },
-
         "rl_direct": {
             "id": "rl_direct",
             "model": RL_MODEL,
             "invocation": "direct",
             "rag_enabled": False,
+            "provider_base_url": LOCAL_BASE_URL,
+            "provider_api_key": "dummy",
         },
     }
 
@@ -1440,10 +1711,68 @@ def load_results_latest(results_path: Path) -> dict[str, dict[str, RunResult]]:
     return latest
 
 
+def load_judgments_latest(judge_path: Path) -> dict[tuple[str, str], str]:
+    """Return the latest valid result fingerprint for each judged task/setup."""
+    latest: dict[tuple[str, str], str] = {}
+
+    if not judge_path.exists():
+        return latest
+
+    with open(judge_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(
+                    f"[WARN] Skipping invalid JSON line in {judge_path} "
+                    f"line={line_no}: {e}",
+                    flush=True,
+                )
+                continue
+
+            task_id = row.get("task_id")
+            setup = row.get("setup")
+            fingerprint = row.get("judge_fingerprint")
+            judge = row.get("judge")
+            if (
+                isinstance(task_id, str)
+                and isinstance(setup, str)
+                and isinstance(fingerprint, str)
+                and isinstance(judge, dict)
+                and "error" not in judge
+            ):
+                latest[(task_id, setup)] = fingerprint
+
+    return latest
+
+
+def judge_fingerprint(problem: Problem, result: RunResult, dev: bool) -> str:
+    """Include the task/reference so edited JSONL rows are re-judged."""
+    judge_model = LOCAL_JUDGE_MODEL if dev else CLOUD_JUDGE_MODEL
+    payload = {
+        "result": result_fingerprint(result),
+        "question": problem.question,
+        "answer": problem.answer,
+        "required": problem.metadata.get("required", []),
+        "dev": dev,
+        "judge_model": judge_model,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+# endregion
+
+
+# region 11: Resumable generation and judging phases
+
 async def run_generation_phase(
     tasks_path: str,
     setup_ids: list[str],
     limit: Optional[int] = None,
+    resume: bool = False,
 ):
     """
     Generation-only phase.
@@ -1452,19 +1781,37 @@ async def run_generation_phase(
     - Runs selected setup ids only.
     - Appends each RunResult to eval_runs/results.jsonl.
     - Does NOT run judge.
+    - With resume=True, skips any existing task_id + setup row. Limit then
+      applies to the next pending tasks for each selected setup.
     """
 
     problems = load_tasks(tasks_path)
-
-    if limit is not None:
-        problems = problems[:limit]
-
     setups = select_setups(setup_ids)
+    all_results_path = OUT_DIR / "results.jsonl"
+    latest = (
+        load_results_latest(all_results_path)
+        if resume and all_results_path.exists()
+        else defaultdict(dict)
+    )
+
+    scheduled: set[tuple[str, str]] = set()
+    for setup in setups:
+        pending = [
+            problem
+            for problem in problems
+            if not resume or setup["id"] not in latest.get(problem.id, {})
+        ]
+        if limit is not None:
+            pending = pending[:limit]
+        scheduled.update((problem.id, setup["id"]) for problem in pending)
 
     print("\n========== GENERATION PHASE ==========", flush=True)
     print(f"tasks_path={tasks_path}", flush=True)
     print(f"num_tasks={len(problems)}", flush=True)
-    print(f"results_path={OUT_DIR / 'results.jsonl'}", flush=True)
+    print(f"scheduled_task_setup_pairs={len(scheduled)}", flush=True)
+    print(f"resume={resume}", flush=True)
+    print(f"limit_per_setup={limit}", flush=True)
+    print(f"results_path={all_results_path}", flush=True)
     print("selected_setups:", flush=True)
 
     for s in setups:
@@ -1479,21 +1826,25 @@ async def run_generation_phase(
 
     print("======================================\n", flush=True)
 
-    # Print MCP tools once for debugging.
-    # If this fails, do not stop the whole eval.
-    try:
-        await print_mcp_tools_direct()
-    except Exception as e:
-        print(f"[WARN] Failed to print MCP tools directly: {e}", flush=True)
-
-    all_results_path = OUT_DIR / "results.jsonl"
-
     # IMPORTANT: append mode.
     with open(all_results_path, "a", encoding="utf-8") as rf:
         for problem in problems:
-            print(f"\n========== TASK {problem.id} ==========", flush=True)
-
             for setup in setups:
+                if (problem.id, setup["id"]) not in scheduled:
+                    if resume:
+                        reason = (
+                            "already has a result"
+                            if setup["id"] in latest.get(problem.id, {})
+                            else "outside the current pending-task limit"
+                        )
+                        print(
+                            f"[SKIP GENERATE] task={problem.id} setup={setup['id']} "
+                            f"{reason}",
+                            flush=True,
+                        )
+                    continue
+
+                print(f"\n========== TASK {problem.id} ==========", flush=True)
                 print(
                     f"[GENERATE] task={problem.id} "
                     f"setup={setup['id']} "
@@ -1538,6 +1889,7 @@ async def run_judge_phase(
     judge_setup_ids: list[str],
     dev: bool,
     limit: Optional[int] = None,
+    resume: bool = False,
 ):
     """
     Judge-only phase.
@@ -1545,19 +1897,19 @@ async def run_judge_phase(
     Behavior:
     - Reads eval_runs/results.jsonl.
     - Uses latest row for each task_id + setup.
-    - Judges only tasks where all requested judge_setup_ids exist.
+    - Judges every available selected task/setup independently.
     - Appends judge outputs to eval_runs/judge.jsonl.
+    - With resume=True, skips a setup only when its latest source result has
+      already received a valid judgment from this judge model/mode.
     """
 
     problems = load_tasks(tasks_path)
-
-    if limit is not None:
-        problems = problems[:limit]
 
     results_path = OUT_DIR / "results.jsonl"
     judge_path = OUT_DIR / "judge.jsonl"
 
     latest = load_results_latest(results_path)
+    latest_judgments = load_judgments_latest(judge_path) if resume else {}
 
     print("\n========== JUDGE PHASE ==========", flush=True)
     print(f"tasks_path={tasks_path}", flush=True)
@@ -1566,6 +1918,8 @@ async def run_judge_phase(
     print(f"judge_path={judge_path}", flush=True)
     print(f"dev={dev}", flush=True)
     print(f"judge_setup_ids={judge_setup_ids}", flush=True)
+    print(f"resume={resume}", flush=True)
+    print(f"limit_per_setup={limit}", flush=True)
 
     if dev:
         print("judge_mode=DEV/local judge", flush=True)
@@ -1586,92 +1940,85 @@ async def run_judge_phase(
 
     judged_count = 0
     skipped_count = 0
+    missing_count = 0
+    scheduled_count_by_setup: defaultdict[str, int] = defaultdict(int)
 
     # IMPORTANT: append mode.
     with open(judge_path, "a", encoding="utf-8") as jf:
         for problem in problems:
             by_setup = latest.get(problem.id, {})
-
-            missing = [
-                setup_id
-                for setup_id in judge_setup_ids
-                if setup_id not in by_setup
-            ]
-
-            if missing:
-                skipped_count += 1
-
-                print(
-                    f"[SKIP JUDGE] task={problem.id} "
-                    f"missing_setups={missing}",
-                    flush=True,
-                )
-
-                # Keep a record that this task was skipped.
-                jf.write(
-                    json.dumps(
-                        {
-                            "task_id": problem.id,
-                            "dev": dev,
-                            "judge_setup_ids": judge_setup_ids,
-                            "error": "missing_setups",
-                            "missing": missing,
-                        },
-                        ensure_ascii=False,
+            for setup_id in judge_setup_ids:
+                result = by_setup.get(setup_id)
+                if result is None:
+                    missing_count += 1
+                    print(
+                        f"[SKIP JUDGE] task={problem.id} setup={setup_id} "
+                        "has no generation result",
+                        flush=True,
                     )
-                    + "\n"
-                )
-                jf.flush()
+                    continue
 
-                continue
+                fingerprint = judge_fingerprint(problem, result, dev)
+                if resume and latest_judgments.get((problem.id, setup_id)) == fingerprint:
+                    skipped_count += 1
+                    print(
+                        f"[SKIP JUDGE] task={problem.id} setup={setup_id} "
+                        "already has a current judgment",
+                        flush=True,
+                    )
+                    continue
 
-            task_results = [
-                by_setup[setup_id]
-                for setup_id in judge_setup_ids
-            ]
+                if limit is not None and scheduled_count_by_setup[setup_id] >= limit:
+                    continue
+                scheduled_count_by_setup[setup_id] += 1
 
-            print(
-                f"[JUDGE] task={problem.id} "
-                f"setups={judge_setup_ids}",
-                flush=True,
-            )
-
-            try:
-                judge = await judge_task(problem, task_results, dev=dev)
-
-            except Exception as e:
                 print(
-                    f"[WARN] Judge failed for task={problem.id}: "
-                    f"{type(e).__name__}: {e}",
+                    f"[JUDGE] task={problem.id} setup={setup_id}",
                     flush=True,
                 )
-                judge = {
-                    "error": "judge_failed",
-                    "message": str(e),
-                    "dev": dev,
-                }
 
-            jf.write(
-                json.dumps(
-                    {
-                        "task_id": problem.id,
+                try:
+                    judge = await judge_task(problem, result, dev=dev)
+
+                except Exception as e:
+                    print(
+                        f"[WARN] Judge failed for task={problem.id} setup={setup_id}: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    judge = {
+                        "error": "judge_failed",
+                        "message": str(e),
                         "dev": dev,
-                        "judge_setup_ids": judge_setup_ids,
-                        "judge": judge,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-            jf.flush()
+                    }
 
-            judged_count += 1
+                row = {
+                    "task_id": problem.id,
+                    "setup": setup_id,
+                    "dev": dev,
+                    "judge": judge,
+                    "created_at": now_iso(),
+                }
+                # Failed or invalid judge outputs remain retryable in --resume.
+                if "error" not in judge:
+                    row["judge_fingerprint"] = fingerprint
+
+                jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                jf.flush()
+                judged_count += 1
 
     print("\n========== JUDGE SUMMARY ==========", flush=True)
     print(f"judged_count={judged_count}", flush=True)
     print(f"skipped_count={skipped_count}", flush=True)
+    print(f"missing_generation_count={missing_count}", flush=True)
     print(f"judge_path={judge_path}", flush=True)
     print("===================================\n", flush=True)
+
+
+# endregion
+
+
+# region 12: CLI
 
 async def main(args: argparse.Namespace):
     if args.phase == "generate":
@@ -1679,6 +2026,7 @@ async def main(args: argparse.Namespace):
             tasks_path=args.tasks_path,
             setup_ids=args.setups,
             limit=args.limit,
+            resume=args.resume,
         )
         return
 
@@ -1688,6 +2036,7 @@ async def main(args: argparse.Namespace):
             judge_setup_ids=args.judge_setups,
             dev=args.dev,
             limit=args.limit,
+            resume=args.resume,
         )
         return
 
@@ -1723,7 +2072,7 @@ def parse_args() -> argparse.Namespace:
         default=["local_rag_copilot"],
         help=(
             "Generation setup ids to run. Used only with --phase generate. "
-            "Examples: local_rag_copilot, cloud_rag_copilot, rl_copilot, rl_direct."
+            "Examples: local_rag_copilot, cloud_rag_copilot, rl_direct."
         ),
     )
 
@@ -1733,35 +2082,45 @@ def parse_args() -> argparse.Namespace:
         default=[
             "local_rag_copilot",
             "cloud_rag_copilot",
-            "rl_copilot",
+            "rl_direct",
         ],
         help=(
-            "Setup ids to compare during judge phase. "
-            "Used only with --phase judge. "
-            "Judge uses latest result for each task_id + setup."
+            "Setup ids to judge independently. Used only with --phase judge. "
+            "Each available task/setup is scored absolutely."
         ),
     )
 
-    # parser.add_argument(
-    #     "--dev",
-    #     action="store_true",
-    #     help=(
-    #         "For judge phase only: use local judge instead of cloud judge. "
-    #         "Generation setup selection is controlled by --setups, not by --dev."
-    #     ),
-    # )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=(
+            "For judge phase only: use the local judge instead of the cloud judge."
+        ),
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue this phase from JSONL progress. Generation skips existing "
+            "task/setup results; judging skips only current valid judgments."
+        ),
+    )
 
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
         help=(
-            "Optional number of tasks to run. Useful for smoke tests. "
-            "Example: --limit 3"
+            "Optional number of pending tasks per selected setup. Useful for "
+            "incremental runs; with --resume it selects the next unfinished rows."
         ),
     )
 
     args = parser.parse_args()
+
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be greater than zero")
 
     if args.phase == "generate" and not args.setups:
         raise ValueError("--phase generate requires at least one --setups value")
@@ -1770,6 +2129,9 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--phase judge requires at least one --judge-setups value")
 
     return args
+
+
+# endregion
 
 if __name__ == "__main__":
     args = parse_args()

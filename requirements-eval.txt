@@ -1,0 +1,9 @@
+# Runtime dependencies for eval_cli.py. The tree-sitter bounds match the
+# Language(c_language()) / Parser(language) API used by the evaluator.
+openai>=1.0
+requests>=2.31
+tree-sitter>=0.25,<0.26
+tree-sitter-c>=0.24,<0.25
+
+# Only needed when calling print_mcp_tools_direct() manually for diagnostics.
+langchain-mcp-adapters>=0.1
