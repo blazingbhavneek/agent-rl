@@ -18,8 +18,6 @@ from parser.parser_files import parseFiles
 from pathlib import Path
 from pprint import pprint
 from typing import Literal
-import random
-from collections import Counter
 
 # 3rd party
 import clang.cindex
@@ -82,10 +80,10 @@ from tools.tools import (
 # HARD-CODED DPO SETTINGS
 # =============================================================================
 
-DPO_ATTEMPTS_PER_PATH = 5
+DPO_ATTEMPTS_PER_PATH = 10
 DPO_MAX_CONCURRENT_AGENTS = 100
 
-DPO_DATA_ROOT = Path("./dpo_llm_data")
+DPO_DATA_ROOT = Path("./dpo_llm_data_full")
 
 DPO_SUPPRESS_AGENT_STDOUT = True
 DPO_PRINT_COMPLETED_ATTEMPTS = True
@@ -697,10 +695,7 @@ def dpo_hash_text(value: Any, length: int = 12) -> str:
 def dpo_job_fingerprint(job: "DPOLLMJob") -> str:
     return dpo_hash_text(
         {
-            "process_name": job.process_name,
             "function_name_to_traced": job.function_name_to_traced,
-            "source_file": job.source_file,
-            "line_number": job.line_number,
             "argument_numbers": job.argument_numbers,
             "path": job.path,
             "intial_context": job.intial_context,
@@ -709,100 +704,21 @@ def dpo_job_fingerprint(job: "DPOLLMJob") -> str:
         length=16,
     )
 
-
-def dpo_job_dir(job: DPOLLMJob) -> Path:
-    process_dir = dpo_safe_name(job.process_name)
-
-    src_stem = "unknown_src"
-    if job.source_file:
-        src_stem = dpo_safe_name(Path(job.source_file).stem)
-
-    try:
-        line_number = int(job.line_number) if job.line_number is not None else None
-    except Exception:
-        line_number = None
-
-    line = line_number if line_number is not None else "unknown_line"
-
-    path_hash = dpo_hash_text(job.path, length=8)
-    context_hash = dpo_hash_text(job.intial_context, length=8)
-    fingerprint = dpo_job_fingerprint(job)
-
-    folder_name = (
-        f"{dpo_safe_name(job.function_name_to_traced)}"
-        f"__{src_stem}"
-        f"__line_{line}"
-        f"__path_{job.path_index:04d}"
-        f"__p_{path_hash}"
-        f"__c_{context_hash}"
-        f"__fp_{fingerprint}"
-    )
-
-    return DPO_DATA_ROOT / process_dir / folder_name
-
-def dpo_attempt_dir(job: DPOLLMJob, attempt_no: int) -> Path:
-    return dpo_job_dir(job) / f"attempt_{attempt_no:02d}"
-
-
-def dpo_selected_path(job: DPOLLMJob) -> Path:
-    return dpo_job_dir(job) / "selected.json"
-
-def dpo_answer_canonical_key(answer: Any) -> str:
-    """
-    Stable comparable key for majority vote.
-    """
-    safe = dpo_json_safe(answer)
-
-    if isinstance(safe, dict):
-        # Usually enough for your outputModel/outputModelForReturn
-        comparable = {
-            "output": safe.get("output"),
-            "call_number": safe.get("call_number"),
-        }
-    else:
-        comparable = safe
-
-    return json.dumps(comparable, sort_keys=True, ensure_ascii=False)
-
-
-def dpo_select_attempt_majority(attempt_results: list[DPOAttemptResult]) -> DPOAttemptResult:
-    """
-    Selection rule:
-      1. Ignore failed attempts if any successful exist.
-      2. Pick most common answer.
-      3. If all successful answers are unique, randomly sample one successful.
-      4. If all failed, randomly sample one failed.
-    """
-    successful = [
-        r for r in attempt_results
-        if r.answer is not None and r.error is None
-    ]
-
-    if not successful:
-        return random.choice(attempt_results)
-
-    counts = Counter(dpo_answer_canonical_key(r.answer) for r in successful)
-
-    most_common_key, most_common_count = counts.most_common(1)[0]
-
-    # all unique
-    if most_common_count == 1:
-        return random.choice(successful)
-
-    matching = [
-        r for r in successful
-        if dpo_answer_canonical_key(r.answer) == most_common_key
-    ]
-
-    # if same answer appears multiple times, choose highest score version
-    return max(matching, key=lambda r: r.score)
-
 # =============================================================================
 # DPO DATA STRUCTURES
 # =============================================================================
 
 @dataclass(frozen=True)
 class DPOLLMJob:
+    """
+    One logical LLM job.
+
+    One job usually means:
+        process + function + path
+
+    Each job gets DPO_ATTEMPTS_PER_PATH independent attempts.
+    """
+
     job_key: str
     process_name: str
     path_index: int
@@ -814,9 +730,6 @@ class DPOLLMJob:
     path: str
     get_upper: bool = True
 
-    # optional metadata for folder naming
-    source_file: str | None = None
-    line_number: int | None = None
 
 @dataclass
 class DPOAttemptResult:
@@ -842,6 +755,34 @@ class DPOAttemptResult:
 # DPO FOLDER LAYOUT
 # =============================================================================
 
+def dpo_attempt_dir(job: DPOLLMJob, attempt_no: int) -> Path:
+    process_dir = dpo_safe_name(job.process_name)
+
+    fingerprint = dpo_job_fingerprint(job)
+
+    path_dir = (
+        f"path_{job.path_index:04d}"
+        f"__{dpo_safe_name(job.function_name_to_traced)}"
+        f"__fp_{fingerprint}"
+    )
+
+    attempt_dir = f"attempt_{attempt_no:02d}"
+
+    return DPO_DATA_ROOT / process_dir / path_dir / attempt_dir
+
+
+def dpo_selected_path(job: DPOLLMJob) -> Path:
+    process_dir = dpo_safe_name(job.process_name)
+
+    fingerprint = dpo_job_fingerprint(job)
+
+    path_dir = (
+        f"path_{job.path_index:04d}"
+        f"__{dpo_safe_name(job.function_name_to_traced)}"
+        f"__fp_{fingerprint}"
+    )
+
+    return DPO_DATA_ROOT / process_dir / path_dir / "selected.json"
 
 # =============================================================================
 # DPO SCORING
@@ -1089,196 +1030,6 @@ def dpo_run_single_attempt(job: DPOLLMJob, attempt_no: int) -> DPOAttemptResult:
 # FLATTENED EXECUTOR: ALL PATHS X ALL ATTEMPTS
 # =============================================================================
 
-def resolve_all_paths_with_dpo_flat(
-    specs: list[dict[str, Any]],
-) -> dict[str, tuple[Any, Any, DPOAttemptResult]]:
-    """
-    Real global/local flattening.
-
-    specs item format:
-
-    {
-        "process_name": str,
-        "project_structure": dict[str, str],
-        "function_name_to_traced": str,
-        "argument_numbers": list[int],
-        "path_index": int,
-        "path": str,
-        "intial_context": str,
-        "get_upper": bool,
-        "source_file": str | None,
-        "line_number": int | None,
-
-        # optional but recommended:
-        "raw_path": list[str],
-
-        # optional:
-        "job_key": str,
-    }
-
-    Returns:
-        {
-            job_key: (selected_answer, selected_stats, selected_attempt_metadata)
-        }
-    """
-
-    def coerce_line_number(value):
-        if value is None:
-            return None
-
-        try:
-            return int(value)
-        except Exception:
-            return None
-
-    def extract_meta_from_path_node(node: str):
-        """
-        Handles nodes like:
-
-            [Dio860d.c]main[963:1035]
-            [Dio860d.c:1024]Dio860dGsim1[657:958]
-            [Dio860d.c:773]Dio860dTcsSend[514:573]
-            [548]mpf_mfs_addque
-
-        Returns:
-            source_file, line_number, function_name
-        """
-
-        if not node:
-            return None, None, None
-
-        # [Dio860d.c:773]Dio860dTcsSend[514:573]
-        m = re.match(
-            r"^\[(?P<file>[^:\]\[]+\.[A-Za-z0-9_]+):(?P<line>\d+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-            node,
-        )
-        if m:
-            return m.group("file"), int(m.group("line")), m.group("func")
-
-        # [Dio860d.c]main[963:1035]
-        m = re.match(
-            r"^\[(?P<file>[^\]\[]+\.[A-Za-z0-9_]+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-            node,
-        )
-        if m:
-            source_file = m.group("file")
-            func_name = m.group("func")
-
-            # recover start line from trailing [963:1035]
-            range_match = re.search(r"\[(?P<start>\d+):(?P<end>\d+)\]\s*$", node)
-            line_number = int(range_match.group("start")) if range_match else None
-
-            return source_file, line_number, func_name
-
-        # [548]mpf_mfs_addque
-        m = re.match(
-            r"^\[(?P<line>\d+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-            node,
-        )
-        if m:
-            return None, int(m.group("line")), m.group("func")
-
-        return None, None, None
-
-    def infer_source_meta_from_raw_path(
-        *,
-        raw_path: list[str] | None,
-        target_function: str,
-        fallback_source_file: str | None,
-        fallback_line_number: int | None,
-    ):
-        """
-        Infers source file and line number from the raw call path.
-
-        Important:
-            clean_path_str() removes bracket metadata.
-            So this only works if spec["raw_path"] is passed.
-        """
-
-        if not raw_path:
-            return fallback_source_file, fallback_line_number
-
-        last_seen_file = fallback_source_file
-        found_file = fallback_source_file
-        found_line = fallback_line_number
-
-        for node in raw_path:
-            source_file, line_number, func_name = extract_meta_from_path_node(node)
-
-            if source_file:
-                last_seen_file = source_file
-
-            if func_name == target_function:
-                found_file = source_file or last_seen_file or fallback_source_file
-
-                if line_number is not None:
-                    found_line = line_number
-
-        return found_file, found_line
-
-    jobs: list[DPOLLMJob] = []
-
-    for spec in specs:
-        process_name = spec["process_name"]
-        function_name = spec["function_name_to_traced"]
-        path_index = int(spec["path_index"])
-        path_str = spec["path"]
-        intial_context = spec["intial_context"]
-
-        source_file = spec.get("source_file")
-        line_number = coerce_line_number(spec.get("line_number"))
-
-        source_file, line_number = infer_source_meta_from_raw_path(
-            raw_path=spec.get("raw_path"),
-            target_function=function_name,
-            fallback_source_file=source_file,
-            fallback_line_number=line_number,
-        )
-
-        line_number = coerce_line_number(line_number)
-
-        path_hash = dpo_hash_text(path_str, length=8)
-        context_hash = dpo_hash_text(intial_context, length=8)
-
-        src_stem = Path(source_file).stem if source_file else "unknown_src"
-        line = line_number if line_number is not None else "unknown_line"
-
-        job_key = spec.get("job_key")
-
-        if not job_key:
-            job_key = (
-                f"{process_name}::"
-                f"{function_name}::"
-                f"{src_stem}::"
-                f"line_{line}::"
-                f"path_{path_index:04d}::"
-                f"p_{path_hash}::"
-                f"c_{context_hash}"
-            )
-
-        jobs.append(
-            DPOLLMJob(
-                job_key=job_key,
-                process_name=process_name,
-                path_index=path_index,
-                project_structure=spec["project_structure"],
-                function_name_to_traced=function_name,
-                argument_numbers=spec["argument_numbers"],
-                intial_context=intial_context,
-                path=path_str,
-                get_upper=spec.get("get_upper", True),
-                source_file=source_file,
-                line_number=line_number,
-            )
-        )
-
-    best_by_job = dpo_run_llm_jobs_flat(jobs)
-
-    return {
-        job_key: (best.answer, best.stats, best)
-        for job_key, best in best_by_job.items()
-    }
-
 def dpo_run_llm_jobs_flat(
     jobs: list[DPOLLMJob],
 ) -> dict[str, DPOAttemptResult]:
@@ -1380,7 +1131,7 @@ def dpo_run_llm_jobs_flat(
         if not attempt_results:
             continue
 
-        best = dpo_select_attempt_majority(attempt_results)
+        best = max(attempt_results, key=lambda r: r.score)
         best_by_job[job.job_key] = best
 
         selected_path = dpo_selected_path(job)
@@ -1392,12 +1143,9 @@ def dpo_run_llm_jobs_flat(
                 "process_name": job.process_name,
                 "path_index": job.path_index,
                 "function_name_to_traced": job.function_name_to_traced,
-                "source_file": job.source_file,
-                "line_number": job.line_number,
                 "argument_numbers": job.argument_numbers,
                 "path": job.path,
                 "get_upper": job.get_upper,
-                "selection_policy": "majority_answer_else_random_unique_else_random_failed",
                 "selected_attempt": best.attempt_no,
                 "selected_score": best.score,
                 "selected_answer": best.answer,
@@ -1599,18 +1347,6 @@ def make_llm_calls_for_function(
 ) -> list | None:
     # will return list of dataframes containing all data to be saved in csv.
 
-    # -------------------------------------------------------------------------
-    # IMPORTANT:
-    # These are used inside DPO helper functions elsewhere.
-    # Importing locally is not enough if those functions reference global names,
-    # so we also inject into globals().
-    # -------------------------------------------------------------------------
-    import random as _random
-    from collections import Counter as _Counter
-
-    globals()["random"] = _random
-    globals()["Counter"] = _Counter
-
     if ("(" in function) or (")" in function):
         answers[function] = [
             (
@@ -1624,13 +1360,10 @@ def make_llm_calls_for_function(
 
     print(f"PROCESSING FUNCTION -->{BOLD}{GREEN}", function, f"{RESET}", end="\n\n")
 
+    # region INTIALIZING STATE AND OTHER VARIABLES.
     STATE = State()
 
-    FILE_NAME_BYTES: dict[str, bytes] = {
-        key: value[1] for key, value in STATE.get("TREES").items()
-    }
-
-    process_name = Path(project_path).name
+    function_types = STATE.get("FUNCTION_TYPES") or {}
 
     list_indices = functions_identified[function].get("indices")
     get_upper = functions_identified[function].get("get_upper")
@@ -1653,11 +1386,11 @@ def make_llm_calls_for_function(
 
     if check_other_functions:
         dependent_function_indices = functions_identified.get(
-            dependent_functions[0]
+            dependent_functions[0], {}
         ).get("indices")
 
         dependent_function_get_upper = functions_identified.get(
-            dependent_functions[0]
+            dependent_functions[0], {}
         ).get("get_upper")
 
         print(
@@ -1670,8 +1403,11 @@ def make_llm_calls_for_function(
     stats_json_path = Path(
         f"/home/seigyo/c_repo/c_repo/results/csv_results/stats/{STATE.get('PROJECT_NAME')}_STATS.json"
     )
-    stats_json_path.parent.mkdir(parents=True, exist_ok=True)
 
+    stats_json_path.parent.mkdir(parents=True, exist_ok=True)
+    # endregion
+
+    # region INTIALIZING EMPTY TOKEN VARIABLES
     dummy_token = {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0}
     empty_stats = {
         "Tokens": dummy_token,
@@ -1680,14 +1416,11 @@ def make_llm_calls_for_function(
         "Other_tool_errors": 0,
         "Incorrect_details": [],
     }
+    # endregion
 
     def write_json_file(data):
         with open(stats_json_path, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-
-    def clean_path_str(path_list):
-        block_regex = r"\[([^\[\]]*)\]"
-        return "->".join(map(lambda x: re.sub(block_regex, "", x), path_list))
 
     def zero_token_count():
         return TokenCount(Input_tokens=0, Output_tokens=0, Total_tokens=0)
@@ -1730,261 +1463,22 @@ def make_llm_calls_for_function(
 
         return values_found
 
-    def extract_line_and_file_from_path(raw_path: list[str], target_function: str):
-        """
-        Extract file and line from path nodes like:
-
-            [Dio860d.c]main[963:1035]
-            [Dio860d.c:1024]Dio860dGsim1[657:958]
-            [Dio860d.c:773]Dio860dTcsSend[514:573]
-            [548]mpf_mfs_addque
-
-        For final nodes like [548]mpf_mfs_addque, there is no file in that node,
-        so it reuses the most recent file seen earlier in the path.
-        """
-
-        last_file = main_file_name
-        found_file = None
-        found_line = None
-
-        for node in raw_path:
-            if not node:
-                continue
-
-            # Case:
-            #   [Dio860d.c:773]Dio860dTcsSend[514:573]
-            m = re.match(
-                r"^\[(?P<file>[^:\]\[]+\.[A-Za-z0-9_]+):(?P<line>\d+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-                node,
-            )
-            if m:
-                last_file = m.group("file")
-                if m.group("func") == target_function:
-                    found_file = last_file
-                    found_line = int(m.group("line"))
-                continue
-
-            # Case:
-            #   [Dio860d.c]main[963:1035]
-            m = re.match(
-                r"^\[(?P<file>[^\]\[]+\.[A-Za-z0-9_]+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-                node,
-            )
-            if m:
-                last_file = m.group("file")
-                if m.group("func") == target_function:
-                    found_file = last_file
-
-                    # Try to recover start line from trailing [963:1035]
-                    range_match = re.search(r"\[(?P<start>\d+):(?P<end>\d+)\]\s*$", node)
-                    if range_match:
-                        found_line = int(range_match.group("start"))
-                continue
-
-            # Case:
-            #   [548]mpf_mfs_addque
-            m = re.match(
-                r"^\[(?P<line>\d+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-                node,
-            )
-            if m:
-                if m.group("func") == target_function:
-                    found_file = last_file
-                    found_line = int(m.group("line"))
-                continue
-
-        return found_file, found_line
-
-    def get_function_source_meta(fn: str):
-        info = functions_identified.get(fn, {}) or {}
-
-        source_file = (
-            info.get("source_file")
-            or info.get("file")
-            or info.get("file_path")
-            or info.get("filename")
-            or main_file_name
-        )
-
-        line_number = (
-            info.get("line_number")
-            or info.get("line")
-            or info.get("start_line")
-        )
-
-        try:
-            line_number = int(line_number) if line_number is not None else None
-        except Exception:
-            line_number = None
-
-        return source_file, line_number
-
-    def extract_meta_from_path_node(node: str):
-        """
-        Handles:
-
-            [Dio860d.c]main[963:1035]
-            [Dio860d.c:1024]Dio860dGsim1[657:958]
-            [Dio860d.c:773]Dio860dTcsSend[514:573]
-            [548]mpf_mfs_addque
-
-        Returns:
-            source_file, line_number, function_name
-        """
-
-        if not node:
-            return None, None, None
-
-        # [Dio860d.c:773]Dio860dTcsSend[514:573]
-        m = re.match(
-            r"^\[(?P<file>[^:\]\[]+\.[A-Za-z0-9_]+):(?P<line>\d+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-            node,
-        )
-        if m:
-            return m.group("file"), int(m.group("line")), m.group("func")
-
-        # [Dio860d.c]main[963:1035]
-        m = re.match(
-            r"^\[(?P<file>[^\]\[]+\.[A-Za-z0-9_]+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-            node,
-        )
-        if m:
-            source_file = m.group("file")
-            func_name = m.group("func")
-
-            range_match = re.search(r"\[(?P<start>\d+):(?P<end>\d+)\]\s*$", node)
-            line_number = int(range_match.group("start")) if range_match else None
-
-            return source_file, line_number, func_name
-
-        # [548]mpf_mfs_addque
-        m = re.match(
-            r"^\[(?P<line>\d+)\](?P<func>[A-Za-z_][A-Za-z0-9_]*)",
-            node,
-        )
-        if m:
-            return None, int(m.group("line")), m.group("func")
-
-        return None, None, None
-
-    def infer_source_meta_from_raw_path(
-        *,
-        raw_path: list[str],
-        target_function: str,
-        fallback_source_file: str | None,
-        fallback_line_number: int | None,
+    def build_unresolved_combined_data(
+        call_graph_data: dict,
+        path: list[str],
+        call_number: int = -1,
+        target_value: str = "UNRESOLVED",
     ):
-        """
-        Infer source_file and line_number from raw path before clean_path_str()
-        removes bracket metadata.
-        """
-
-        last_seen_file = fallback_source_file
-        found_file = fallback_source_file
-        found_line = fallback_line_number
-
-        for node in raw_path:
-            source_file, line_number, func_name = extract_meta_from_path_node(node)
-
-            if source_file:
-                last_seen_file = source_file
-
-            if func_name == target_function:
-                found_file = source_file or last_seen_file or fallback_source_file
-
-                if line_number is not None:
-                    found_line = line_number
-
-        return found_file, found_line
-
-    def make_dpo_spec(
-        *,
-        target_function: str,
-        argument_numbers: list[int],
-        path_index: int,
-        raw_path: list[str],
-        path_str: str,
-        intial_context: str,
-        get_upper_value: bool,
-    ) -> dict:
-        source_file, line_number = get_function_source_meta(target_function)
-
-        source_file, line_number = infer_source_meta_from_raw_path(
-            raw_path=raw_path,
-            target_function=target_function,
-            fallback_source_file=source_file,
-            fallback_line_number=line_number,
-        )
-
         return {
-            "process_name": process_name,
-            "project_structure": project_structure,
-            "function_name_to_traced": target_function,
-            "argument_numbers": argument_numbers,
-            "path_index": path_index,
-            "path": path_str,
-            "raw_path": raw_path,
-            "intial_context": intial_context,
-            "get_upper": get_upper_value,
-            "source_file": source_file,
-            "line_number": line_number,
+            **call_graph_data,
+            "target_number": {
+                "path_str": "->".join(path),
+                "ans": [target_value],
+            },
+            "call_number": call_number,
         }
 
-    def dpo_spec_job_key(spec: dict) -> str:
-        """
-        Must match resolve_all_paths_with_dpo_flat() when no explicit job_key is used.
-        """
-
-        source_file = spec.get("source_file")
-        src_stem = Path(source_file).stem if source_file else "unknown_src"
-
-        line_number = spec.get("line_number")
-
-        try:
-            line_number = int(line_number) if line_number is not None else None
-        except Exception:
-            line_number = None
-
-        line = line_number if line_number is not None else "unknown_line"
-
-        path_hash = dpo_hash_text(spec["path"], length=8)
-        context_hash = dpo_hash_text(spec["intial_context"], length=8)
-
-        return (
-            f"{spec['process_name']}::"
-            f"{spec['function_name_to_traced']}::"
-            f"{src_stem}::"
-            f"line_{line}::"
-            f"path_{int(spec['path_index']):04d}::"
-            f"p_{path_hash}::"
-            f"c_{context_hash}"
-        )
-
-    def run_flat_dpo_specs(specs_with_local_keys: list[tuple[tuple[str, int], dict]]):
-        if not specs_with_local_keys:
-            return {}
-
-        specs = [spec for _, spec in specs_with_local_keys]
-
-        local_key_to_job_key = {
-            local_key: dpo_spec_job_key(spec)
-            for local_key, spec in specs_with_local_keys
-        }
-
-        print(
-            "[LOCAL DPO FLATTEN COLLECTED]",
-            f"function={function}",
-            f"jobs={len(specs)}",
-            f"local_keys={list(local_key_to_job_key.keys())}",
-        )
-
-        results_by_job_key = resolve_all_paths_with_dpo_flat(specs)
-
-        return {
-            local_key: results_by_job_key.get(job_key)
-            for local_key, job_key in local_key_to_job_key.items()
-        }
-
+    # region INTIALIZING THE FUNCTION_DICT
     FUNCTION_DICT: dict[str, any] = {
         function: {
             "Total_Input": 0,
@@ -2009,7 +1503,9 @@ def make_llm_calls_for_function(
 
     FUNCTION_INPUT_TOKEN = FUNCTION_DICT[function].get("Total_Input", 0)
     FUNCTION_OUTPUT_TOKEN = FUNCTION_DICT[function].get("Total_Output", 0)
+    # endregion
 
+    # region FINDING OUT FROM WHICH PART WE NEED TO RESUME
     if FUNCTION_DICT[function]["Each_Path_Tokens"] == []:
         PATH_TO_START_WITH = 1
     else:
@@ -2018,7 +1514,9 @@ def make_llm_calls_for_function(
         )
 
     print("Need to start with the path", PATH_TO_START_WITH)
+    # endregion
 
+    # region MAKING CALL_GRAPH AND GETTING DATA
     macro_data = possible_paths_data = None
 
     call_graph_with_paths = orchestrate(
@@ -2047,26 +1545,26 @@ def make_llm_calls_for_function(
     ]
 
     path_strs: list[list[str]] = [path[0][0] for path in possible_paths_data]
+    # endregion
 
     print("TOTAL PATHS FOR THIS FUNCTION: ", len(path_strs))
 
     make_graph(paths=path_strs)
 
-    print(f"PARSING FOR FUNCTION -> {function}")
-
-    parser = parseFiles(
-        project_structure=project_structure,
-        paths=path_strs,
-        macro_data=macro_data,
-        file_name_bytes=FILE_NAME_BYTES,
-    )
-
-    contexts = parser.get_parsed_results(get_upper=get_upper)
+    # =============================================================================
+    # PATH-ONLY MODE
+    # =============================================================================
+    # We no longer call parseFiles(...).
+    # Each context is intentionally empty.
+    # The DPO/agent should read source code itself using the full path metadata.
+    print(f"USING PATHS ONLY FOR FUNCTION -> {function}")
+    contexts = [(path, "") for path in path_strs]
 
     # =============================================================================
     # CASE 1: THERE IS A DEPENDENT FUNCTION
     # =============================================================================
-    if len(path_nodes) > 0:
+    if check_other_functions and len(path_nodes) > 0:
+        # region GETTING DEPENDENT FUNCTION PATH FROM EACH FUNCTION PATH
         paths_to_dependent: list[list[str]] = []
 
         print_or_return_possible_paths_trees(
@@ -2074,72 +1572,68 @@ def make_llm_calls_for_function(
             dependent_function=dependent_functions[0],
             result_path_list=paths_to_dependent,
         )
+        # endregion
 
-        print(f"PARSING FOR DEPENDENT FUNCTION -> {dependent_functions[0]}")
+        print(f"USING PATHS ONLY FOR DEPENDENT FUNCTION -> {dependent_functions[0]}")
+        dependent_contexts = [(path, "") for path in paths_to_dependent]
 
-        dependent_function_parser = parseFiles(
-            project_structure=project_structure,
-            paths=paths_to_dependent,
-            macro_data=macro_data,
-            file_name_bytes=FILE_NAME_BYTES,
-        )
-
-        dependent_contexts = dependent_function_parser.get_parsed_results(
-            get_upper=True
-        )
+        # -------------------------------------------------------------------------
+        # DPO BATCH 1: Determine function type if needed.
+        # -------------------------------------------------------------------------
+        type_selected_by_path = {}
 
         needs_dynamic_type = (
-            STATE.get("FUNCTION_TYPES").get(function, {}).get("type", "NO DATA")
+            function_types.get(function, {}).get("type", "NO DATA")
             == "WRITEF/READF"
         )
 
-        dpo_specs_with_keys: list[tuple[tuple[str, int], dict]] = []
-
         if needs_dynamic_type:
+            type_path_contexts = []
+
             for index, (path, context) in enumerate(contexts, start=1):
                 if index < PATH_TO_START_WITH:
                     continue
 
-                path_str = clean_path_str(path)
+                path_str = "->".join(path)
+                type_path_contexts.append((index, path_str, ""))
 
-                dpo_specs_with_keys.append(
-                    (
-                        ("type", index),
-                        make_dpo_spec(
-                            target_function=function,
-                            argument_numbers=list_indices,
-                            path_index=index,
-                            raw_path=path,
-                            path_str=path_str,
-                            intial_context=context,
-                            get_upper_value=get_upper,
-                        )
-                    )
+            if type_path_contexts:
+                type_selected_by_path = resolve_paths_with_dpo(
+                    process_name=Path(project_path).name,
+                    project_structure=project_structure,
+                    function_name_to_traced=function,
+                    argument_numbers=list_indices,
+                    path_contexts=type_path_contexts,
+                    get_upper=get_upper,
                 )
+
+        # -------------------------------------------------------------------------
+        # DPO BATCH 2: Resolve dependent function target values.
+        # -------------------------------------------------------------------------
+        dependent_path_contexts = []
 
         for index, (new_path, context_new) in enumerate(dependent_contexts, start=1):
             if index < PATH_TO_START_WITH:
                 continue
 
-            new_path_str = clean_path_str(new_path)
+            new_path_str = "->".join(new_path)
+            dependent_path_contexts.append((index, new_path_str, ""))
 
-            dpo_specs_with_keys.append(
-                (
-                    ("dependent", index),
-                    make_dpo_spec(
-                        target_function=dependent_functions[0],
-                        argument_numbers=dependent_function_indices,
-                        path_index=index,
-                        raw_path=new_path,
-                        path_str=new_path_str,
-                        intial_context=context_new,
-                        get_upper_value=dependent_function_get_upper,
-                    )
-                )
+        dependent_selected_by_path = {}
+
+        if dependent_path_contexts:
+            dependent_selected_by_path = resolve_paths_with_dpo(
+                process_name=Path(project_path).name,
+                project_structure=project_structure,
+                function_name_to_traced=dependent_functions[0],
+                argument_numbers=dependent_function_indices,
+                path_contexts=dependent_path_contexts,
+                get_upper=dependent_function_get_upper,
             )
 
-        selected_flat = run_flat_dpo_specs(dpo_specs_with_keys)
-
+        # -------------------------------------------------------------------------
+        # PROCESS SELECTED RESULTS ONLY
+        # -------------------------------------------------------------------------
         for index, (path, context) in enumerate(contexts, start=1):
             if index < PATH_TO_START_WITH:
                 continue
@@ -2147,22 +1641,25 @@ def make_llm_calls_for_function(
             call_graph_data = call_graph_determined_datas[index - 1]
 
             print(f"{BOLD}{GREEN}PROCESS PATH_{index}{RESET}")
-            print("-" * 20, "PATH AND CONTEXT", "-" * 20)
+            print("-" * 20, "PATH", "-" * 20)
 
-            print(highlight(context, CLexer(), TerminalFormatter()))
+            path_str = "->".join(path)
+
+            print(path_str)
             print("-" * 56)
 
             stats_dict1 = None
 
+            # region WHEN WE NEED TO DETERMINE FUNCTION_TYPE LIKE mpf_mfs_getrec etc
             if needs_dynamic_type:
                 call_graph_data = {
                     **call_graph_data,
-                    "process_name": process_name,
+                    "process_name": Path(project_path).name,
                 }
 
                 print(" STEP - 1 DETERMINING THE CALL_TYPE")
 
-                selected_type = selected_flat.get(("type", index))
+                selected_type = type_selected_by_path.get(index)
 
                 if not selected_type:
                     final_combined_data = {
@@ -2182,6 +1679,7 @@ def make_llm_calls_for_function(
                     combined_model = Combined.model_validate(final_combined_data)
                     save_dict_csv(data_dict=combined_model.model_dump(), save=True)
                     write_json_file(data=FUNCTION_DICT)
+
                     answers[function].append(
                         (combined_model, Stats.model_validate(empty_stats))
                     )
@@ -2209,6 +1707,7 @@ def make_llm_calls_for_function(
                     combined_model = Combined.model_validate(final_combined_data)
                     save_dict_csv(data_dict=combined_model.model_dump(), save=True)
                     write_json_file(data=FUNCTION_DICT)
+
                     answers[function].append(
                         (combined_model, Stats.model_validate(empty_stats))
                     )
@@ -2217,13 +1716,14 @@ def make_llm_calls_for_function(
                     continue
 
                 print(
-                    f"[DPO USING SELECTED TYPE] path={index} "
+                    f"[DPO USING BEST TYPE] path={index} "
                     f"attempt={best_attempt.attempt_no} "
                     f"score={best_attempt.score} "
                     f"history={best_attempt.history_path}"
                 )
 
                 stats_dict1 = stats.model_dump()
+
                 FUNCTION_INPUT_TOKEN += stats_dict1.get("Tokens").get("Input_tokens")
                 FUNCTION_OUTPUT_TOKEN += stats_dict1.get("Tokens").get("Output_tokens")
 
@@ -2239,26 +1739,59 @@ def make_llm_calls_for_function(
                     **call_graph_data,
                     "type": output_string,
                     "call_number": call_number,
-                    "process_name": process_name,
+                    "process_name": Path(project_path).name,
                 }
-
+            # endregion
             else:
+                # region WHEN FUNCTION_TYPE IS ALREADY DECIDED
                 call_graph_data = {
                     **call_graph_data,
-                    "process_name": process_name,
-                    "type": STATE.get("FUNCTION_TYPES")
-                    .get(function, {})
-                    .get("type", "NO DATA"),
+                    "process_name": Path(project_path).name,
+                    "type": function_types.get(function, {}).get("type", "NO DATA"),
                 }
+                # endregion
 
             print("NOW RUNNING FOR THE DEPENDENT FUNCTION.")
 
+            if index - 1 >= len(dependent_contexts):
+                print(
+                    f"{BOLD}{RED}No dependent context/path found for path index {index}.{RESET}"
+                )
+
+                final_combined_data = {
+                    **call_graph_data,
+                    "target_number": {
+                        "path_str": "->".join(path),
+                        "ans": ["UNRESOLVED"],
+                    },
+                    "call_number": -1,
+                }
+
+                combined_model = Combined.model_validate(final_combined_data)
+
+                if stats_dict1:
+                    append_path_tokens(index, stats_dict1["Tokens"])
+                else:
+                    tokens = zero_token_count()
+                    append_path_tokens(index, tokens.model_dump())
+
+                update_function_token_totals()
+                write_json_file(data=FUNCTION_DICT)
+                save_dict_csv(data_dict=combined_model.model_dump(), save=True)
+
+                answers[function].append(
+                    (combined_model, Stats.model_validate(empty_stats))
+                )
+
+                print(f"DONE WITH PATH {index}")
+                continue
+
             new_path, context_new = dependent_contexts[index - 1]
 
-            print("CONTEXT FOR THE DEPENDENT FUNCTION")
-            print(highlight(context_new, CLexer(), TerminalFormatter()))
+            print("PATH FOR THE DEPENDENT FUNCTION")
+            print("->".join(new_path))
 
-            selected_dependent = selected_flat.get(("dependent", index))
+            selected_dependent = dependent_selected_by_path.get(index)
 
             if not selected_dependent:
                 final_combined_data = {
@@ -2267,9 +1800,8 @@ def make_llm_calls_for_function(
                         "path_str": "->".join(path),
                         "ans": ["UNRESOLVED"],
                     },
+                    "call_number": -1,
                 }
-
-                final_combined_data["call_number"] = -1
 
                 combined_model = Combined.model_validate(final_combined_data)
 
@@ -2299,9 +1831,8 @@ def make_llm_calls_for_function(
                         "path_str": "->".join(path),
                         "ans": ["UNRESOLVED"],
                     },
+                    "call_number": -1,
                 }
-
-                final_combined_data["call_number"] = -1
 
                 combined_model = Combined.model_validate(final_combined_data)
 
@@ -2323,7 +1854,7 @@ def make_llm_calls_for_function(
                 continue
 
             print(
-                f"[DPO USING SELECTED DEPENDENT] path={index} "
+                f"[DPO USING BEST DEPENDENT] path={index} "
                 f"attempt={best_attempt.attempt_no} "
                 f"score={best_attempt.score} "
                 f"history={best_attempt.history_path}"
@@ -2392,7 +1923,10 @@ def make_llm_calls_for_function(
     # CASE 2: NO DEPENDENT FUNCTION
     # =============================================================================
     else:
-        dpo_specs_with_keys: list[tuple[tuple[str, int], dict]] = []
+        # -------------------------------------------------------------------------
+        # DPO BATCH: Resolve all eligible direct paths.
+        # -------------------------------------------------------------------------
+        direct_path_contexts = []
 
         for index, (path, context) in enumerate(contexts, start=1):
             if index < PATH_TO_START_WITH:
@@ -2401,49 +1935,50 @@ def make_llm_calls_for_function(
             if "pmf" in function and len(list_indices) == 0:
                 continue
 
-            path_str = clean_path_str(path)
+            path_str = "->".join(path)
+            direct_path_contexts.append((index, path_str, ""))
 
-            dpo_specs_with_keys.append(
-                (
-                    ("direct", index),
-                    make_dpo_spec(
-                        target_function=function,
-                        argument_numbers=list_indices,
-                        path_index=index,
-                        raw_path=path,
-                        path_str=path_str,
-                        intial_context=context,
-                        get_upper_value=get_upper,
-                    )
-                )
+        selected_by_path = {}
+
+        if direct_path_contexts:
+            selected_by_path = resolve_paths_with_dpo(
+                process_name=Path(project_path).name,
+                project_structure=project_structure,
+                function_name_to_traced=function,
+                argument_numbers=list_indices,
+                path_contexts=direct_path_contexts,
+                get_upper=get_upper,
             )
 
-        selected_flat = run_flat_dpo_specs(dpo_specs_with_keys)
-
+        # -------------------------------------------------------------------------
+        # PROCESS SELECTED RESULTS ONLY
+        # -------------------------------------------------------------------------
         for index, (path, context) in enumerate(contexts, start=1):
             if index < PATH_TO_START_WITH:
                 continue
 
             call_graph_data = call_graph_determined_datas[index - 1]
 
-            type_of_func = STATE.get("FUNCTION_TYPES").get(function).get("type")
+            type_of_func = function_types.get(function, {}).get("type")
 
             call_graph_data = {
                 **call_graph_data,
-                "process_name": process_name,
+                "process_name": Path(project_path).name,
                 "type": type_of_func if type_of_func else "NO DATA",
             }
 
             console.print(call_graph_data)
 
             print(f"{BOLD}{GREEN}PROCESS PATH_{index}{RESET}")
-            print("-" * 20, "PATH AND CONTEXT", "-" * 20)
+            print("-" * 20, "PATH", "-" * 20)
 
-            print(highlight(context, CLexer(), TerminalFormatter()))
+            path_str = "->".join(path)
+
+            print(path_str)
             print("-" * 56)
 
             if "pmf" in function and len(list_indices) == 0:
-                launch = STATE.get("FUNCTION_TYPES").get(function).get("launch")
+                launch = function_types.get(function, {}).get("launch")
 
                 final_combined_data = {
                     **call_graph_data,
@@ -2476,10 +2011,10 @@ def make_llm_calls_for_function(
                 print(f"DONE WITH PATH {index}")
                 continue
 
-            selected = selected_flat.get(("direct", index))
+            selected = selected_by_path.get(index)
 
             if not selected:
-                launch = STATE.get("FUNCTION_TYPES").get(function).get("launch")
+                launch = function_types.get(function, {}).get("launch")
 
                 final_combined_data = {
                     **call_graph_data,
@@ -2503,7 +2038,7 @@ def make_llm_calls_for_function(
                 save_dict_csv(data_dict=combined_model.model_dump(), save=True)
 
                 answers[function].append(
-                    (combined_model, Stats.model_validate(empty_stats).model_dump())
+                    (combined_model, Stats.model_validate(empty_stats))
                 )
 
                 print(f"DONE WITH PATH {index}")
@@ -2512,7 +2047,7 @@ def make_llm_calls_for_function(
             validated_model, stats, best_attempt = selected
 
             if not validated_model:
-                launch = STATE.get("FUNCTION_TYPES").get(function).get("launch")
+                launch = function_types.get(function, {}).get("launch")
 
                 final_combined_data = {
                     **call_graph_data,
@@ -2536,14 +2071,14 @@ def make_llm_calls_for_function(
                 save_dict_csv(data_dict=combined_model.model_dump(), save=True)
 
                 answers[function].append(
-                    (combined_model, Stats.model_validate(empty_stats).model_dump())
+                    (combined_model, Stats.model_validate(empty_stats))
                 )
 
                 print(f"DONE WITH PATH {index}")
                 continue
 
             print(
-                f"[DPO USING SELECTED DIRECT] path={index} "
+                f"[DPO USING BEST DIRECT] path={index} "
                 f"attempt={best_attempt.attempt_no} "
                 f"score={best_attempt.score} "
                 f"history={best_attempt.history_path}"
@@ -2570,7 +2105,7 @@ def make_llm_calls_for_function(
 
             call_number = validated_model_dict.get("call_number") or -1
 
-            launch = STATE.get("FUNCTION_TYPES").get(function).get("launch")
+            launch = function_types.get(function, {}).get("launch")
 
             final_combined_data = {
                 **call_graph_data,
@@ -2597,353 +2132,134 @@ def make_llm_calls_for_function(
 
 @time_it()
 def trace_variable(project_path):
-    """
-    Global-flat DPO version.
-
-    Pipeline:
-
-        1. Build project structure, trees, macros, FILE_FUNCTIONS.
-        2. Identify all functions to trace.
-        3. Collect DPO specs from every function without running DPO.
-        4. Run resolve_all_paths_with_dpo_flat(all_specs) exactly once.
-        5. Process every function using the global DPO results.
-
-    Required make_llm_calls_for_function contract:
-
-        Collect mode:
-
-            prepared_data = make_llm_calls_for_function(
-                ...,
-                dpo_mode="collect",
-            )
-
-            It must return either None or dict like:
-
-            {
-                "function": function_name,
-                "dpo_specs": list[dict],
-                "prepared": any,
-            }
-
-        Process mode:
-
-            function_dataframes = make_llm_calls_for_function(
-                ...,
-                dpo_mode="process",
-                prepared_data=prepared_data,
-                global_dpo_results=global_dpo_results,
-            )
-
-    """
-
-    import pickle
-    import inspect
-    from pathlib import Path
-    from collections import defaultdict
-
     STATE = State()
-
     pickle_dir = (
         Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
     )
-
     if not pickle_dir.exists():
         pickle_dir.mkdir(exist_ok=True, parents=True)
 
     project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}.pkl"
-
     potential_main_files: list[str] | None = None
-
-    # ==========================================================================
-    # 1. LOAD OR BUILD PROJECT STRUCTURE
-    # ==========================================================================
     if not project_structure_path.exists():
         print(
-            "PROJECT STRUCTURE NEEDS TO BE RESOLVED. "
-            "NO PICKLE FILE. IT WILL TAKE TIME...."
+            "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
         )
-
         PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
-            show=False,
-            project_path=project_path,
+            show=False, project_path=project_path
         )
-
         PROJECT_STRUCTURE = dict(
             sorted(PROJECT_STRUCTURE.items(), key=lambda x: str(x[0]))
         )
-
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
-
         with open(project_structure_path, "wb") as f:
             pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
-
     else:
         with open(project_structure_path, "rb") as f:
-            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)
+            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)  # already sored.
 
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
-
     print("THE MAIN FILES ARE: ", potential_main_files)
-
-    # ==========================================================================
-    # 2. PREPROCESS PROJECT TREES
-    # ==========================================================================
+    # project_tree_path = pickle_dir/f'{STATE.get('PROJECT_NAME')}_tree.pkl'
     trees = Preprocess().preprocess(
-        project_structure=PROJECT_STRUCTURE,
-    )
+        project_structure=PROJECT_STRUCTURE
+    )  # str, tuple[Tree,bytes]
 
     STATE.set("TREES", trees)
-
+    # print(extract_includes(filepath=PROJECT_STRUCTURE['dio000d.c']))
+    # sys.exit()
     PROJECT_STRUCTURE = {
-        key: str(PROJECT_STRUCTURE[key])
-        for key in PROJECT_STRUCTURE.keys()
+        key: str(PROJECT_STRUCTURE[key]) for key in PROJECT_STRUCTURE.keys()
     }
-
+    # PROJECT_STRUCTURE = dict(sorted(PROJECT_STRUCTURE.items(),key=lambda x: str(x[0])))
+    # console.print(PROJECT_STRUCTURE)
     print("LENGTH OF PROJECT_STRUCTURE", len(PROJECT_STRUCTURE))
-
     FUNCTION_POINTER_ARGS = STATE.get("FUNCTION_POINTER_ARGS")
-
     FILE_FUNCTIONS = {}
 
     main_file_name = None
     bad_main_files = []
     macros = {}
     file_includes: dict[str, list] = {}
-
-    # ==========================================================================
-    # 3. EXTRACT MACROS, INCLUDES, FUNCTIONS
-    # ==========================================================================
     for files in PROJECT_STRUCTURE.keys():
         macros[files] = extract_all_macros(PROJECT_STRUCTURE[files])
         file_includes[files] = extract_includes(PROJECT_STRUCTURE[files])
-
         if files.endswith(".h"):
             continue
 
+        file_path = PROJECT_STRUCTURE[files]
         functions = get_local_function_definitions(
-            code_bytes=trees[files][1],
-        )
-
-        if "main" in functions.keys() and any(
-            files == x for x in potential_main_files
-        ):
+            code_bytes=trees[files][1]
+        )  # function_name:dict(info of this function.)
+        # if files == 'dio000d.c':
+        #     print('This is the files and functions for the dio000d.c',files,functions)
+        if "main" in functions.keys() and any(files == x for x in potential_main_files):
             main_file_name = files
             print("Found main file", main_file_name)
-
         if "main" in functions and not any(files == x for x in potential_main_files):
             bad_main_files.append(files)
-
         FILE_FUNCTIONS[files] = functions
 
     for bad_files in bad_main_files:
         del FILE_FUNCTIONS[bad_files]
         del PROJECT_STRUCTURE[bad_files]
         del trees[bad_files]
-
     STATE.set("FILE_FUNCTIONS", FILE_FUNCTIONS)
+
     STATE.set("FILE_INCLUDES", file_includes)
     STATE.set("MACROS", macros)
+    # STATE.set('TREES',trees)
 
-    # ==========================================================================
-    # 4. IDENTIFY FUNCTIONS TO TRACE
-    # ==========================================================================
     functions_identified = identify_funs_to_trace(
-        project_structure=PROJECT_STRUCTURE,
-        trees=trees,
-    )
-
+        project_structure=PROJECT_STRUCTURE, trees=trees
+    )  # functions and
     if functions_identified == {}:
         print(
-            f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT "
-            f"{project_path.name}.{RESET}"
+            f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
         return None
-
     console.print(
-        "-" * 10,
-        "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.",
-        "-" * 10,
+        "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
     )
 
     console.print(functions_identified)
+    # sys.exit()
     console.print("-" * 60)
+    import time
 
-    answers: dict[str, list[tuple[BaseModel, BaseModel]]] = defaultdict(list)
+    answers: dict[str, list[tuple[BaseModel, BaseModel]]] = defaultdict(
+        list
+    )  # funct_name [(combinedModel,Stats)]
 
+    # print('dio000d.c' in PROJECT_STRUCTURE)
     print("This is the main file::", main_file_name)
-
-    # ==========================================================================
-    # 5. VERIFY make_llm_calls_for_function SUPPORTS GLOBAL MODE
-    # ==========================================================================
-    make_llm_signature = inspect.signature(make_llm_calls_for_function)
-
-    required_extra_params = {
-        "dpo_mode",
-        "prepared_data",
-        "global_dpo_results",
-    }
-
-    missing_params = [
-        param
-        for param in required_extra_params
-        if param not in make_llm_signature.parameters
-    ]
-
-    if missing_params:
-        raise TypeError(
-            "Your make_llm_calls_for_function does not support global flat DPO yet. "
-            "trace_variable alone cannot flatten globally because your current "
-            "make_llm_calls_for_function starts DPO internally.\n\n"
-            f"Missing parameters: {missing_params}\n\n"
-            "Update make_llm_calls_for_function to accept:\n"
-            "    dpo_mode='normal' | 'collect' | 'process'\n"
-            "    prepared_data=None\n"
-            "    global_dpo_results=None\n"
-        )
-
-    # ==========================================================================
-    # 6. COLLECT PHASE
-    # ==========================================================================
-    prepared_by_function: dict[str, dict] = {}
-    all_dpo_specs: list[dict] = []
-
-    print()
-    print("=" * 80)
-    print("[GLOBAL DPO COLLECT PHASE START]")
-    print("=" * 80)
-
-    for function in functions_identified:
-        STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-
-        print()
-        print(f"{BOLD}{GREEN}[COLLECT] {function}{RESET}")
-
-        prepared_data = make_llm_calls_for_function(
-            function=function,
-            trees=trees,
-            functions_identified=functions_identified,
-            answers=answers,
-            main_file_name=main_file_name,
-            function_pointer_args=FUNCTION_POINTER_ARGS,
-            file_functions=FILE_FUNCTIONS,
-            project_structure=PROJECT_STRUCTURE,
-            project_path=project_path,
-            dpo_mode="collect",
-            prepared_data=None,
-            global_dpo_results=None,
-        )
-
-        if prepared_data is None:
-            print(f"[COLLECT SKIP] {function}: no prepared data")
-            continue
-
-        if not isinstance(prepared_data, dict):
-            raise TypeError(
-                f"Collect mode for {function} must return dict or None. "
-                f"Got: {type(prepared_data)}"
-            )
-
-        function_dpo_specs = prepared_data.get("dpo_specs", [])
-
-        if function_dpo_specs is None:
-            function_dpo_specs = []
-
-        if not isinstance(function_dpo_specs, list):
-            raise TypeError(
-                f"prepared_data['dpo_specs'] for {function} must be list. "
-                f"Got: {type(function_dpo_specs)}"
-            )
-
-        prepared_by_function[function] = prepared_data
-        all_dpo_specs.extend(function_dpo_specs)
-
-        print(
-            f"[COLLECT DONE] function={function} "
-            f"specs={len(function_dpo_specs)} "
-            f"total_specs_so_far={len(all_dpo_specs)}"
-        )
-
-    print()
-    print("=" * 80)
-    print("[GLOBAL DPO COLLECT PHASE DONE]")
-    print(f"functions_prepared={len(prepared_by_function)}")
-    print(f"total_dpo_jobs={len(all_dpo_specs)}")
-    print("=" * 80)
-
-    # ==========================================================================
-    # 7. GLOBAL DPO PHASE
-    # ==========================================================================
-    if all_dpo_specs:
-        print()
-        print("=" * 80)
-        print("[GLOBAL DPO START]")
-        print(f"total_jobs={len(all_dpo_specs)}")
-        print("=" * 80)
-
-        global_dpo_results = resolve_all_paths_with_dpo_flat(all_dpo_specs)
-
-        print()
-        print("=" * 80)
-        print("[GLOBAL DPO DONE]")
-        print(f"results={len(global_dpo_results)}")
-        print("=" * 80)
-
-    else:
-        print()
-        print("=" * 80)
-        print("[GLOBAL DPO SKIPPED]")
-        print("No DPO specs collected.")
-        print("=" * 80)
-
-        global_dpo_results = {}
-
-    # ==========================================================================
-    # 8. PROCESS PHASE
-    # ==========================================================================
+    # sys.exit()
     data_csvs = []
-
-    print()
-    print("=" * 80)
-    print("[GLOBAL DPO PROCESS PHASE START]")
-    print("=" * 80)
-
     for function in functions_identified:
-        if function not in prepared_by_function:
-            print(f"[PROCESS SKIP] {function}: no prepared data")
-            continue
-
+        # if function == 'mpf_mfs_open' or function=='mpf_mfs_close' or function=='mpf_mfs_getrec': continue
+        # if 'pmf_addevent' not in function: continue
+        # if function != 'mpf_mfs_open':continue
+        # if project_path.name == 'dio120d' : continue
         STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-
-        print()
-        print(f"{BOLD}{GREEN}[PROCESS] {function}{RESET}")
-
         function_dataframes: list | None = make_llm_calls_for_function(
             function=function,
             trees=trees,
             functions_identified=functions_identified,
-            answers=answers,
+            answers=answers,  # will be modified in place
             main_file_name=main_file_name,
-            function_pointer_args=FUNCTION_POINTER_ARGS,
+            function_pointer_args=FUNCTION_POINTER_ARGS,  # TODO: need the same for these or make a state class holding these vars together.
             file_functions=FILE_FUNCTIONS,
             project_structure=PROJECT_STRUCTURE,
             project_path=project_path,
-            dpo_mode="process",
-            prepared_data=prepared_by_function[function],
-            global_dpo_results=global_dpo_results,
         )
-
         if function_dataframes is not None:
             data_csvs = [*data_csvs, *function_dataframes]
 
-    print()
-    print("=" * 80)
-    print("[GLOBAL DPO PROCESS PHASE DONE]")
-    print(f"data_csvs={len(data_csvs)}")
-    print("=" * 80)
-
     console.print(data_csvs)
+    # save_dicts_to_csv(data_csvs)
 
-    return answers
+    return answers  # full answer plus+ stats
+
 
 # Run the tracer
 if __name__ == "__main__":
