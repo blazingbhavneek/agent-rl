@@ -53,7 +53,7 @@ CLOUD_JUDGE_MODEL = os.getenv("CLOUD_JUDGE_MODEL", "gpt-5.4")
 LOCAL_JUDGE_MODEL = os.getenv("LOCAL_JUDGE_MODEL", ORIGINAL_MODEL)
 
 # Keep output here.
-OUT_DIR = Path("eval_runs")
+OUT_DIR = Path("eval_runs_gpt")
 OUT_DIR.mkdir(exist_ok=True)
 
 # endregion
@@ -210,34 +210,34 @@ def make_prompt(
     )
 
     if main_c_path is not None:
+        path = main_c_path.resolve()
         target_file_text = (
-            f"The target file already exists at this absolute path:\n"
-            f"{main_c_path.resolve()}\n"
+            "Write the code here:\n"
+            f"{path}\n"
         )
         write_rule = (
-            f"- Write the complete C solution into this exact file:\n"
-            f"  {main_c_path.resolve()}\n"
-            f"- Do not write to ./main.c unless it is the same file as the absolute path above.\n"
-        )
-        research_rule = (
-            "- Use the configured MCP tools to research the required library "
-            "functions before coding.\n"
-            if rag_enabled
-            else "- No MCP tools are available for this run; solve only from the task.\n"
+            "- Create the file if it does not exist.\n"
+            f"- Write/overwrite the complete C solution at:\n  {path} if it already exists\n"
         )
     else:
         target_file_text = "You are responding through a chat-completions API.\n"
         write_rule = (
             "- Return the complete C solution in one fenced ```c code block.\n"
         )
-        research_rule = "- You have no tools or filesystem access.\n"
 
     return f"""Solve this C code-generation task.
+
+Code rules:
+CPP Style comments are not allowed: Use /* <Comment Body> */ instead of // <Comment Body>
+Dont declare variable inside for loops
+Always have a main function in the code.
+Do not forward declare library functions using extern, declared functions will not be compiled. Just including their headers is enough.
+Dont try to run gcc commands or try to compile yourself, the written code will be tested in another location, dont try to find its headers, use the search tools to read about library and only then write code. Make no mistakes.
 
 {target_file_text}
 
 Rules:
-{write_rule}{research_rule}- Do not create or edit any other files.
+{write_rule}- Do not create or edit any other files.
 - Do not ask the user questions.
 - Do not include explanations.
 - The following required library functions must be called directly when they are listed:
@@ -689,16 +689,12 @@ async def call_copilot_cli(
 
         try:
             # Critical:
-            # Pre-create main.c. Do NOT delete it.
+            # Pre-create main.c as a blank file.
             # Copilot is much more reliable when the target file exists.
-            initial_main_c = (
-                "/*\n"
-                "Target file for Copilot evaluation.\n"
-                "Replace this entire file with the complete C solution.\n"
-                "*/\n"
-            )
+            initial_main_c = ""
 
-            main_c_path.write_text(initial_main_c, encoding="utf-8")
+            # TODO: Run it back
+            # main_c_path.write_text(initial_main_c, encoding="utf-8")
 
             exact_main_c_path = main_c_path.resolve()
 
@@ -715,10 +711,8 @@ async def call_copilot_cli(
 IMPORTANT WORKSPACE INSTRUCTION:
 - Your current working directory is:
   {workspace}
-- The target file already exists.
-- The exact file you must edit is:
+- The exact file you must create is:
   {exact_main_c_path}
-- Replace the entire contents of that file with the complete C solution.
 - Do not create any other files.
 - Do not edit any other files.
 - Do not only describe the solution in chat.
@@ -823,13 +817,13 @@ IMPORTANT WORKSPACE INSTRUCTION:
                 ]
 
             print("========== COPILOT RUN START ==========", flush=True)
-            print(f"setup={setup}", flush=True)
-            print(f"model={model}", flush=True)
-            print(f"attempt={attempt}/{attempts}", flush=True)
-            print(f"timeout_sec={int(timeout)}", flush=True)
-            print(f"workspace={workspace}", flush=True)
-            print(f"main_c_path={exact_main_c_path}", flush=True)
-            print("command=", " ".join(cmd[:1] + ["-p", "<PROMPT>"] + cmd[3:]), flush=True)
+            print(f"setup = {setup}", flush=True)
+            print(f"model = {model}", flush=True)
+            print(f"attempt = {attempt}/{attempts}", flush=True)
+            print(f"timeout_sec = {int(timeout)}", flush=True)
+            print(f"workspace = {workspace}", flush=True)
+            print(f"main_c_path = {exact_main_c_path}", flush=True)
+            print("command = ", " ".join(cmd[:1] + ["-p", "<PROMPT>"] + cmd[3:]), flush=True)
             print("=======================================\n", flush=True)
 
             copilot_started = True
@@ -922,32 +916,29 @@ IMPORTANT WORKSPACE INSTRUCTION:
                     f"Copilot CLI exited with non-zero returncode={proc.returncode}"
                 )
 
-            # If Copilot left the placeholder unchanged, it did not solve the task.
-            placeholder_stripped = initial_main_c.strip()
+            # If main.c is still blank, it means Copilot didn't write to the file.
+            # Check if it outputted the code in stdout instead.
+            if not generated_code:
+                stdout_code = extract_c_code(transcript_raw)
+                if not stdout_code:
+                    raise RuntimeError(
+                        f"Copilot did not write generated code to main.c and did not output code in stdout at {exact_main_c_path}"
+                    )
 
-            if not generated_code or generated_code == placeholder_stripped:
-                raise RuntimeError(
-                    f"Copilot did not write generated code to main.c at {exact_main_c_path}"
+            # Put main.c first so existing extract_c_code(raw) picks this code,
+            # but only if it actually contains code.
+            if generated_code:
+                raw = (
+                    "```c\n"
+                    f"{generated_code}\n"
+                    "```\n\n"
+                    "[COPILOT_TRANSCRIPT]\n"
+                    f"{transcript_raw}"
                 )
-
-            # Also reject if it only left a comment-like placeholder.
-            if (
-                "Target file for Copilot evaluation" in generated_code
-                and "Replace this entire file" in generated_code
-                and len(generated_code) < 500
-            ):
-                raise RuntimeError(
-                    f"Copilot left placeholder content in main.c at {exact_main_c_path}"
-                )
-
-            # Put main.c first so existing extract_c_code(raw) picks this code.
-            raw = (
-                "```c\n"
-                f"{generated_code}\n"
-                "```\n\n"
-                "[COPILOT_TRANSCRIPT]\n"
-                f"{transcript_raw}"
-            )
+            else:
+                # If main.c is blank, just use the transcript so extract_c_code 
+                # can find the code in stdout.
+                raw = transcript_raw
 
             last_raw = raw
 
@@ -1163,22 +1154,22 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
         safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", problem.id)
         safe_setup = re.sub(r"[^A-Za-z0-9_.-]+", "_", setup)
 
+        # Create a unique folder for each run to ensure a fresh blank main.c
+        run_id = f"{int(time.time() * 1000)}_{os.getpid()}"
         workspace_dir = (
             OUT_DIR
             / f"copilot_workspace_{safe_setup}"
             / safe_task_id
+            / run_id
         ).resolve()
 
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
+        # TODO: Run it back
         main_c_path = (workspace_dir / "main.c").resolve()
-
         # Critical: Copilot is much more reliable if the file already exists.
-        if not main_c_path.exists():
-            main_c_path.write_text(
-                "/* Write the complete solution for this task here. */\n",
-                encoding="utf-8",
-            )
+        # Create a blank main.c file.
+        # main_c_path.write_text("", encoding="utf-8")
 
         prompt = make_prompt(
             problem.question,
@@ -1275,8 +1266,10 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
     if invocation == "copilot" and main_c_path is not None and main_c_path.exists():
         code = main_c_path.read_text(encoding="utf-8", errors="replace").strip()
 
+        # TODO: run it back
         if not code:
-            code = extract_c_code(raw)
+            code = ""
+        #     code = extract_c_code(raw)
     else:
         code = extract_c_code(raw)
 
@@ -1773,6 +1766,7 @@ async def run_generation_phase(
     setup_ids: list[str],
     limit: Optional[int] = None,
     resume: bool = False,
+    max_concurrency: int = 5,  # <--- NEW: Controls how many tasks run at once
 ):
     """
     Generation-only phase.
@@ -1783,6 +1777,7 @@ async def run_generation_phase(
     - Does NOT run judge.
     - With resume=True, skips any existing task_id + setup row. Limit then
       applies to the next pending tasks for each selected setup.
+    - Runs up to `max_concurrency` tasks in parallel using asyncio.
     """
 
     problems = load_tasks(tasks_path)
@@ -1811,6 +1806,7 @@ async def run_generation_phase(
     print(f"scheduled_task_setup_pairs={len(scheduled)}", flush=True)
     print(f"resume={resume}", flush=True)
     print(f"limit_per_setup={limit}", flush=True)
+    print(f"max_concurrency={max_concurrency}", flush=True)
     print(f"results_path={all_results_path}", flush=True)
     print("selected_setups:", flush=True)
 
@@ -1826,63 +1822,80 @@ async def run_generation_phase(
 
     print("======================================\n", flush=True)
 
-    # IMPORTANT: append mode.
-    with open(all_results_path, "a", encoding="utf-8") as rf:
-        for problem in problems:
-            for setup in setups:
-                if (problem.id, setup["id"]) not in scheduled:
-                    if resume:
-                        reason = (
-                            "already has a result"
-                            if setup["id"] in latest.get(problem.id, {})
-                            else "outside the current pending-task limit"
-                        )
-                        print(
-                            f"[SKIP GENERATE] task={problem.id} setup={setup['id']} "
-                            f"{reason}",
-                            flush=True,
-                        )
-                    continue
+    # 1. Semaphore to limit concurrent Copilot CLI instances
+    semaphore = asyncio.Semaphore(max_concurrency)
+    
+    # 2. Lock to prevent concurrent file writes from corrupting the JSONL
+    file_lock = asyncio.Lock()
 
-                print(f"\n========== TASK {problem.id} ==========", flush=True)
+    # 3. Define the async worker for a single task/setup pair
+    async def process_task(problem: Problem, setup: dict[str, Any]):
+        if (problem.id, setup["id"]) not in scheduled:
+            if resume:
+                reason = (
+                    "already has a result"
+                    if setup["id"] in latest.get(problem.id, {})
+                    else "outside the current pending-task limit"
+                )
                 print(
-                    f"[GENERATE] task={problem.id} "
-                    f"setup={setup['id']} "
-                    f"model={setup['model']} "
-                    f"invocation={setup['invocation']} "
-                    f"rag_enabled={setup.get('rag_enabled', False)}",
+                    f"[SKIP GENERATE] task={problem.id} setup={setup['id']} "
+                    f"{reason}",
                     flush=True,
                 )
+            return
 
-                try:
-                    result = await run_one(problem, setup)
+        async with semaphore:
+            print(f"\n========== TASK {problem.id} ==========", flush=True)
+            print(
+                f"[GENERATE] task={problem.id} "
+                f"setup={setup['id']} "
+                f"model={setup['model']} "
+                f"invocation={setup['invocation']} "
+                f"rag_enabled={setup.get('rag_enabled', False)}",
+                flush=True,
+            )
 
-                except Exception as e:
-                    # This should rarely trigger because run_one already catches
-                    # generation errors and returns a failure RunResult.
-                    print(
-                        f"[ERROR] setup={setup['id']} task={problem.id} "
-                        f"unexpected failure: {type(e).__name__}: {e}",
-                        flush=True,
-                    )
-                    raise
-
-                rf.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
-                rf.flush()
-
+            try:
+                result = await run_one(problem, setup)
+            except Exception as e:
                 print(
-                    f"[SAVED] task={result.task_id} "
-                    f"setup={result.setup} "
-                    f"required_pass={result.required_pass} "
-                    f"compile_pass={result.compile_pass} "
-                    f"hard_pass={result.hard_pass} "
-                    f"latency_ms={result.latency_ms} "
-                    f"tokens={result.total_tokens}",
+                    f"[ERROR] setup={setup['id']} task={problem.id} "
+                    f"unexpected failure: {type(e).__name__}: {e}",
                     flush=True,
                 )
+                # NOTE: In concurrent execution, raising an exception here would crash 
+                # the entire asyncio.gather and kill all other running tasks.
+                # We log it and return to allow the rest of the batch to finish safely.
+                return
+
+            # 4. Safely append to the JSONL file
+            async with file_lock:
+                with open(all_results_path, "a", encoding="utf-8") as rf:
+                    rf.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+                    rf.flush()
+
+            print(
+                f"[SAVED] task={result.task_id} "
+                f"setup={result.setup} "
+                f"required_pass={result.required_pass} "
+                f"compile_pass={result.compile_pass} "
+                f"hard_pass={result.hard_pass} "
+                f"latency_ms={result.latency_ms} "
+                f"tokens={result.total_tokens}",
+                flush=True,
+            )
+
+    # 5. Gather all the scheduled tasks and run them concurrently
+    tasks_to_run = [
+        process_task(problem, setup)
+        for problem in problems
+        for setup in setups
+    ]
+
+    # Run them all concurrently (up to the semaphore limit)
+    await asyncio.gather(*tasks_to_run)
 
     print(f"\nSaved appended generation results to: {all_results_path}", flush=True)
-
 
 async def run_judge_phase(
     tasks_path: str,
