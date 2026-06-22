@@ -225,6 +225,12 @@ def make_prompt(
             "- Return the complete C solution in one fenced ```c code block.\n"
         )
 
+    research_rule = (
+        "- Use the configured MCP tools to research required library functions before coding.\n"
+        if rag_enabled
+        else "- No MCP tools are available for this run.\n"
+    )
+
     return f"""Solve this C code-generation task.
 
 Code rules:
@@ -237,7 +243,7 @@ Dont try to run gcc commands or try to compile yourself, the written code will b
 {target_file_text}
 
 Rules:
-{write_rule}- Do not create or edit any other files.
+{write_rule}{research_rule}- Do not create or edit any other files.
 - Do not ask the user questions.
 - Do not include explanations.
 - The following required library functions must be called directly when they are listed:
@@ -1369,13 +1375,10 @@ async def run_one(problem: Problem, setup_cfg: dict[str, Any]) -> RunResult:
 
 # region 9: Absolute judging
 
-ABSOLUTE_SCORE_KEYS = (
-    "correctness",
-    "required_function_usage",
+JUDGE_SCORE_KEYS = (
+    "task_correctness",
+    "reference_similarity",
     "code_quality",
-    "retrieval_use",
-    "efficiency",
-    "overall",
 )
 
 
@@ -1402,10 +1405,6 @@ def result_fingerprint(result: RunResult) -> str:
 
 def make_judge_prompt(problem: Problem, result: RunResult) -> str:
     candidate = {
-        "setup": result.setup,
-        "model": result.model,
-        "invocation": result.invocation,
-        "rag_enabled": result.rag_enabled,
         "code": result.extracted_code,
         "required": result.required,
         "called": result.called,
@@ -1414,12 +1413,6 @@ def make_judge_prompt(problem: Problem, result: RunResult) -> str:
         "compile_pass": result.compile_pass,
         "hard_pass": result.hard_pass,
         "compile_logs": result.compile_logs,
-        "input_tokens": result.input_tokens,
-        "output_tokens": result.output_tokens,
-        "total_tokens": result.total_tokens,
-        "latency_ms": result.latency_ms,
-        "rag_query_count": result.rag_query_count,
-        "rag_queries": result.rag_queries,
     }
 
     return f"""You are an absolute evaluator for one C code-generation result.
@@ -1434,26 +1427,20 @@ Required library functions:
 {problem.metadata.get("required", [])}
 
 Evaluate only this result. Do not compare it to other models or setups. Compiler and
-required-call facts are authoritative. Use only visible RAG query names, never infer
-hidden retrieval contents.
+required-call facts are authoritative. A non-compiling candidate receives 0 for task
+correctness and code quality. Reference similarity means behavioral agreement, not
+textual or implementation similarity.
 
-Scoring rubric (0-10, absolute):
-- correctness: semantic fit to the task and reference answer; compilation failure is 0.
-- required_function_usage: required calls are correct and complete; missing calls are 0.
-- code_quality: safety, clarity, and unnecessary complexity.
-- retrieval_use: appropriate and economical use of retrieval for this setup.
-- efficiency: tokens and latency in isolation, not relative to another result.
-- overall: evidence-based aggregate, never higher than correctness when compilation fails.
+Scoring rubric (all scores are numbers from 0 to 1):
+- task_correctness: fulfillment of the task and required library calls.
+- reference_similarity: semantic agreement with the reference answer's behavior.
+- code_quality: safety, clarity, and unnecessary complexity in the C implementation.
 
 Return only valid JSON with exactly these keys:
 {{
-  "correctness": 0,
-  "required_function_usage": 0,
-  "code_quality": 0,
-  "retrieval_use": 0,
-  "efficiency": 0,
-  "overall": 0,
-  "verdict": "pass|partial|fail",
+  "task_correctness": 0.0,
+  "reference_similarity": 0.0,
+  "code_quality": 0.0,
   "reasoning": "brief evidence-based explanation"
 }}
 
@@ -1466,28 +1453,30 @@ def validate_absolute_judgment(parsed: Any) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("judge output must be a JSON object")
 
-    expected_keys = set(ABSOLUTE_SCORE_KEYS) | {"verdict", "reasoning"}
+    expected_keys = set(JUDGE_SCORE_KEYS) | {"reasoning"}
     if set(parsed) != expected_keys:
         raise ValueError(
             f"judge output keys must be exactly {sorted(expected_keys)}, got {sorted(parsed)}"
         )
 
     normalized: dict[str, Any] = {}
-    for key in ABSOLUTE_SCORE_KEYS:
+    for key in JUDGE_SCORE_KEYS:
         value = parsed[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"judge score {key!r} must be a number")
-        if not 0 <= value <= 10:
-            raise ValueError(f"judge score {key!r} must be between 0 and 10")
+        if not 0 <= value <= 1:
+            raise ValueError(f"judge score {key!r} must be between 0 and 1")
         normalized[key] = value
 
-    if parsed["verdict"] not in {"pass", "partial", "fail"}:
-        raise ValueError("judge verdict must be pass, partial, or fail")
     if not isinstance(parsed["reasoning"], str):
         raise ValueError("judge reasoning must be a string")
 
-    normalized["verdict"] = parsed["verdict"]
     normalized["reasoning"] = parsed["reasoning"]
+    normalized["overall"] = (
+        0.45 * normalized["task_correctness"]
+        + 0.40 * normalized["reference_similarity"]
+        + 0.15 * normalized["code_quality"]
+    )
     return normalized
 
 
@@ -1513,11 +1502,6 @@ async def judge_task(
                 "Set OPENAI_API_KEY or CLOUD_LLM_API_KEY, or run with --dev."
             )
 
-    client = OpenAI(
-        base_url=judge_base_url,
-        api_key=judge_api_key,
-    )
-
     prompt = make_judge_prompt(problem, result)
 
     print("\n========== JUDGE START ==========", flush=True)
@@ -1526,38 +1510,37 @@ async def judge_task(
     print(f"judge_base_url={judge_base_url}", flush=True)
     print("=================================\n", flush=True)
 
-    resp = client.chat.completions.create(
-        model=judge_model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a careful evaluation judge. Return only valid JSON.",
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        temperature=0.0,
-        timeout=180.0,
-    )
-
-    raw = resp.choices[0].message.content or ""
-
-    try:
-        parsed = validate_absolute_judgment(json.loads(raw))
-        parsed["_judge_mode"] = judge_mode
-        parsed["_judge_model"] = judge_model
-        return parsed
-
-    except (json.JSONDecodeError, ValueError) as e:
-        return {
-            "error": "judge_output_invalid",
-            "message": str(e),
-            "raw": raw,
-            "_judge_mode": judge_mode,
-            "_judge_model": judge_model,
-        }
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            client = OpenAI(base_url=judge_base_url, api_key=judge_api_key)
+            resp = client.chat.completions.create(
+                model=judge_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a careful evaluation judge. Return only valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                timeout=180.0,
+            )
+            parsed = validate_absolute_judgment(
+                json.loads(resp.choices[0].message.content or "")
+            )
+            parsed["_judge_mode"] = judge_mode
+            parsed["_judge_model"] = judge_model
+            return parsed
+        except Exception as e:
+            delay = min(60.0, float(2 ** min(attempt - 1, 6)))
+            print(
+                f"[WARN] judge attempt={attempt} failed: {type(e).__name__}: {e}; "
+                f"retrying in {delay:.0f}s",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
 
 
 # endregion
@@ -1570,7 +1553,7 @@ def build_setup_registry() -> dict[str, dict[str, Any]]:
     Registry of all known generation setups.
 
     Generation phase chooses from this registry using --setups.
-    Judge phase chooses setup ids from stored results using --judge-setups.
+    The judge phase discovers setup ids directly from its stored results.
 
     Important:
     - Cloud API key is only required if cloud_rag_copilot is selected.
@@ -1759,21 +1742,223 @@ def judge_fingerprint(problem: Problem, result: RunResult, dev: bool) -> str:
 # endregion
 
 
-# region 11: Resumable generation and judging phases
+# region 10b: Coherence-check rounds
+
+COHERENCE_CLASSIFICATIONS = {
+    "coherent_c",
+    "empty_output",
+    "provider_failure",
+    "stdout_transcript",
+    "non_code",
+}
+
+
+def results_round_path(round_number: int) -> Path:
+    if round_number == 0:
+        return OUT_DIR / "results.jsonl"
+    return OUT_DIR / f"results_{round_number}.jsonl"
+
+
+def check_round_path(round_number: int) -> Path:
+    if round_number == 0:
+        return OUT_DIR / "check.jsonl"
+    return OUT_DIR / f"check_{round_number}.jsonl"
+
+
+def available_result_rounds() -> list[int]:
+    rounds = []
+    if results_round_path(0).exists():
+        rounds.append(0)
+    for path in OUT_DIR.glob("results_*.jsonl"):
+        match = re.fullmatch(r"results_(\d+)\.jsonl", path.name)
+        if match:
+            rounds.append(int(match.group(1)))
+    return sorted(set(rounds))
+
+
+def latest_checked_round() -> Optional[int]:
+    checked = [
+        round_number
+        for round_number in available_result_rounds()
+        if check_round_path(round_number).exists()
+    ]
+    return max(checked) if checked else None
+
+
+def next_unchecked_round() -> Optional[int]:
+    pending = [
+        round_number
+        for round_number in available_result_rounds()
+        if not check_round_path(round_number).exists()
+    ]
+    return max(pending) if pending else None
+
+
+def make_coherence_prompt(problem: Problem, result: RunResult) -> str:
+    return f"""You validate whether a model extraction is usable C source text.
+
+Task:
+{problem.question}
+
+Extracted output:
+{result.extracted_code}
+
+Compiler log (context only; a compile error alone is not a reason to retry):
+{result.compile_logs}
+
+Do not evaluate task correctness, required APIs, quality, or whether the code compiles.
+Decide only whether the extracted output is recognizably coherent C source, rather than
+empty output, an API/provider/budget failure, a Copilot/stdout transcript, or arbitrary
+non-code text.
+
+Return only valid JSON with exactly these keys:
+{{
+  "retry": false,
+  "classification": "coherent_c|empty_output|provider_failure|stdout_transcript|non_code",
+  "reasoning": "brief explanation"
+}}
+"""
+
+
+def validate_coherence_check(parsed: Any) -> dict[str, Any]:
+    if not isinstance(parsed, dict):
+        raise ValueError("coherence check output must be a JSON object")
+    if set(parsed) != {"retry", "classification", "reasoning"}:
+        raise ValueError("coherence check output has unexpected keys")
+    if not isinstance(parsed["retry"], bool):
+        raise ValueError("coherence check retry must be a boolean")
+    if parsed["classification"] not in COHERENCE_CLASSIFICATIONS:
+        raise ValueError("coherence check classification is invalid")
+    if not isinstance(parsed["reasoning"], str):
+        raise ValueError("coherence check reasoning must be a string")
+    if parsed["retry"] == (parsed["classification"] == "coherent_c"):
+        raise ValueError("coherence retry must be false exactly for coherent_c")
+    return {
+        "retry": parsed["retry"],
+        "classification": parsed["classification"],
+        "reasoning": parsed["reasoning"],
+    }
+
+
+async def check_result_coherence(problem: Problem, result: RunResult) -> dict[str, Any]:
+    """Use the local model only to reject unusable extraction fallbacks."""
+    prompt = make_coherence_prompt(problem, result)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            client = OpenAI(base_url=LOCAL_BASE_URL, api_key="dummy")
+            response = client.chat.completions.create(
+                model=LOCAL_JUDGE_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON. Do not execute code.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                timeout=180.0,
+            )
+            return validate_coherence_check(
+                json.loads(response.choices[0].message.content or "")
+            )
+        except Exception as e:
+            delay = min(60.0, float(2 ** min(attempt - 1, 6)))
+            print(
+                f"[WARN] coherence check attempt={attempt} failed: "
+                f"{type(e).__name__}: {e}; retrying in {delay:.0f}s",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
+
+
+def load_checks(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    """Load the latest valid check row for each task/setup from one check file."""
+    checks: dict[tuple[str, str], dict[str, Any]] = {}
+    if not path.exists():
+        return checks
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                task_id = row["task_id"]
+                setup = row["setup"]
+                result_hash = row["result_fingerprint"]
+                decision = validate_coherence_check(row["check"])
+                if not all(isinstance(value, str) for value in (task_id, setup, result_hash)):
+                    raise ValueError("task_id, setup, and result_fingerprint must be strings")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+                print(
+                    f"[WARN] Skipping invalid check row {path} line={line_no}: {e}",
+                    flush=True,
+                )
+                continue
+            checks[(task_id, setup)] = {
+                "result_fingerprint": result_hash,
+                "check": decision,
+                "round": row.get("round"),
+            }
+    return checks
+
+
+def coherent_candidates_from_round(round_number: int) -> list[tuple[int, RunResult]]:
+    results_path = results_round_path(round_number)
+    checks = load_checks(check_round_path(round_number))
+    candidates: list[tuple[int, RunResult]] = []
+    for task_id, by_setup in load_results_latest(results_path).items():
+        for setup, result in by_setup.items():
+            decision = checks.get((task_id, setup))
+            if (
+                decision
+                and decision["result_fingerprint"] == result_fingerprint(result)
+                and not decision["check"]["retry"]
+            ):
+                candidates.append((round_number, result))
+    return candidates
+
+
+def outstanding_retry_pairs() -> set[tuple[str, str]]:
+    """Return task/setup pairs whose newest checked candidate still needs a retry."""
+    latest: dict[tuple[str, str], tuple[int, bool]] = {}
+    for round_number in available_result_rounds():
+        check_path = check_round_path(round_number)
+        if not check_path.exists():
+            continue
+        checks = load_checks(check_path)
+        results = load_results_latest(results_round_path(round_number))
+        for task_id, by_setup in results.items():
+            for setup, result in by_setup.items():
+                decision = checks.get((task_id, setup))
+                if decision and decision["result_fingerprint"] == result_fingerprint(result):
+                    latest[(task_id, setup)] = (
+                        round_number,
+                        decision["check"]["retry"],
+                    )
+    return {pair for pair, (_round, retry) in latest.items() if retry}
+
+
+# endregion
+
+
+# region 11: Generation phase
 
 async def run_generation_phase(
     tasks_path: str,
     setup_ids: list[str],
     limit: Optional[int] = None,
     resume: bool = False,
-    max_concurrency: int = 5,  # <--- NEW: Controls how many tasks run at once
+    max_concurrency: int = 5,
 ):
     """
     Generation-only phase.
 
     Behavior:
     - Runs selected setup ids only.
-    - Appends each RunResult to eval_runs/results.jsonl.
+    - Appends each RunResult to OUT_DIR/results.jsonl.
     - Does NOT run judge.
     - With resume=True, skips any existing task_id + setup row. Limit then
       applies to the next pending tasks for each selected setup.
@@ -1897,141 +2082,320 @@ async def run_generation_phase(
 
     print(f"\nSaved appended generation results to: {all_results_path}", flush=True)
 
-async def run_judge_phase(
-    tasks_path: str,
-    judge_setup_ids: list[str],
-    dev: bool,
-    limit: Optional[int] = None,
-    resume: bool = False,
-):
-    """
-    Judge-only phase.
+# endregion
 
-    Behavior:
-    - Reads eval_runs/results.jsonl.
-    - Uses latest row for each task_id + setup.
-    - Judges every available selected task/setup independently.
-    - Appends judge outputs to eval_runs/judge.jsonl.
-    - With resume=True, skips a setup only when its latest source result has
-      already received a valid judgment from this judge model/mode.
-    """
 
-    problems = load_tasks(tasks_path)
+# region 12: Coherence checks, retries, merging, and source-aware judging
 
-    results_path = OUT_DIR / "results.jsonl"
-    judge_path = OUT_DIR / "judge.jsonl"
+async def run_check_phase(tasks_path: str) -> None:
+    round_number = next_unchecked_round()
+    if round_number is None:
+        print("[CHECK] No unchecked results round found.", flush=True)
+        return
 
+    results_path = results_round_path(round_number)
+    check_path = check_round_path(round_number)
+    problems = {problem.id: problem for problem in load_tasks(tasks_path)}
     latest = load_results_latest(results_path)
-    latest_judgments = load_judgments_latest(judge_path) if resume else {}
+    bad_count = 0
+    checked_count = 0
 
-    print("\n========== JUDGE PHASE ==========", flush=True)
-    print(f"tasks_path={tasks_path}", flush=True)
-    print(f"num_tasks={len(problems)}", flush=True)
+    print("\n========== COHERENCE CHECK PHASE ==========", flush=True)
     print(f"results_path={results_path}", flush=True)
-    print(f"judge_path={judge_path}", flush=True)
-    print(f"dev={dev}", flush=True)
-    print(f"judge_setup_ids={judge_setup_ids}", flush=True)
-    print(f"resume={resume}", flush=True)
-    print(f"limit_per_setup={limit}", flush=True)
+    print(f"check_path={check_path}", flush=True)
+    print(f"round={round_number}", flush=True)
+    print(f"local_judge_model={LOCAL_JUDGE_MODEL}", flush=True)
+    print("===========================================\n", flush=True)
 
-    if dev:
-        print("judge_mode=DEV/local judge", flush=True)
-        print(f"local_base_url={LOCAL_BASE_URL}", flush=True)
-        print(f"local_judge_model={LOCAL_JUDGE_MODEL}", flush=True)
-    else:
-        print("judge_mode=FULL/cloud judge", flush=True)
-        print(f"cloud_base_url={CLOUD_BASE_URL}", flush=True)
-        print(f"cloud_judge_model={CLOUD_JUDGE_MODEL}", flush=True)
-
-        if not CLOUD_API_KEY:
-            raise RuntimeError(
-                "Cloud judge requested, but no API key was found. "
-                "Set OPENAI_API_KEY or CLOUD_LLM_API_KEY, or run judge with --dev."
-            )
-
-    print("=================================\n", flush=True)
-
-    judged_count = 0
-    skipped_count = 0
-    missing_count = 0
-    scheduled_count_by_setup: defaultdict[str, int] = defaultdict(int)
-
-    # IMPORTANT: append mode.
-    with open(judge_path, "a", encoding="utf-8") as jf:
-        for problem in problems:
-            by_setup = latest.get(problem.id, {})
-            for setup_id in judge_setup_ids:
-                result = by_setup.get(setup_id)
-                if result is None:
-                    missing_count += 1
-                    print(
-                        f"[SKIP JUDGE] task={problem.id} setup={setup_id} "
-                        "has no generation result",
-                        flush=True,
-                    )
-                    continue
-
-                fingerprint = judge_fingerprint(problem, result, dev)
-                if resume and latest_judgments.get((problem.id, setup_id)) == fingerprint:
-                    skipped_count += 1
-                    print(
-                        f"[SKIP JUDGE] task={problem.id} setup={setup_id} "
-                        "already has a current judgment",
-                        flush=True,
-                    )
-                    continue
-
-                if limit is not None and scheduled_count_by_setup[setup_id] >= limit:
-                    continue
-                scheduled_count_by_setup[setup_id] += 1
-
+    with open(check_path, "x", encoding="utf-8") as check_file:
+        for task_id, by_setup in latest.items():
+            problem = problems.get(task_id)
+            if problem is None:
                 print(
-                    f"[JUDGE] task={problem.id} setup={setup_id}",
+                    f"[WARN] Skipping result task={task_id}; it is absent from {tasks_path}",
+                    flush=True,
+                )
+                continue
+            for setup, result in by_setup.items():
+                decision = await check_result_coherence(problem, result)
+                row = {
+                    "task_id": task_id,
+                    "setup": setup,
+                    "round": round_number,
+                    "source_results": results_path.name,
+                    "result_fingerprint": result_fingerprint(result),
+                    "check": decision,
+                    "created_at": now_iso(),
+                }
+                check_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                check_file.flush()
+                checked_count += 1
+                bad_count += int(decision["retry"])
+                print(
+                    f"[CHECK] task={task_id} setup={setup} "
+                    f"classification={decision['classification']} retry={decision['retry']}",
                     flush=True,
                 )
 
-                try:
-                    judge = await judge_task(problem, result, dev=dev)
+    print(
+        f"[CHECK SUMMARY] round={round_number} checked={checked_count} bad={bad_count}",
+        flush=True,
+    )
+    outstanding = outstanding_retry_pairs()
+    if checked_count and not outstanding:
+        await run_merge_phase(tasks_path)
+    elif outstanding:
+        print(
+            f"[CHECK] outstanding_retry_pairs={len(outstanding)}; run --phase retry.",
+            flush=True,
+        )
 
-                except Exception as e:
-                    print(
-                        f"[WARN] Judge failed for task={problem.id} setup={setup_id}: "
-                        f"{type(e).__name__}: {e}",
-                        flush=True,
-                    )
-                    judge = {
-                        "error": "judge_failed",
-                        "message": str(e),
-                        "dev": dev,
-                    }
 
+async def _generate_pairs_to_path(
+    problems: list[Problem],
+    setups: list[dict[str, Any]],
+    scheduled: set[tuple[str, str]],
+    output_path: Path,
+    max_concurrency: int = 5,
+) -> None:
+    semaphore = asyncio.Semaphore(max_concurrency)
+    file_lock = asyncio.Lock()
+
+    async def process_task(problem: Problem, setup: dict[str, Any]) -> None:
+        if (problem.id, setup["id"]) not in scheduled:
+            return
+        async with semaphore:
+            print(
+                f"[GENERATE] task={problem.id} setup={setup['id']} "
+                f"output={output_path.name}",
+                flush=True,
+            )
+            try:
+                result = await run_one(problem, setup)
+            except Exception as e:
+                # run_one normally converts provider failures into a RunResult. Keep
+                # an unexpected exception visible instead of guessing its category.
+                print(
+                    f"[ERROR] task={problem.id} setup={setup['id']} "
+                    f"unexpected generation failure: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+                return
+            async with file_lock:
+                with open(output_path, "a", encoding="utf-8") as results_file:
+                    results_file.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+                    results_file.flush()
+
+    await asyncio.gather(
+        *[
+            process_task(problem, setup)
+            for problem in problems
+            for setup in setups
+            if (problem.id, setup["id"]) in scheduled
+        ]
+    )
+
+
+async def run_retry_phase(
+    tasks_path: str,
+    limit: Optional[int] = None,
+    max_concurrency: int = 5,
+) -> None:
+    round_number = latest_checked_round()
+    if round_number is None:
+        raise FileNotFoundError("No check.jsonl exists. Run --phase check first.")
+
+    retry_pairs = outstanding_retry_pairs()
+
+    if not retry_pairs:
+        print("[RETRY] There are no retryable task IDs.", flush=True)
+        return
+
+    next_round = round_number + 1
+    output_path = results_round_path(next_round)
+    if output_path.exists():
+        raise FileExistsError(
+            f"{output_path} already exists. Run --phase check for that round before retrying again."
+        )
+
+    problems = load_tasks(tasks_path)
+    setup_ids = sorted({setup for _, setup in retry_pairs})
+    setups = select_setups(setup_ids)
+    scheduled: set[tuple[str, str]] = set()
+    scheduled_by_setup: defaultdict[str, int] = defaultdict(int)
+    for problem in problems:
+        for setup in setups:
+            pair = (problem.id, setup["id"])
+            if pair not in retry_pairs:
+                continue
+            if limit is not None and scheduled_by_setup[setup["id"]] >= limit:
+                continue
+            scheduled.add(pair)
+            scheduled_by_setup[setup["id"]] += 1
+
+    print("\n========== RETRY PHASE ==========", flush=True)
+    print(f"source_check={check_round_path(round_number)}", flush=True)
+    print(f"output_results={output_path}", flush=True)
+    print(f"retryable_pairs={len(retry_pairs)}", flush=True)
+    print(f"scheduled_pairs={len(scheduled)}", flush=True)
+    print("=================================\n", flush=True)
+    await _generate_pairs_to_path(
+        problems, setups, scheduled, output_path, max_concurrency=max_concurrency
+    )
+
+
+def merge_candidate_key(round_number: int, result: RunResult) -> tuple[int, int, int, int]:
+    return (
+        int(result.hard_pass),
+        int(result.compile_pass),
+        int(result.required_pass),
+        round_number,
+    )
+
+
+async def run_merge_phase(tasks_path: str) -> None:
+    problems = load_tasks(tasks_path)
+    candidates: dict[tuple[str, str], tuple[int, RunResult]] = {}
+    observed_setups: set[str] = set()
+    for round_number in available_result_rounds():
+        round_results = load_results_latest(results_round_path(round_number))
+        observed_setups.update(
+            setup for by_setup in round_results.values() for setup in by_setup
+        )
+        if not check_round_path(round_number).exists():
+            continue
+        for candidate_round, result in coherent_candidates_from_round(round_number):
+            key = (result.task_id, result.setup)
+            previous = candidates.get(key)
+            if previous is None or merge_candidate_key(candidate_round, result) > merge_candidate_key(
+                previous[0], previous[1]
+            ):
+                candidates[key] = (candidate_round, result)
+
+    setups = sorted(observed_setups)
+    expected = {(problem.id, setup) for problem in problems for setup in setups}
+    selected = []
+    selection = []
+    for problem in problems:
+        for setup in setups:
+            chosen = candidates.get((problem.id, setup))
+            if chosen is None:
+                continue
+            round_number, result = chosen
+            selected.append(result)
+            selection.append(
+                {
+                    "task_id": result.task_id,
+                    "setup": result.setup,
+                    "source_round": round_number,
+                    "hard_pass": result.hard_pass,
+                    "compile_pass": result.compile_pass,
+                    "required_pass": result.required_pass,
+                }
+            )
+
+    merged_path = OUT_DIR / "result_merged.jsonl"
+    with open(merged_path, "w", encoding="utf-8") as merged_file:
+        for result in selected:
+            merged_file.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+
+    missing_pairs = sorted(expected - set(candidates))
+    missing = sorted({task_id for task_id, _setup in missing_pairs})
+    summary = {
+        "created_at": now_iso(),
+        "merged_path": merged_path.name,
+        "selected_count": len(selected),
+        "missing_task_ids": missing,
+        "missing_task_setup_pairs": [
+            {"task_id": task_id, "setup": setup}
+            for task_id, setup in missing_pairs
+        ],
+        "selection": selection,
+    }
+    (OUT_DIR / "merge_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"[MERGE] selected={len(selected)} missing={len(missing)} path={merged_path}",
+        flush=True,
+    )
+
+
+async def run_judge_phase(
+    tasks_path: str,
+    judge_setup_ids: Optional[list[str]] = None,
+    dev: bool = False,
+    limit: Optional[int] = None,
+    resume: bool = False,
+    source: str = "results",
+) -> None:
+    if source not in {"results", "merged"}:
+        raise ValueError("judge source must be 'results' or 'merged'")
+    results_path = OUT_DIR / (
+        "results.jsonl" if source == "results" else "result_merged.jsonl"
+    )
+    judge_path = OUT_DIR / "judge.jsonl"
+    problems = load_tasks(tasks_path)
+    latest = load_results_latest(results_path)
+    stored_setups = sorted(
+        {setup for by_setup in latest.values() for setup in by_setup}
+    )
+    selected_setups = (
+        [setup for setup in judge_setup_ids if setup in stored_setups]
+        if judge_setup_ids is not None
+        else stored_setups
+    )
+    latest_judgments = load_judgments_latest(judge_path) if resume else {}
+    scheduled_by_setup: defaultdict[str, int] = defaultdict(int)
+    judged_count = 0
+    skipped_count = 0
+
+    print("\n========== JUDGE PHASE ==========", flush=True)
+    print(f"results_path={results_path}", flush=True)
+    print(f"judge_path={judge_path}", flush=True)
+    print(f"discovered_setups={selected_setups}", flush=True)
+    print(f"source={source}", flush=True)
+    print("=================================\n", flush=True)
+
+    with open(judge_path, "a", encoding="utf-8") as judge_file:
+        for problem in problems:
+            for setup in selected_setups:
+                result = latest.get(problem.id, {}).get(setup)
+                if result is None:
+                    continue
+                fingerprint = judge_fingerprint(problem, result, dev)
+                if resume and latest_judgments.get((problem.id, setup)) == fingerprint:
+                    skipped_count += 1
+                    continue
+                if limit is not None and scheduled_by_setup[setup] >= limit:
+                    continue
+                scheduled_by_setup[setup] += 1
+                judge = await judge_task(problem, result, dev=dev)
                 row = {
                     "task_id": problem.id,
-                    "setup": setup_id,
+                    "setup": setup,
+                    "source_results": results_path.name,
+                    "result_fingerprint": result_fingerprint(result),
+                    "judge_fingerprint": fingerprint,
                     "dev": dev,
                     "judge": judge,
                     "created_at": now_iso(),
                 }
-                # Failed or invalid judge outputs remain retryable in --resume.
-                if "error" not in judge:
-                    row["judge_fingerprint"] = fingerprint
-
-                jf.write(json.dumps(row, ensure_ascii=False) + "\n")
-                jf.flush()
+                judge_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                judge_file.flush()
                 judged_count += 1
 
-    print("\n========== JUDGE SUMMARY ==========", flush=True)
-    print(f"judged_count={judged_count}", flush=True)
-    print(f"skipped_count={skipped_count}", flush=True)
-    print(f"missing_generation_count={missing_count}", flush=True)
-    print(f"judge_path={judge_path}", flush=True)
-    print("===================================\n", flush=True)
+    print(
+        f"[JUDGE SUMMARY] judged={judged_count} skipped={skipped_count} path={judge_path}",
+        flush=True,
+    )
 
 
 # endregion
 
 
-# region 12: CLI
+# region 13: CLI
 
 async def main(args: argparse.Namespace):
     if args.phase == "generate":
@@ -2043,13 +2407,28 @@ async def main(args: argparse.Namespace):
         )
         return
 
+    if args.phase == "check":
+        await run_check_phase(args.tasks_path)
+        return
+
+    if args.phase == "retry":
+        await run_retry_phase(
+            tasks_path=args.tasks_path,
+            limit=args.limit,
+        )
+        return
+
+    if args.phase == "merge":
+        await run_merge_phase(args.tasks_path)
+        return
+
     if args.phase == "judge":
         await run_judge_phase(
             tasks_path=args.tasks_path,
-            judge_setup_ids=args.judge_setups,
             dev=args.dev,
             limit=args.limit,
             resume=args.resume,
+            source=args.judge_source,
         )
         return
 
@@ -2059,7 +2438,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate C code-generation models in separated phases: "
-            "generation and judge."
+            "generation, coherence checks, retries, merging, and judging."
         )
     )
 
@@ -2070,12 +2449,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--phase",
-        choices=["generate", "judge"],
+        choices=["generate", "check", "retry", "merge", "judge"],
         required=True,
         help=(
             "Phase to run. "
-            "'generate' appends model outputs to results.jsonl. "
-            "'judge' reads results.jsonl and appends judge outputs to judge.jsonl."
+            "'generate' writes results.jsonl; 'check' validates extracted output; "
+            "'retry' writes the next results_N.jsonl; 'merge' writes result_merged.jsonl; "
+            "'judge' appends judge.jsonl."
         ),
     )
 
@@ -2090,24 +2470,20 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--judge-setups",
-        nargs="+",
-        default=[
-            "local_rag_copilot",
-            "cloud_rag_copilot",
-            "rl_direct",
-        ],
-        help=(
-            "Setup ids to judge independently. Used only with --phase judge. "
-            "Each available task/setup is scored absolutely."
-        ),
-    )
-
-    parser.add_argument(
         "--dev",
         action="store_true",
         help=(
             "For judge phase only: use the local judge instead of the cloud judge."
+        ),
+    )
+
+    parser.add_argument(
+        "--judge-source",
+        choices=["results", "merged"],
+        default="results",
+        help=(
+            "Judge source. The default reads results.jsonl; 'merged' reads "
+            "result_merged.jsonl after coherence-check retry rounds."
         ),
     )
 
@@ -2137,9 +2513,6 @@ def parse_args() -> argparse.Namespace:
 
     if args.phase == "generate" and not args.setups:
         raise ValueError("--phase generate requires at least one --setups value")
-
-    if args.phase == "judge" and not args.judge_setups:
-        raise ValueError("--phase judge requires at least one --judge-setups value")
 
     return args
 

@@ -187,7 +187,7 @@ class EvalCliTests(unittest.TestCase):
         ):
             args = self.mod.parse_args()
         self.assertTrue(args.dev)
-        self.assertNotIn("rl_copilot", args.judge_setups)
+        self.assertEqual(args.judge_source, "results")
 
     def test_query_parser_keeps_the_mcp_function_name(self):
         raw = '● function_info (MCP: moove) · name: "pmf_preexit"\n'
@@ -368,15 +368,14 @@ class EvalCliTests(unittest.TestCase):
             )
             self.assertIn("The function returns 7.", prompt)
             self.assertIn("Do not compare", prompt)
+            self.assertIn("compile_logs", prompt)
+            self.assertNotIn("latency_ms", prompt)
 
             judgment = {
-                "correctness": 8,
-                "required_function_usage": 10,
-                "code_quality": 8,
-                "retrieval_use": 7,
-                "efficiency": 8,
-                "overall": 8,
-                "verdict": "pass",
+                "task_correctness": 0.8,
+                "reference_similarity": 0.9,
+                "code_quality": 0.8,
+                "overall": 0.84,
                 "reasoning": "Compiled and matches the reference behavior.",
             }
             with patch.object(
@@ -395,12 +394,107 @@ class EvalCliTests(unittest.TestCase):
                 asyncio.run(
                     self.mod.run_judge_phase(
                         str(tasks_path),
-                        ["local_rag_copilot"],
                         dev=True,
                         resume=True,
                     )
                 )
                 self.assertEqual(judge_task.await_count, 1)
+
+    def test_coherence_check_validation_and_round_files(self):
+        scores = self.mod.validate_absolute_judgment(
+            {
+                "task_correctness": 0.8,
+                "reference_similarity": 0.9,
+                "code_quality": 0.8,
+                "reasoning": "Evidence based.",
+            }
+        )
+        self.assertAlmostEqual(scores["overall"], 0.84)
+        coherent = self.mod.validate_coherence_check(
+            {
+                "retry": False,
+                "classification": "coherent_c",
+                "reasoning": "C source is present.",
+            }
+        )
+        self.assertFalse(coherent["retry"])
+        retry = self.mod.validate_coherence_check(
+            {
+                "retry": True,
+                "classification": "provider_failure",
+                "reasoning": "The extraction is an API error.",
+            }
+        )
+        self.assertTrue(retry["retry"])
+        with self.assertRaises(ValueError):
+            self.mod.validate_coherence_check(
+                {
+                    "retry": True,
+                    "classification": "coherent_c",
+                    "reasoning": "Contradiction.",
+                }
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.OUT_DIR = Path(tmp)
+            self.assertEqual(self.mod.results_round_path(0).name, "results.jsonl")
+            self.assertEqual(self.mod.check_round_path(0).name, "check.jsonl")
+            self.assertEqual(self.mod.results_round_path(2).name, "results_2.jsonl")
+            self.assertEqual(self.mod.check_round_path(2).name, "check_2.jsonl")
+
+    def test_check_retry_and_merge_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.mod.OUT_DIR = tmp_path / "eval_runs"
+            self.mod.OUT_DIR.mkdir()
+            tasks_path = tmp_path / "tasks.jsonl"
+            tasks_path.write_text(
+                "\n".join(
+                    json.dumps({"id": task_id, "question": task_id, "answer": "answer"})
+                    for task_id in ("t1", "t2")
+                ) + "\n",
+                encoding="utf-8",
+            )
+            first = self.make_result("t1")
+            failed = self.make_result("t2")
+            failed.extracted_code = "[GENERATION_FAILED] quota exhausted"
+            failed.compile_pass = False
+            failed.hard_pass = False
+            (self.mod.OUT_DIR / "results.jsonl").write_text(
+                "\n".join(json.dumps(self.mod.asdict(row)) for row in (first, failed)) + "\n",
+                encoding="utf-8",
+            )
+
+            initial_decisions = [
+                {"retry": False, "classification": "coherent_c", "reasoning": "C"},
+                {"retry": True, "classification": "provider_failure", "reasoning": "quota"},
+            ]
+            with patch.object(
+                self.mod,
+                "check_result_coherence",
+                new=AsyncMock(side_effect=initial_decisions),
+            ):
+                asyncio.run(self.mod.run_check_phase(str(tasks_path)))
+            self.assertTrue((self.mod.OUT_DIR / "check.jsonl").exists())
+
+            retried = self.make_result("t2")
+            async def fake_run_one(problem, setup):
+                self.assertEqual(problem.id, "t2")
+                return retried
+
+            with patch.object(self.mod, "run_one", side_effect=fake_run_one):
+                asyncio.run(self.mod.run_retry_phase(str(tasks_path)))
+            self.assertTrue((self.mod.OUT_DIR / "results_1.jsonl").exists())
+
+            with patch.object(
+                self.mod,
+                "check_result_coherence",
+                new=AsyncMock(return_value=initial_decisions[0]),
+            ):
+                asyncio.run(self.mod.run_check_phase(str(tasks_path)))
+            merged = self.mod.load_results_latest(self.mod.OUT_DIR / "result_merged.jsonl")
+            self.assertEqual(set(merged), {"t1", "t2"})
+            summary = json.loads((self.mod.OUT_DIR / "merge_summary.json").read_text())
+            self.assertEqual(summary["missing_task_ids"], [])
 
 
 if __name__ == "__main__":
